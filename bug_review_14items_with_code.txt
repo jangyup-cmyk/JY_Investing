@@ -1,0 +1,1378 @@
+================================================================================
+                    코드 리뷰: 14개 버그 종합 분석 + 상세 수정 코드
+                         Code Review Report With Solutions
+================================================================================
+생성일: 2026-05-12
+리뷰 범위: 전체 프로젝트 (주요 Python 파일)
+리뷰 항목: 버그 위험성 + 테스트 누락 + 구체적 수정 코드
+
+================================================================================
+📊 심각도 분류
+================================================================================
+🔴 높은 심각도 (5개): 운영 중 프로그램 중단 가능성 높음
+🟡 중간 심각도 (5개): 데이터 손실 또는 기능 오류 가능
+🔵 낮은 심각도 (4개): 성능 저하 또는 로그 부실
+
+================================================================================
+                           🔴 높은 심각도 (5개)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣  kis_api.py - API 응답이 JSON이 아닐 때 crash
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】kis_api.py, 라인 85-90 (get_access_token 메서드)
+
+【문제 코드】
+  res = requests.post(url, json=payload, headers=headers, timeout=5)
+  if res.status_code == 200:
+      self.access_token = res.json().get("access_token", "")
+
+【발생 상황】
+  - 프록시/방화벽이 HTML 에러 페이지 반환 (HTTP 200 + HTML body)
+  - API 서버 중단 시 JSON 파싱 실패 → JSONDecodeError
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def get_access_token(self, max_retries: int = 3, retry_delay: int = 2) -> bool:
+    """토큰 발급 (응답 타입 검증 추가)"""
+    for attempt in range(max_retries):
+        try:
+            res = requests.post(url, json=payload, headers=headers, timeout=5)
+            
+            # ✅ 1단계: HTTP 상태 확인
+            if res.status_code != 200:
+                logger.error(f"토큰 발급 실패: HTTP {res.status_code}")
+                return False
+            
+            # ✅ 2단계: Content-Type 확인
+            if 'application/json' not in res.headers.get('Content-Type', ''):
+                logger.error(f"예상치 못한 응답 형식: {res.headers.get('Content-Type')}")
+                logger.debug(f"응답 본문: {res.text[:200]}")
+                return False
+            
+            # ✅ 3단계: JSON 파싱 + rt_cd 검증
+            try:
+                data = res.json()
+            except ValueError as e:
+                logger.error(f"JSON 파싱 실패: {e}, 응답: {res.text[:200]}")
+                return False
+            
+            # ✅ 4단계: API 응답 코드 검증
+            if data.get("rt_cd") != "0":
+                logger.error(f"API 오류: {data.get('msg', 'Unknown')}")
+                return False
+            
+            # ✅ 5단계: 토큰 존재 확인
+            output = data.get("output", {})
+            if not isinstance(output, dict):
+                logger.error(f"output이 dict가 아님: {type(output)}")
+                return False
+            
+            token = output.get("access_token", "").strip()
+            if not token:
+                logger.error("토큰이 비어있습니다")
+                return False
+            
+            self.access_token = token
+            self.token_expire_time = output.get("expires_in", 3600)
+            logger.info(f"✅ 토큰 발급 성공 ({self.user.get('name', 'Unknown')})")
+            return True
+            
+        except requests.Timeout:
+            logger.warning(f"타임아웃 ({attempt + 1}/{max_retries}), 재시도...")
+            time.sleep(retry_delay)
+        except Exception as e:
+            logger.error(f"예상치 못한 오류: {e}")
+            return False
+    
+    return False
+
+────────────────────────────────────────────────────────────────
+
+【테스트 케이스】
+  Case 1: HTML 응답
+    res.headers = {'Content-Type': 'text/html'}
+    → 기대: False, 에러 로그
+  
+  Case 2: 빈 토큰
+    data = {"rt_cd": "0", "output": {"access_token": ""}}
+    → 기대: False, "토큰이 비어있습니다" 로그
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2️⃣  kis_api.py - order_cash() 반환값이 None일 수 있음
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】kis_api.py, 라인 125-135 (order_cash 메서드)
+
+【문제 코드】
+  res_market = kis_client.order_cash(stock_code, qty_market, 0, "01")
+  market_success = res_market.get("rt_cd") == "0"  # ← None.get() = AttributeError
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def order_cash(self, stock_code: str, qty: int, price: float, order_type: str = "01") -> dict:
+    """주식 매수/매도 주문 - 항상 dict 반환 보장"""
+    url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
+    payload = {
+        "CANO": self.user["account_no"][:8],
+        "ACNT_PRDT_CD": self.user["account_no"][8:],
+        "PDNO": stock_code,
+        "ORD_DVSN": order_type,
+        "ORD_QTY": str(qty),
+        "ORD_UNPR": "0" if order_type == "01" else str(int(price)),
+        "SLL_TYPE": "00",
+    }
+    hash_key = self._generate_hash_key(payload)
+    headers = self._get_headers("TTTC0802U", hash_key)
+    
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        
+        # ✅ HTTP 상태 확인
+        if res.status_code not in [200, 201]:
+            logger.error(f"주문 실패 ({stock_code}): HTTP {res.status_code}")
+            return {
+                "rt_cd": "-1",
+                "msg": f"HTTP {res.status_code}",
+                "output": None
+            }
+        
+        # ✅ JSON 파싱 시도 + 구조 검증
+        try:
+            data = res.json()
+        except ValueError:
+            logger.error(f"JSON 파싱 실패: {res.text[:200]}")
+            return {
+                "rt_cd": "-1",
+                "msg": "Invalid JSON response",
+                "output": None
+            }
+        
+        # ✅ 응답 구조 검증 (필수 필드)
+        if not isinstance(data, dict):
+            logger.warning(f"응답이 dict가 아님: {type(data)}")
+            return {
+                "rt_cd": "-1",
+                "msg": "Invalid response type",
+                "output": None
+            }
+        
+        if "rt_cd" not in data:
+            logger.warning(f"응답에 rt_cd 없음: {data.keys()}")
+            return {
+                "rt_cd": "-1",
+                "msg": "Missing rt_cd in response",
+                "output": None
+            }
+        
+        return data  # ✅ 항상 dict 반환
+        
+    except requests.Timeout:
+        logger.error(f"주문 타임아웃 ({stock_code})")
+        return {
+            "rt_cd": "-1",
+            "msg": "Timeout",
+            "output": None
+        }
+    except Exception as e:
+        logger.error(f"주문 오류 ({stock_code}): {e}")
+        return {
+            "rt_cd": "-1",
+            "msg": str(e),
+            "output": None
+        }
+
+────────────────────────────────────────────────────────────────
+
+【호출부 수정】trader.py
+  res_market = kis_client.order_cash(stock_code, qty_market, 0, "01")
+  
+  # ✅ None 체크 + rt_cd 검증
+  if res_market is None:
+      logger.error(f"order_cash 반환값이 None")
+      return None
+  
+  market_success = res_market.get("rt_cd") == "0"
+  market_order_no = res_market.get("output", {}).get("ODNO", "") if market_success else ""
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3️⃣  trader.py - 토큰 실패 후에도 API 호출 진행
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】trader.py, 라인 30-40 (execute_split_buy 메서드)
+
+【문제 코드】
+  if not kis_client.get_access_token():
+      logger.error(f"{user['name']} 토큰 발급 실패")
+      return None
+  
+  res_market = kis_client.order_cash(...)  # ← 토큰이 빈 문자열일 수도 있음
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def execute_split_buy(user: dict, stock_code: str, current_price: float, bull_score: float = 0.5) -> dict | None:
+    """bull_score에 따른 동적 비중 분할 매수"""
+    budget = user["budget"]
+    
+    # 수량 계산
+    if bull_score >= 0.70:
+        market_ratio = 0.7
+        logger.info(f"[{stock_code}] 강력 매수 (Score: {bull_score:.2f}) -> 시장가 70%, 지정가 30%")
+    else:
+        market_ratio = 0.4
+        logger.info(f"[{stock_code}] 일반 매수 (Score: {bull_score:.2f}) -> 시장가 40%, 지정가 60%")
+        
+    market_budget = budget * market_ratio
+    limit_budget = budget * (1.0 - market_ratio)
+    
+    qty_market = math.floor(market_budget / current_price)
+    qty_limit = math.floor(limit_budget / current_price)
+    
+    if qty_market <= 0 and qty_limit <= 0:
+        logger.warning(f"수량 계산 실패: market_qty={qty_market}, limit_qty={qty_limit}")
+        return None
+
+    kis_client = KISAPIClient(user)
+
+    # ✅ 1단계: 토큰 확인 - 실패하면 즉시 반환
+    if not kis_client.get_access_token():
+        logger.error(f"{user['name']} 토큰 발급 실패 - 주문 중단")
+        return {
+            "name": user["name"],
+            "account": user["account_no"],
+            "error": "토큰 발급 실패",
+            "market_qty": 0,
+            "limit_qty": 0,
+        }
+    
+    # ✅ 2단계: 토큰 유효성 재확인
+    if not kis_client.access_token or kis_client.access_token.strip() == "":
+        logger.error(f"{user['name']} 토큰이 비어있음")
+        return {
+            "name": user["name"],
+            "account": user["account_no"],
+            "error": "토큰이 비어있음",
+            "market_qty": 0,
+            "limit_qty": 0,
+        }
+
+    # 시장가 매수
+    res_market = kis_client.order_cash(stock_code, qty_market, 0, "01")
+    
+    # ✅ 3단계: 응답 검증 (None 체크)
+    if res_market is None:
+        logger.error(f"시장가 주문 응답 None: {stock_code}")
+        return None
+    
+    market_success = res_market.get("rt_cd") == "0"
+    market_order_no = res_market.get("output", {}).get("ODNO", "") if market_success else ""
+
+    logger.info(f"시장가 주문 ({user['name']}): {stock_code} {qty_market}주 - {'성공' if market_success else '실패'}")
+
+    # 지정가 매수
+    res_limit = kis_client.order_cash(stock_code, qty_limit, current_price, "00")
+    limit_success = res_limit.get("rt_cd") == "0" if res_limit else False
+    limit_order_no = res_limit.get("output", {}).get("ODNO", "") if limit_success else ""
+
+    logger.info(f"지정가 주문 ({user['name']}): {stock_code} {qty_limit}주 @ {int(current_price)}원 - {'성공' if limit_success else '실패'}")
+
+    # 10분 뒤 미체결 취소 스케줄 등록
+    if limit_order_no:
+        cancel_time = datetime.now() + timedelta(minutes=10)
+        scheduler.add_job(
+            check_and_cancel_order,
+            trigger="date",
+            run_date=cancel_time,
+            args=[user, stock_code, limit_order_no],
+        )
+
+    return {
+        "name": user["name"],
+        "account": user["account_no"],
+        "market_qty": qty_market,
+        "limit_qty": qty_limit,
+        "market_order_no": market_order_no,
+        "limit_order_no": limit_order_no,
+    }
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4️⃣  scheduler.py - KISAPIClient 반복 생성 (API 호출 초과)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】scheduler.py, 라인 135-165 (run_signal_pipeline 메서드)
+
+【발생 상황】
+  - 20개 종목 × 3개 계좌 = 60회 반복
+  - 매 반복마다 토큰 발급 API 호출 (60회)
+  - KIS API 초당 20 요청 제한 → Rate limit 초과 (429 오류)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def run_signal_pipeline(stock_codes: list = None, simulate_only: bool = False):
+    """최적화된 파이프라인 - 토큰 재사용"""
+    stock_codes = resolve_stock_codes(stock_codes)
+    
+    if not stock_codes:
+        logger.debug("모니터링 종목 없음")
+        return {"stock_codes": [], "simulated": simulate_only, "processed": 0}
+    
+    if simulate_only:
+        logger.info(f"[시뮬레이션] 파이프라인 대상: {stock_codes}")
+        return {
+            "stock_codes": stock_codes,
+            "simulated": True,
+            "processed": len(stock_codes),
+        }
+    
+    import stock_data
+    from agents.agent_orchestrator import AgentOrchestrator
+    from kis_api import KISAPIClient
+    
+    orchestrator = AgentOrchestrator()
+    
+    processed = 0
+    
+    # ✅ 사용자별 토큰 캐시 (한 번만 발급)
+    user_tokens = {}
+    
+    for user in config.USERS:
+        # ✅ 토큰 한 번만 발급 + 캐시
+        kis_client = KISAPIClient(user)
+        if not kis_client.get_access_token():
+            logger.error(f"[파이프라인] 토큰 발급 실패: {user['name']}")
+            continue
+        
+        token = kis_client.access_token
+        user_tokens[user["account_no"]] = token
+        
+        logger.info(f"토큰 확보: {user['name']}")
+        
+        # ✅ 종목별 처리 시에는 이미 발급된 토큰 전달
+        for stock_code in stock_codes:
+            try:
+                # 종목 데이터 조회
+                stock_data_result = stock_data.fetch_stock_data(stock_code, user)
+                if not stock_data_result.get("success"):
+                    logger.warning(f"종목 데이터 조회 실패: {stock_code}")
+                    continue
+                
+                # 에이전트 파이프라인 실행 (토큰 캐시 사용)
+                result = orchestrator.process(
+                    input_data={
+                        "stock_code": stock_code,
+                        "user": user,
+                        "token": token,  # ✅ 캐시된 토큰 사용 (재발급 금지)
+                        **stock_data_result
+                    }
+                )
+                
+                if result.get("pass"):
+                    processed += 1
+                    logger.info(f"매매 신호 발생: {stock_code}")
+                    
+            except Exception as e:
+                logger.error(f"파이프라인 오류 ({stock_code}): {e}")
+                continue
+    
+    logger.info(f"파이프라인 완료: {processed}개 신호 발생")
+    
+    return {
+        "stock_codes": stock_codes,
+        "simulated": False,
+        "processed": processed,
+    }
+
+────────────────────────────────────────────────────────────────
+
+【개선 효과】
+  기존: 20개 종목 × 3계좌 = 60회 토큰 발급 요청
+  개선: 3계좌 × 1회 = 3회만 발급 → 95% 감소
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5️⃣  telegram_bot.py - requests.post().json() 예외 처리 미흡
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】telegram_bot.py, 라인 15-18 (send_custom_message 메서드)
+
+【문제 코드】
+  try:
+      return requests.post(url, json=payload, timeout=5).json()
+  except Exception as exc:
+      logger.error(f"Telegram 전송 실패: {exc}")
+      return {"ok": False, "error": str(exc)}
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def send_custom_message(bot_token: str, channel_id: str, text: str) -> dict:
+    """Telegram 메시지 전송 - 안전한 응답 처리"""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": channel_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    
+    try:
+        # ✅ 1단계: HTTP 요청
+        response = requests.post(url, json=payload, timeout=5)
+        
+        # ✅ 2단계: 상태 코드 확인
+        if response.status_code != 200:
+            logger.error(f"Telegram HTTP {response.status_code}: {response.text[:200]}")
+            return {
+                "ok": False,
+                "error": f"HTTP {response.status_code}",
+                "error_code": response.status_code,
+            }
+        
+        # ✅ 3단계: Content-Type 확인
+        if 'application/json' not in response.headers.get('Content-Type', ''):
+            logger.error(f"Telegram 응답이 JSON이 아님: {response.text[:200]}")
+            return {
+                "ok": False,
+                "error": "Non-JSON response",
+            }
+        
+        # ✅ 4단계: JSON 파싱
+        try:
+            data = response.json()
+        except ValueError as e:
+            logger.error(f"JSON 파싱 실패: {e}")
+            return {
+                "ok": False,
+                "error": f"JSON parse error: {e}",
+            }
+        
+        # ✅ 5단계: Telegram API 응답 코드 확인
+        if not data.get("ok"):
+            error_msg = data.get("description", "Unknown error")
+            logger.error(f"Telegram 오류: {error_msg}")
+            return data
+        
+        logger.debug(f"Telegram 메시지 전송 성공: {channel_id}")
+        return data
+        
+    except requests.Timeout:
+        logger.error(f"Telegram 타임아웃 ({channel_id})")
+        return {
+            "ok": False,
+            "error": "Timeout",
+        }
+    except requests.ConnectionError as e:
+        logger.error(f"Telegram 연결 실패: {e}")
+        return {
+            "ok": False,
+            "error": f"Connection error: {e}",
+        }
+    except Exception as e:
+        logger.error(f"Telegram 전송 중 예상치 못한 오류: {e}")
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+────────────────────────────────────────────────────────────────
+
+
+================================================================================
+                           🟡 중간 심각도 (5개)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6️⃣  analyzer.py - is_market_bullish()에서 None 처리 부재
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】analyzer.py, 라인 101-108 (is_market_bullish 메서드)
+
+【문제 코드】
+  data = kis_client.get_index_price(code)
+  results[name] = float(data.get("bstp_nmix_prdy_ctrt", 0))  # ← data가 None이면 crash
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def is_market_bullish(user: dict, token: str = "", min_rate: float = -1.0) -> dict:
+    """KOSPI/KOSDAQ 지수 확인 (안전한 None 처리)"""
+    if user is None:  # ✅ user 유효성 확인
+        logger.error("is_market_bullish: user가 None")
+        return {"ok": False, "kospi": 0.0, "kosdaq": 0.0, "error": "user is None"}
+    
+    kis_client = KISAPIClient(user)
+    results = {}
+    
+    for name, code in {"KOSPI": "0001", "KOSDAQ": "1001"}.items():
+        try:
+            data = kis_client.get_index_price(code)
+            
+            # ✅ 1단계: 데이터 자체 검증
+            if data is None:
+                logger.warning(f"{name} 데이터가 None 반환됨")
+                results[name] = 0.0
+                continue
+            
+            # ✅ 2단계: dict 타입 확인
+            if not isinstance(data, dict):
+                logger.warning(f"{name} 데이터가 dict가 아님: {type(data)}")
+                results[name] = 0.0
+                continue
+            
+            # ✅ 3단계: 필드 존재 확인 후 float 변환
+            rate_str = data.get("bstp_nmix_prdy_ctrt", "0")
+            if rate_str is None or rate_str == "":
+                results[name] = 0.0
+                continue
+            
+            try:
+                results[name] = float(rate_str)
+            except (ValueError, TypeError):
+                logger.warning(f"{name} 등락률 변환 실패: {rate_str}")
+                results[name] = 0.0
+                
+        except Exception as e:
+            logger.error(f"{name} API 조회 오류: {e}")
+            results[name] = 0.0
+    
+    worst = min(results.values()) if results.values() else 0.0
+    return {
+        "ok": worst >= min_rate,
+        "kospi": results.get("KOSPI", 0.0),
+        "kosdaq": results.get("KOSDAQ", 0.0),
+    }
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7️⃣  analyzer.py - is_valid_stock_final()에서 user가 None
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】analyzer.py, 라인 210-220 (is_valid_stock_final 메서드)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def is_valid_stock_final(
+    stock: dict,
+    open_price: float,
+    high_price: float,
+    prev_close: float,
+    daily_prices: list,
+    daily_opens: list,
+    daily_closes: list,
+    daily_volumes: list,
+    minute_vols: list,
+    user: dict,
+    token: str,
+) -> dict:
+    """최종 필터 - None 입력값 검증"""
+    
+    # ✅ 필수 입력값 검증
+    if stock is None or not isinstance(stock, dict):
+        return {"pass": False, "reason": "stock이 유효하지 않음"}
+    
+    if user is None or not isinstance(user, dict):
+        return {"pass": False, "reason": "user가 유효하지 않음"}
+    
+    if not daily_prices or not isinstance(daily_prices, list):
+        return {"pass": False, "reason": "daily_prices가 비어있거나 유효하지 않음"}
+    
+    f = config.FILTER
+    cp = stock.get("price")
+    
+    if cp is None or not isinstance(cp, (int, float)):
+        return {"pass": False, "reason": "주가 정보 누락"}
+    
+    # 기존 13대 필수 필터 검증
+    if not (f["min_change_rate"] <= stock.get("change_rate", 0) <= f["max_change_rate"]):
+        return {"pass": False, "reason": "등락률 범위 초과"}
+    
+    if not (f["min_price"] <= cp <= f["max_price"]):
+        return {"pass": False, "reason": "주가 범위 초과"}
+    
+    if not is_ma_aligned(daily_prices):
+        return {"pass": False, "reason": "정배열 미충족"}
+    
+    if not is_valid_trading_time(...)["ok"]:
+        return {"pass": False, "reason": "시간외"}
+
+    # ✅ user가 유효한 상태에서만 지수 확인
+    mr = is_market_bullish(user, token, f["min_market_rate"])
+    if not mr.get("ok", False):
+        return {"pass": False, "reason": "하락장 차단"}
+    
+    # ... 이하 기존 필터 로직
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8️⃣  stock_data.py - 빈 배열로 인한 IndexError
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】stock_data.py, 라인 32 (fetch_previous_close 메서드)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def fetch_previous_close(stock_code: str, user: dict) -> float:
+    """전일 종가 조회 - 안전한 배열 처리"""
+    kis_client = KISAPIClient(user)
+    
+    try:
+        daily_data = kis_client.get_daily_price(stock_code, count=2)
+        
+        # ✅ 1단계: 데이터 자체 검증
+        if daily_data is None:
+            logger.warning(f"daily_data가 None: {stock_code}")
+            return 0.0
+        
+        # ✅ 2단계: 배열 타입 확인
+        if not isinstance(daily_data, list):
+            logger.warning(f"daily_data가 list가 아님: {type(daily_data)}")
+            return 0.0
+        
+        # ✅ 3단계: 길이 확인 + 안전한 접근
+        if len(daily_data) < 2:
+            logger.warning(f"일봉 데이터 부족: {stock_code} (count: {len(daily_data)})")
+            # 1개만 있어도 반환
+            if len(daily_data) == 1:
+                prev_close_price = daily_data[0].get("stck_clpr", "0")
+                return float(prev_close_price)
+            return 0.0
+        
+        # ✅ 4단계: 전일 종가 추출
+        prev_close_price = daily_data[0].get("stck_clpr", "0")
+        
+        try:
+            return float(prev_close_price)
+        except (ValueError, TypeError):
+            logger.warning(f"종가 변환 실패: {stock_code}, {prev_close_price}")
+            return 0.0
+            
+    except Exception as e:
+        logger.error(f"전일 종가 조회 오류 ({stock_code}): {e}")
+        return 0.0
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9️⃣  position_tracker.py - 파일 I/O 실패 무시
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】position_tracker.py, 라인 40-45 (_save 메서드)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+import shutil
+import os
+
+def _save(positions: dict) -> bool:
+    """포지션 저장 - 실패 여부 반환"""
+    try:
+        # ✅ 1단계: 백업 생성 (기존 파일 있으면)
+        if os.path.exists(POSITION_FILE):
+            backup_file = f"{POSITION_FILE}.bak"
+            try:
+                shutil.copy2(POSITION_FILE, backup_file)
+                logger.debug(f"백업 생성: {backup_file}")
+            except Exception as e:
+                logger.warning(f"백업 생성 실패: {e}")
+        
+        # ✅ 2단계: 임시 파일에 쓰기 (원자적 연산)
+        temp_file = f"{POSITION_FILE}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(positions, f, ensure_ascii=False, indent=2)
+        
+        # ✅ 3단계: 임시 파일을 원본으로 교체
+        if os.path.exists(POSITION_FILE):
+            os.remove(POSITION_FILE)
+        os.rename(temp_file, POSITION_FILE)
+        
+        logger.debug(f"포지션 저장 성공: {len(positions)} 종목")
+        return True
+        
+    except OSError as e:
+        logger.error(f"positions.json 저장 실패 (디스크 오류): {e}")
+        # 임시 파일 정리
+        try:
+            temp_file = f"{POSITION_FILE}.tmp"
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except:
+            pass
+        return False
+    except Exception as e:
+        logger.error(f"포지션 저장 중 예상치 못한 오류: {e}")
+        return False
+
+
+def add_position(stock_code: str, qty: int, price: float, position_type: str = "buy") -> bool:
+    """포지션 추가 - 저장 실패 시 롤백"""
+    with _lock:
+        positions = _load()
+        
+        if stock_code not in positions:
+            positions[stock_code] = {
+                "quantity": 0,
+                "avg_price": 0.0,
+                "entry_time": "",
+                "position_type": position_type,
+            }
+        
+        old_pos = positions[stock_code].copy()
+        
+        # 포지션 계산
+        current_qty = positions[stock_code]["quantity"]
+        current_avg = positions[stock_code]["avg_price"]
+        
+        positions[stock_code]["quantity"] = current_qty + qty
+        if current_qty + qty > 0:
+            positions[stock_code]["avg_price"] = (current_avg * current_qty + price * qty) / (current_qty + qty)
+        positions[stock_code]["entry_time"] = datetime.now().isoformat()
+        
+        # ✅ 저장 시도 - 실패하면 롤백
+        if not _save(positions):
+            positions[stock_code] = old_pos  # 롤백
+            logger.error(f"포지션 추가 저장 실패, 롤백됨: {stock_code}")
+            return False
+        
+        logger.info(f"포지션 추가: {stock_code} +{qty}주 @ {price:,.0f}원")
+        return True
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔟  agents/sentiment_analyst.py - 외부 API 의존성 검증 부족
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】agents/sentiment_analyst.py, 라인 28-35 (fetch_recent_news 메서드)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+def fetch_recent_news(self, stock_code: str) -> dict:
+    """네이버 뉴스 API - 상세한 오류 처리"""
+    url = self.naver_news_api.format(stock_code=stock_code)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    
+    try:
+        # ✅ 1단계: HTTP 요청
+        res = requests.get(url, headers=headers, timeout=3)
+        
+        # ✅ 2단계: 상태 코드 확인
+        if res.status_code == 429:
+            logger.warning(f"API Rate limit: {stock_code}")
+            return {"success": False, "error": "Rate limited", "titles": []}
+        
+        if res.status_code != 200:
+            logger.warning(f"네이버 API {res.status_code}: {stock_code}")
+            return {"success": False, "error": f"HTTP {res.status_code}", "titles": []}
+        
+        # ✅ 3단계: JSON 파싱
+        try:
+            data = res.json()
+        except ValueError as e:
+            logger.warning(f"JSON 파싱 실패: {stock_code}")
+            return {"success": False, "error": "JSON parse error", "titles": []}
+        
+        # ✅ 4단계: 응답 구조 검증
+        if not isinstance(data, list) or len(data) == 0:
+            logger.debug(f"뉴스 데이터 없음: {stock_code}")
+            return {"success": True, "error": None, "titles": []}
+        
+        # ✅ 5단계: 안전한 파싱
+        titles = []
+        for group in data:
+            if not isinstance(group, dict):
+                continue
+            
+            items = group.get("items", [])
+            if not isinstance(items, list):
+                continue
+            
+            for item in items:
+                if isinstance(item, dict):
+                    title = item.get("title", "").strip()
+                    if title:
+                        titles.append(title)
+        
+        logger.debug(f"뉴스 {len(titles)}개 수집: {stock_code}")
+        return {"success": True, "error": None, "titles": titles}
+        
+    except requests.Timeout:
+        logger.warning(f"네이버 API 타임아웃: {stock_code}")
+        return {"success": False, "error": "Timeout", "titles": []}
+    except requests.ConnectionError as e:
+        logger.warning(f"네이버 연결 실패: {e}")
+        return {"success": False, "error": "Connection error", "titles": []}
+    except Exception as e:
+        logger.error(f"뉴스 수집 중 예상치 못한 오류: {e}")
+        return {"success": False, "error": str(e), "titles": []}
+
+
+def process(self, input_data: dict) -> dict:
+    """감정 분석 실행 - 뉴스 수집 실패 처리"""
+    stock_code = input_data.get("stock_code", "")
+    
+    # ✅ 뉴스 수집 (실패해도 계속 진행)
+    news_result = self.fetch_recent_news(stock_code)
+    
+    if not news_result.get("success"):
+        logger.warning(f"뉴스 수집 실패: {news_result.get('error')}")
+        titles = []
+    else:
+        titles = news_result.get("titles", [])
+    
+    # 기본 점수 (뉴스 없을 때)
+    sentiment_score = 0.5
+    
+    if titles:
+        # 감정 분석 수행
+        sentiment_score = self._analyze_sentiment(titles)
+    
+    return {
+        "sentiment_score": sentiment_score,
+        "news_count": len(titles),
+        "has_data": len(titles) > 0,
+        "success": True,
+    }
+
+────────────────────────────────────────────────────────────────
+
+
+================================================================================
+                           🔵 낮은 심각도 (4개)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣1️⃣  agents/technical_analyst.py - talib 데이터 타입 불일치
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】agents/technical_analyst.py, 라인 37-50 (process 메서드)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+import numpy as np
+import talib
+
+class TechnicalAnalyst(BaseAgent):
+    def process(self, input_data: dict) -> dict:
+        """기술적 분석 - 데이터 타입 검증"""
+        
+        # ✅ 1단계: 데이터 추출 및 타입 검증
+        daily_prices = self._validate_price_array(
+            input_data.get("daily_prices", []),
+            "daily_prices"
+        )
+        if daily_prices is None or len(daily_prices) < 20:
+            logger.warning("일봉 데이터 부족 - 기술 분석 스킵")
+            return {
+                "rsi": None,
+                "macd": None,
+                "stoch": None,
+                "trend": "unknown",
+                "error": "Insufficient data",
+                "success": False
+            }
+        
+        daily_highs = self._validate_price_array(
+            input_data.get("daily_highs", daily_prices),
+            "daily_highs"
+        ) or daily_prices
+        
+        daily_lows = self._validate_price_array(
+            input_data.get("daily_lows", daily_prices),
+            "daily_lows"
+        ) or daily_prices
+        
+        try:
+            # ✅ 2단계: talib 계산
+            rsi = talib.RSI(daily_prices, timeperiod=14)
+            macd, signal, hist = talib.MACD(daily_prices, fastperiod=12, slowperiod=26, signalperiod=9)
+            
+            # STOCH 계산 시 high/low/close 필요
+            try:
+                k, d = talib.STOCH(daily_highs, daily_lows, daily_prices, 
+                                   fastk_period=14, slowk_period=3, slowd_period=3)
+            except Exception as e:
+                logger.warning(f"STOCH 계산 실패: {e}")
+                k, d = None, None
+            
+            return {
+                "rsi": float(rsi[-1]) if rsi is not None and len(rsi) > 0 else None,
+                "macd": {
+                    "value": float(macd[-1]) if macd is not None and len(macd) > 0 else None,
+                    "signal": float(signal[-1]) if signal is not None and len(signal) > 0 else None,
+                    "histogram": float(hist[-1]) if hist is not None and len(hist) > 0 else None,
+                },
+                "stoch": {
+                    "k": float(k[-1]) if k is not None and len(k) > 0 else None,
+                    "d": float(d[-1]) if d is not None and len(d) > 0 else None,
+                },
+                "trend": self._determine_trend(rsi[-1] if rsi is not None and len(rsi) > 0 else 50),
+                "success": True,
+            }
+        
+        except Exception as e:
+            logger.error(f"talib 계산 오류: {e}")
+            return {
+                "rsi": None,
+                "macd": None,
+                "stoch": None,
+                "trend": "unknown",
+                "error": str(e),
+                "success": False,
+            }
+
+    def _validate_price_array(self, data: any, field_name: str) -> np.ndarray | None:
+        """가격 배열 검증"""
+        if data is None:
+            return None
+        
+        if not isinstance(data, (list, np.ndarray)):
+            logger.warning(f"{field_name}이 list가 아님: {type(data)}")
+            return None
+        
+        if len(data) == 0:
+            logger.warning(f"{field_name}이 비어있음")
+            return None
+        
+        try:
+            # numpy 배열로 변환 (talib 호환성)
+            return np.array([float(x) for x in data])
+        except (ValueError, TypeError) as e:
+            logger.warning(f"{field_name} 변환 실패: {e}")
+            return None
+
+    def _determine_trend(self, rsi: float) -> str:
+        """RSI 기반 추세 판단"""
+        if rsi is None:
+            return "unknown"
+        if rsi > 70:
+            return "overbought"
+        elif rsi < 30:
+            return "oversold"
+        elif rsi > 50:
+            return "uptrend"
+        else:
+            return "downtrend"
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣2️⃣  telegram_listener.py - Async 함수 재연결 로직 없음
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】telegram_listener.py, 라인 116-125 (connect 메서드)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+async def connect(self, max_retries: int = 3, retry_delay: int = 5) -> bool:
+    """Telegram 연결 - 자동 재연결 로직"""
+    for attempt in range(max_retries):
+        try:
+            self.client = TelegramClient(
+                self.session_file,
+                self.api_id,
+                self.api_hash
+            )
+            
+            # ✅ 1단계: 연결 시도
+            await self.client.start(phone=self.phone_number)
+            
+            # ✅ 2단계: 연결 상태 확인
+            if not await self.client.is_user_authorized():
+                logger.error(f"Telethon 인증 실패 (시도 {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                else:
+                    return False
+            
+            logger.info("✅ Telethon 클라이언트 연결 성공")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Telethon 연결 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+            
+            # ✅ 3단계: 마지막 시도 아니면 재시도
+            if attempt < max_retries - 1:
+                logger.info(f"{retry_delay}초 후 재연결 시도...")
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(f"최대 재시도 횟수 초과 ({max_retries}회)")
+                return False
+    
+    return False
+
+
+async def get_folder_info(self) -> dict:
+    """등록된 채널 정보 조회 - 부분 실패 처리"""
+    if not self.client or not await self.client.is_user_authorized():
+        logger.error("클라이언트가 연결되지 않았습니다.")
+        return {}
+    
+    folder_info = {}
+    
+    for group_name, channel_refs in self.channel_groups.items():
+        channels = []
+        failed_channels = []
+        
+        for channel_ref in channel_refs:
+            try:
+                # ✅ 안전한 엔티티 조회
+                entity = await self.client.get_entity(channel_ref)
+                
+                # ✅ 필드 검증
+                channels.append({
+                    "name": getattr(entity, 'title', str(channel_ref)),
+                    "id": getattr(entity, 'id', None),
+                    "username": f"@{entity.username}" if hasattr(entity, 'username') and entity.username else None,
+                })
+                
+            except ValueError:
+                logger.warning(f"채널을 찾을 수 없음: {channel_ref}")
+                failed_channels.append(channel_ref)
+            except Exception as e:
+                logger.warning(f"채널 조회 실패 ({channel_ref}): {e}")
+                failed_channels.append(channel_ref)
+        
+        folder_info[group_name] = {
+            "channels": channels,
+            "success_count": len(channels),
+            "failed_count": len(failed_channels),
+            "failed_channels": failed_channels,
+        }
+        
+        logger.info(f"'{group_name}' 그룹: {len(channels)}개 채널 조회 성공, {len(failed_channels)}개 실패")
+    
+    return folder_info
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣3️⃣  agents/agent_orchestrator.py - 에이전트 반환값 검증 없음
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】agents/agent_orchestrator.py (process 메서드)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+class AgentOrchestrator:
+    def __init__(self):
+        self.agents = {
+            "sentiment": SentimentAnalyst(),
+            "technical": TechnicalAnalyst(),
+            "risk": RiskManagement(),
+            "researcher": ResearcherTeam(),
+            "trader": TraderAgent(),
+            "portfolio": PortfolioManager(),
+        }
+    
+    def process(self, input_data: dict) -> dict:
+        """에이전트 오케스트레이션 - 단계별 오류 처리"""
+        
+        # ✅ 입력값 검증
+        if not input_data or not isinstance(input_data, dict):
+            logger.error("입력값이 유효하지 않음")
+            return {"success": False, "error": "Invalid input"}
+        
+        results = {
+            "stage": "init",
+            "timestamp": datetime.now().isoformat(),
+            "stages": {}
+        }
+        
+        try:
+            # 1단계: 감정 분석
+            results["stage"] = "sentiment"
+            sentiment_result = self._safe_agent_call(
+                "sentiment",
+                input_data,
+                required_keys=["sentiment_score"]
+            )
+            if not sentiment_result.get("success"):
+                return self._build_error_response(results, "Sentiment analysis failed")
+            
+            results["stages"]["sentiment"] = sentiment_result
+            
+            # 2단계: 기술적 분석
+            results["stage"] = "technical"
+            technical_result = self._safe_agent_call(
+                "technical",
+                {**input_data, **sentiment_result},
+                required_keys=["rsi", "trend"]
+            )
+            if not technical_result.get("success"):
+                return self._build_error_response(results, "Technical analysis failed")
+            
+            results["stages"]["technical"] = technical_result
+            
+            # 3단계: 리스크 관리
+            results["stage"] = "risk"
+            risk_result = self._safe_agent_call(
+                "risk",
+                {**input_data, **technical_result},
+                required_keys=["risk_score", "position_size"]
+            )
+            if not risk_result.get("success"):
+                return self._build_error_response(results, "Risk management failed")
+            
+            results["stages"]["risk"] = risk_result
+            
+            # 4단계: 연구팀
+            results["stage"] = "researcher"
+            researcher_result = self._safe_agent_call(
+                "researcher",
+                {**input_data, **risk_result},
+                required_keys=["recommendation"]
+            )
+            if not researcher_result.get("success"):
+                return self._build_error_response(results, "Research analysis failed")
+            
+            results["stages"]["researcher"] = researcher_result
+            
+            # 5단계: 매매 결정
+            results["stage"] = "trader"
+            trader_result = self._safe_agent_call(
+                "trader",
+                {**input_data, **researcher_result},
+                required_keys=["action"]
+            )
+            if not trader_result.get("success"):
+                return self._build_error_response(results, "Trading decision failed")
+            
+            results["stages"]["trader"] = trader_result
+            
+            # 6단계: 포트폴리오 관리
+            results["stage"] = "portfolio"
+            portfolio_result = self._safe_agent_call(
+                "portfolio",
+                {**input_data, **trader_result},
+                required_keys=[]
+            )
+            
+            results["stages"]["portfolio"] = portfolio_result
+            results["success"] = True
+            results["final_action"] = trader_result.get("action")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"오케스트레이션 중 예상치 못한 오류 (단계: {results['stage']}): {e}")
+            return self._build_error_response(results, str(e))
+    
+    def _safe_agent_call(self, agent_name: str, input_data: dict, required_keys: list) -> dict:
+        """안전한 에이전트 호출"""
+        try:
+            agent = self.agents.get(agent_name)
+            if not agent:
+                logger.error(f"에이전트를 찾을 수 없음: {agent_name}")
+                return {"success": False, "error": f"Agent '{agent_name}' not found"}
+            
+            result = agent.process(input_data)
+            
+            # ✅ 반환값 검증
+            if result is None:
+                logger.error(f"에이전트가 None 반환: {agent_name}")
+                return {"success": False, "error": f"Agent '{agent_name}' returned None"}
+            
+            if not isinstance(result, dict):
+                logger.error(f"에이전트가 dict가 아닌 값 반환: {agent_name}, {type(result)}")
+                return {"success": False, "error": f"Invalid return type from '{agent_name}'"}
+            
+            # ✅ 필수 필드 확인
+            for key in required_keys:
+                if key not in result:
+                    logger.warning(f"필수 필드 누락: {agent_name}.{key}")
+                    result[key] = None
+            
+            result["success"] = True
+            return result
+            
+        except Exception as e:
+            logger.error(f"에이전트 호출 실패 ({agent_name}): {e}")
+            return {"success": False, "error": str(e)}
+    
+    def _build_error_response(self, results: dict, error_msg: str) -> dict:
+        """오류 응답 구성"""
+        results["success"] = False
+        results["error"] = error_msg
+        return results
+
+────────────────────────────────────────────────────────────────
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣4️⃣  config.py - 환경 변수 검증 부족
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】config.py (get_env_or_default 함수)
+
+【수정 코드】
+────────────────────────────────────────────────────────────────
+
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+def get_env_or_default(key: str, default: str = "", required: bool = False) -> str:
+    """환경 변수 조회 - 검증"""
+    value = os.getenv(key, default)
+    
+    # ✅ 1단계: placeholder 값 확인
+    if isinstance(value, str) and value.startswith("your_"):
+        logger.warning(f"설정 누락: {key} (placeholder 값 사용 중)")
+        if required:
+            raise ValueError(f"필수 설정 누락: {key}")
+        return default
+    
+    # ✅ 2단계: 필수 항목이 비었는지 확인
+    if required and not value:
+        raise ValueError(f"필수 설정이 비어있음: {key}")
+    
+    # ✅ 3단계: 민감 정보는 마스킹
+    if "TOKEN" in key or "SECRET" in key or "KEY" in key or "PASSWORD" in key:
+        masked = value[:3] + "***" + value[-3:] if len(value) > 6 else "***"
+        logger.debug(f"{key}={masked}")
+    else:
+        logger.debug(f"{key}={value}")
+    
+    return value
+
+
+def validate_config():
+    """주요 설정 검증"""
+    required_keys = {
+        "KIS_API_KEY": "한투 API 키",
+        "KIS_SECRET": "한투 API 시크릿",
+        "TELEGRAM_BOT_TOKEN": "텔레그램 봇 토큰",
+    }
+    
+    missing_keys = []
+    for key, description in required_keys.items():
+        try:
+            value = get_env_or_default(key, required=True)
+            if not value:
+                missing_keys.append(f"{key} ({description})")
+        except ValueError as e:
+            missing_keys.append(f"{key} ({description}): {e}")
+    
+    if missing_keys:
+        raise RuntimeError(f"필수 설정 누락:\n" + "\n".join(missing_keys))
+    
+    logger.info("✅ 모든 필수 설정 검증 완료")
+
+
+# 모듈 로드 시 검증
+try:
+    validate_config()
+except RuntimeError as e:
+    logger.error(f"설정 검증 실패: {e}")
+    raise
+
+# 나머지 설정들 (검증 포함)
+KIS_API_KEY = get_env_or_default("KIS_API_KEY", required=True)
+KIS_SECRET = get_env_or_default("KIS_SECRET", required=True)
+TELEGRAM_BOT_TOKEN = get_env_or_default("TELEGRAM_BOT_TOKEN", required=True)
+
+────────────────────────────────────────────────────────────────
+
+
+================================================================================
+                          📋 종합 정리 및 우선순위
+================================================================================
+
+【최우선 (이번 주)】
+  1. kis_api.py #1 - get_access_token() 응답 검증
+  2. kis_api.py #2 - order_cash() 반환값 보장
+  3. trader.py #3 - 토큰 실패 후 API 호출 방지
+  5. telegram_bot.py #5 - HTTP 상태 + JSON 파싱
+
+【높은 우선순위 (1-2주)】
+  4. scheduler.py #4 - 토큰 캐시 메커니즘 도입
+  6. analyzer.py #6 - is_market_bullish() None 처리
+  10. sentiment_analyst.py #10 - 외부 API 예외 처리
+
+【중간 우선순위 (2-3주)】
+  7. analyzer.py #7 - is_valid_stock_final() 입력값 검증
+  8. stock_data.py #8 - 배열 안전 접근
+  9. position_tracker.py #9 - 파일 저장 실패 처리
+  11. technical_analyst.py #11 - talib 데이터 타입
+
+【낮은 우선순위 (한 달 내)】
+  12. telegram_listener.py #12 - 재연결 로직
+  13. agent_orchestrator.py #13 - 에러 격리
+  14. config.py #14 - 환경 변수 검증
+
+================================================================================
+                            작업 체크리스트
+================================================================================
+
+파일별 수정 현황 추적용:
+
+kis_api.py
+  [ ] #1 - get_access_token() JSON 파싱 검증
+  [ ] #2 - order_cash() 반환값 보장
+  
+trader.py
+  [ ] #3 - 토큰 유효성 재검증 + 즉시 반환
+  
+scheduler.py
+  [ ] #4 - 토큰 캐시 메커니즘
+
+telegram_bot.py
+  [ ] #5 - HTTP 상태 + Content-Type + JSON 파싱
+
+analyzer.py
+  [ ] #6 - is_market_bullish() None 체크 + 타입 검증
+  [ ] #7 - is_valid_stock_final() 입력값 검증
+
+stock_data.py
+  [ ] #8 - fetch_previous_close() 배열 안전 접근
+
+position_tracker.py
+  [ ] #9 - _save() 반환값 + 백업 + 롤백
+
+agents/sentiment_analyst.py
+  [ ] #10 - fetch_recent_news() HTTP/JSON 상세 처리
+
+agents/technical_analyst.py
+  [ ] #11 - process() 데이터 타입 검증 + numpy
+
+telegram_listener.py
+  [ ] #12 - connect() 재연결 로직
+
+agents/agent_orchestrator.py
+  [ ] #13 - process() 반환값 검증 + 에러 격리
+
+config.py
+  [ ] #14 - get_env_or_default() 필수/선택 구분
+
+================================================================================
+생성일: 2026-05-12
+버전: 2.0 (상세 수정 코드 포함)
+================================================================================

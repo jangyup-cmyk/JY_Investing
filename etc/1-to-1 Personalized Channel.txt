@@ -1,0 +1,150 @@
+기존의 '단일 채널 그룹 발송' 방식에서 **'1계좌 1봇 1채널 (1-to-1 Personalized Channel)'** 형태로 구조를 변경하는 것은, 고객(VIP)별로 완벽하게 프라이버시를 보장하고 맞춤형 서비스를 제공할 수 있는 매우 훌륭한 비즈니스 모델업그레이드입니다.
+
+이 구조로 변경하려면 중앙에서 전체 메시지를 쏘는 방식이 아니라, **사용자 정보(USERS) 배열 안에 각자의 텔레그램 봇 토큰과 채널 ID를 귀속**시키고, 매매 스레드가 각자의 봇을 통해 개별적으로 메시지를 쏘도록 아키텍처를 수정해야 합니다.
+
+통합 명세서 v3.0에서 변경되어야 할 **핵심 3개 모듈의 수정 코드**를 안내해 드립니다.
+
+---
+
+### 1. `config.py` 수정 (개별 봇 토큰 및 채널 ID 추가)
+
+기존에 전역 변수로 관리하던 텔레그램 봇 토큰을 제거하고, `USERS` 배열 내에 각 계좌별 고유 봇 토큰(`bot_token`)과 채널 ID(`channel_id`)를 추가합니다.
+
+```python
+# config.py
+
+# 다계좌 정보 및 개별 텔레그램 봇 관리
+USERS = [
+    {
+        "name": "전장엽님", 
+        "account_no": "73918950", 
+        "budget": 1_000_000, 
+        "app_key": "전장엽님_앱키", 
+        "app_secret": "전장엽님_시크릿",
+        "bot_token": "전장엽님_전용_봇토큰",   # ⭐️ 신규: A계좌 봇
+        "channel_id": "@jy_private_ch_A"      # ⭐️ 신규: A계좌 채널
+    },
+    {
+        "name": "김양선님", 
+        "account_no": "75045260", 
+        "budget": 1_000_000, 
+        "app_key": "김양선님_앱키", 
+        "app_secret": "김양선님_시크릿",
+        "bot_token": "김양선님_전용_봇토큰",   # ⭐️ 신규: B계좌 봇
+        "channel_id": "@ys_private_ch_B"      # ⭐️ 신규: B계좌 채널
+    }
+]
+
+# 시스템 치명적 오류 수신용 관리자 개인 봇 (유지)
+TELEGRAM_ADMIN_BOT_TOKEN = "관리자_메인_봇토큰"
+TELEGRAM_ADMIN_ID = "운영자_개인_ID"
+
+```
+
+---
+
+### 2. `telegram_bot.py` 수정 (개별 발송 로직)
+
+고정된 봇이 아니라, 매개변수로 전달받은 **개별 유저의 봇 토큰과 채널 ID를 이용해 API를 호출**하도록 변경합니다.
+
+```python
+# telegram_bot.py
+import requests
+
+def send_custom_message(bot_token, channel_id, text):
+    """전달받은 특정 봇 토큰과 채널로 메시지를 발송하는 코어 함수"""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": channel_id, 
+        "text": text, 
+        "parse_mode": "HTML"
+    }
+    try:
+        return requests.post(url, json=payload).json()
+    except Exception as e:
+        print(f"텔레그램 발송 실패 ({channel_id}): {e}")
+        return None
+
+def send_personal_buy_signal(user, name, code, price, rate):
+    """개별 사용자 계좌 전용 매수 시그널 발송"""
+    budget = user["budget"]
+    qty = int((budget / 2) / price) # 50% 분할 매수 수량
+    
+    text = (
+        f"⭐️ Ai 종목매수 시그널 [VIP 전용]\n"
+        f"￣￣￣￣￣￣￣￣￣￣￣￣￣￣￣\n"
+        f"매수 종목명 : {name} ({code})\n"
+        f"매수 가격 : {price:,}원 👉 {rate:.2f}%\n"
+        f"매수 금액 : 총 {budget:,}원\n\n"
+        f"[체결 및 대기 상세]\n"
+        f"✅ 1차 시장가 체결 : {int(budget/2):,}원 ({qty:,}주)\n"
+        f"⏳ 2차 지정가 대기 : {int(budget/2):,}원 ({qty:,}주)\n"
+        f"(*10분 후 미체결 시 자동 취소)\n\n"
+        f"매수 계좌 : {user['name']} {user['account_no']}계좌"
+    )
+    # 해당 유저의 전용 봇과 전용 채널로 발송
+    return send_custom_message(user["bot_token"], user["channel_id"], text)
+
+def send_personal_cancel_alert(user, stock_code, unfilled_qty):
+    """개별 사용자 미체결 취소 알림"""
+    text = f"⚠️ [자동취소] {user['name']}님 계좌의 {stock_code} 미체결 지정가 매수({unfilled_qty}주)가 10분 경과로 자동 취소되었습니다."
+    return send_custom_message(user["bot_token"], user["channel_id"], text)
+
+```
+
+---
+
+### 3. `trader.py` 수정 (독립적인 스레드 실행 및 즉시 알림)
+
+기존에는 모든 체결 결과를 하나로 묶어서(`success_results`) 한 번에 알림을 보냈으나, 이제는 **각자의 매수 주문이 끝나는 즉시 해당 사용자의 채널로 봇이 알림을 쏘도록** 파이프라인을 변경합니다.
+
+```python
+# trader.py
+import concurrent.futures
+import config
+import telegram_bot as bot
+
+# (execute_split_buy 함수는 이전 코드 유지 - API 주문 전송 역할)
+
+def trade_and_notify(user, stock):
+    """[단일 스레드 작업] 매수를 실행하고 성공하면 개별 채널에 봇 알림 발송"""
+    
+    # 1. 50:50 분할 매수 주문 실행
+    res = execute_split_buy(user, stock["code"], stock["price"])
+    
+    # 2. 매수 주문이 성공적으로 들어갔다면, 해당 유저의 봇으로 즉시 알림 발송
+    if res:
+        bot.send_personal_buy_signal(
+            user=user,
+            name=stock["name"], 
+            code=stock["code"], 
+            price=stock["price"], 
+            rate=stock["change_rate"]
+        )
+    return res
+
+def process_signals_and_trade(stock):
+    """포착된 종목을 다계좌에 동시 실행하는 진입점"""
+    
+    # 1. 포착 시그널을 각 사용자의 채널에 먼저 동시 발송 (옵션)
+    for user in config.USERS:
+        text = f"⭐️ Ai 종목포착: {stock['name']} ({stock['price']:,}원)"
+        bot.send_custom_message(user["bot_token"], user["channel_id"], text)
+        
+    # 2. 다계좌 동시 체결 및 개별 매수 알림 발사 (멀티스레딩)
+    # 10명의 유저라면 10개의 독립적인 작업이 동시에 실행됨
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(config.USERS)) as executor:
+        futures = [executor.submit(trade_and_notify, user, stock) for user in config.USERS]
+        
+        # 결과 대기
+        for future in concurrent.futures.as_completed(futures):
+            # 오류 발생 시 로깅 등 예외 처리 가능
+            pass
+
+```
+
+### 💡 아키텍처 변경에 따른 운영 팁
+
+1. **봇파더(BotFather) 설정:** 계좌(고객)가 추가될 때마다 텔레그램 `@BotFather`를 통해 새로운 봇을 생성(예: `A_Trade_Bot`, `B_Trade_Bot`)하고 토큰을 발급받아 `config.py`에 넣어야 합니다.
+2. **Rate Limit 방어:** 텔레그램 봇은 동일 채널에 초당 발송할 수 있는 메시지 수가 제한되어 있습니다. 하지만 이 방식처럼 **"서로 다른 봇이 서로 다른 채널에"** 메시지를 쏘는 구조는 텔레그램의 트래픽 제한(Rate Limit)에 걸리지 않는 매우 안전한 구조입니다.
+3. **취소 스케줄러 수정:** 이전 대화에서 작성한 10분 뒤 미체결을 확인하는 `check_and_cancel_order` 함수 내에서도 취소 성공 시 `bot.send_personal_cancel_alert(user, ...)`를 호출하도록 연결만 해주시면 완벽합니다.

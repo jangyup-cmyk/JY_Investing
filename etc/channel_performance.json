@@ -1,0 +1,23 @@
+{
+  "period": "weekly",
+  "channels": {
+    "_root": {
+      "win_rate": 0.51,
+      "avg_return_pct": 1.2,
+      "signal_count": 12,
+      "base_weight": 0.9
+    },
+    "channel_alpha": {
+      "win_rate": 0.63,
+      "avg_return_pct": 3.8,
+      "signal_count": 18,
+      "base_weight": 1.0
+    },
+    "channel_beta": {
+      "win_rate": 0.47,
+      "avg_return_pct": -1.1,
+      "signal_count": 9,
+      "base_weight": 1.0
+    }
+  }
+}

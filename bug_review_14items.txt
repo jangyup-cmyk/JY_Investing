@@ -1,0 +1,580 @@
+================================================================================
+                    코드 리뷰: 14개 버그 종합 분석
+                         Code Review Report
+================================================================================
+생성일: 2026-05-12
+리뷰 범위: 전체 프로젝트 (주요 Python 파일)
+리뷰 항목: 버그 위험성 + 테스트 누락
+
+================================================================================
+📊 심각도 분류
+================================================================================
+🔴 높은 심각도 (5개): 운영 중 프로그램 중단 가능성 높음
+🟡 중간 심각도 (5개): 데이터 손실 또는 기능 오류 가능
+🔵 낮은 심각도 (4개): 성능 저하 또는 로그 부실
+
+================================================================================
+                           🔴 높은 심각도 (5개)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣  kis_api.py - API 응답이 JSON이 아닐 때 crash
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  kis_api.py, 라인 85-90 (get_access_token 메서드)
+
+【문제 코드】
+  res = requests.post(url, json=payload, headers=headers, timeout=5)
+  if res.status_code == 200:
+      self.access_token = res.json().get("access_token", "")  # ← JSON이 아니면 crash
+
+【발생 상황】
+  - 프록시/방화벽이 HTML 에러 페이지 반환 (HTTP 200 + HTML body)
+  - API 서버 중단 시 JSON 파싱 실패
+  - 앱 아무 메시지도 남기지 않고 중단
+
+【수정 방향】
+  ✅ 1단계: Content-Type 헤더 확인 (application/json 여부)
+  ✅ 2단계: 실제 JSON 파싱 시도 (ValueError 예외 처리)
+  ✅ 3단계: API 응답 코드 (rt_cd) 검증
+  ✅ 4단계: 토큰 존재 확인 (빈 문자열 제외)
+  ✅ 5단계: 각 단계별 상세 에러 로깅
+
+【테스트 필요】
+  - API 서버가 HTML 에러 페이지 반환할 때 처리
+  - 네트워크 타임아웃 상황
+  - JSON 파싱 실패 케이스
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2️⃣  kis_api.py - order_cash() 반환값이 None일 수 있음
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  kis_api.py, 라인 125-135 (order_cash 메서드)
+  trader.py, 라인 37 (호출 부분)
+
+【문제 코드】
+  def order_cash(...) -> dict:
+      try:
+          res = requests.post(...)
+          if res.status_code == 200:
+              return res.json()
+          else:
+              return {"success": False, "error": res.text}
+      except Exception as e:
+          return {"success": False, "error": str(e)}
+      # ← exception 발생하면 None 반환 가능
+  
+  # 사용처:
+  res_market = kis_client.order_cash(...)
+  market_success = res_market.get("rt_cd") == "0"  # ← None.get() = AttributeError
+
+【발생 상황】
+  - JSON 파싱 실패 시 exception → None 반환
+  - res_market.get() 호출 시 AttributeError
+  - dict 메서드를 호출할 수 없음
+
+【수정 방향】
+  ✅ 메서드가 항상 dict를 반환하도록 보장
+  ✅ exception 케이스도 명시적인 dict 반환
+  ✅ rt_cd 필드 필수 포함 (기본값: "-1")
+  ✅ HTTP 상태/JSON 파싱 각각 예외 처리
+  ✅ 호출부에서 None 체크 추가
+
+【테스트 필요】
+  - 네트워크 오류 시 반환값
+  - JSON 파싱 실패 시 반환값
+  - 모든 반환값에 rt_cd 필드 존재 확인
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3️⃣  trader.py - 토큰 실패 후에도 API 호출 진행
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  trader.py, 라인 30-40 (execute_split_buy 메서드)
+
+【문제 코드】
+  if not kis_client.get_access_token():
+      logger.error(f"{user['name']} 토큰 발급 실패")
+      return None  # ← 여기서 반환하고...
+  
+  # 라인 37 (이어서)
+  res_market = kis_client.order_cash(stock_code, qty_market, 0, "01")
+  # ← 토큰이 빈 문자열("")일 때 실행됨 (return 전에 exception 발생 가능)
+
+【발생 상황】
+  - kis_api.py에서 토큰 발급 실패 시 self.access_token = ""로 설정
+  - 토큰 검증이 없어서 빈 토큰으로 API 호출
+  - API는 401 오류 응답 + 불필요한 로그 누적
+
+【수정 방향】
+  ✅ 1단계: get_access_token() 반환값 확인
+  ✅ 2단계: 토큰 유효성 재검증 (빈 문자열 제외)
+  ✅ 3단계: 토큰 실패 시 즉시 반환 (API 호출 금지)
+  ✅ 4단계: order_cash() 반환값도 None 체크
+  ✅ 5단계: 에러 응답에 명확한 이유 기록
+
+【테스트 필요】
+  - 토큰 발급 실패 케이스
+  - 토큰이 빈 문자열일 때 처리
+  - 토큰 실패 후 API 호출 방지 확인
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4️⃣  scheduler.py - KISAPIClient 반복 생성 (API 호출 초과)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  scheduler.py, 라인 135-165 (run_signal_pipeline 메서드)
+
+【문제 코드】
+  for user in config.USERS:
+      kis_client = KISAPIClient(user)  # ← 매번 생성
+      if not kis_client.get_access_token():  # ← 매번 토큰 발급 API 호출
+          continue
+      
+      for stock_code in stock_codes:  # ← N개 종목 반복
+          # API 호출...
+
+【발생 상황】
+  - 20개 종목 × 3개 계좌 = 60회 반복 실행
+  - 매 반복마다 토큰 발급 API 호출 (60회)
+  - KIS API 초당 20 요청 제한 → Rate limit 초과 (429 오류)
+
+【수정 방향】
+  ✅ 토큰 캐시 메커니즘 도입
+  ✅ 사용자별 토큰 한 번만 발급
+  ✅ 종목 처리 시 캐시된 토큰 전달 (재발급 금지)
+  ✅ 토큰 유효 시간 내에는 재사용
+  ✅ Rate limit 대비 대기 로직 추가
+
+【테스트 필요】
+  - 많은 종목 처리 시 API 호출 수 확인
+  - Rate limit 429 오류 발생 여부
+  - 토큰 재사용 시 정상 작동 확인
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5️⃣  telegram_bot.py - requests.post().json() 예외 처리 미흡
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  telegram_bot.py, 라인 15-18 (send_custom_message 메서드)
+
+【문제 코드】
+  try:
+      return requests.post(url, json=payload, timeout=5).json()
+      # ← JSONDecodeError 가능 (응답이 JSON이 아닐 때)
+  except Exception as exc:
+      logger.error(f"Telegram 전송 실패: {exc}")
+      return {"ok": False, "error": str(exc)}
+
+【발생 상황】
+  - Telegram 서버 문제 → HTML 에러 페이지 반환
+  - HTTP 200이지만 JSON이 아님
+  - .json() 호출 시 JSONDecodeError 발생
+  - HTTP 상태 코드 미확인
+
+【수정 방향】
+  ✅ 1단계: HTTP 상태 코드 먼저 확인 (200인지)
+  ✅ 2단계: Content-Type 헤더 확인 (application/json)
+  ✅ 3단계: .json() 호출 전에 유효성 검증
+  ✅ 4단계: 각 오류 케이스 구분 처리
+  ✅ 5단계: 네트워크 오류와 API 오류 분리
+
+【테스트 필요】
+  - Telegram API 서버 에러 응답
+  - HTTP 상태 코드별 처리 (4xx, 5xx)
+  - JSON이 아닌 응답 처리
+  - 네트워크 타임아웃
+
+
+================================================================================
+                           🟡 중간 심각도 (5개)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6️⃣  analyzer.py - is_market_bullish()에서 None 처리 부재
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  analyzer.py, 라인 101-108 (is_market_bullish 메서드)
+
+【문제 코드】
+  data = kis_client.get_index_price(code)  # ← None 반환 가능
+  results[name] = float(data.get("bstp_nmix_prdy_ctrt", 0))
+  # ← data가 None이면 AttributeError (None.get() 불가)
+
+【발생 상황】
+  - kis_client.get_index_price()가 None 반환 가능
+  - None.get() 호출 시 AttributeError 발생
+  - except에서 잡긴 하지만 지수를 0으로 설정 (상승장→하락장 오판)
+
+【수정 방향】
+  ✅ data가 None인지 명시적 확인
+  ✅ data가 dict인지 타입 검증
+  ✅ 필드 존재 확인 후 접근
+  ✅ float() 변환 실패 처리
+  ✅ 각 단계 로깅으로 문제 추적
+
+【테스트 필요】
+  - API가 None 반환할 때 처리
+  - 필드 누락 시 동작
+  - 데이터 타입 불일치 처리
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7️⃣  analyzer.py - is_valid_stock_final()에서 user가 None
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  analyzer.py, 라인 210-220 (is_valid_stock_final 메서드)
+
+【문제 코드】
+  def is_valid_stock_final(
+      ...
+      user: dict,  # ← None 가능
+      ...
+  ) -> dict:
+      ...
+      mr = is_market_bullish(user, token, ...)
+      # ← user가 None일 때 KISAPIClient(None)에서 crash
+
+【발생 상황】
+  - is_valid_stock_final(user=None) 호출 가능
+  - is_market_bullish(None) 전달
+  - KISAPIClient(None) 생성 시도 → AttributeError
+
+【수정 방향】
+  ✅ 메서드 시작 시 필수 입력값 검증
+  ✅ stock, user, daily_prices 등 None 체크
+  ✅ 데이터 타입도 검증 (dict, list 등)
+  ✅ 에러 응답에 명확한 이유 기록
+
+【테스트 필요】
+  - user가 None일 때 처리
+  - stock이 없을 때 처리
+  - daily_prices가 비었을 때 처리
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8️⃣  stock_data.py - 빈 배열로 인한 IndexError
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  stock_data.py, 라인 32 (fetch_previous_close 메서드)
+
+【문제 코드】
+  daily_data = kis_client.get_daily_price(stock_code, count=2)
+  if not daily_data:
+      return 0.0
+  
+  prev_close_price = daily_data[0].get("stck_clpr", "0")
+  # ← [0] 접근 전에 길이 재확인 필요
+
+【발생 상황】
+  - daily_data = [] 일 때 (빈 리스트)
+  - if not daily_data에서 True → 반환
+  - 하지만 API 오류로 [0] 접근 시도하면 IndexError
+
+【수정 방향】
+  ✅ 데이터 자체 None 검증
+  ✅ 배열 타입 확인
+  ✅ 길이 명시적 확인 (len() >= 2)
+  ✅ 안전한 인덱스 접근
+  ✅ float() 변환 예외 처리
+
+【테스트 필요】
+  - daily_data가 None일 때
+  - daily_data가 빈 배열일 때
+  - daily_data가 1개 요소만 있을 때
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9️⃣  position_tracker.py - 파일 I/O 실패 무시
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  position_tracker.py, 라인 40-45 (_save 메서드)
+
+【문제 코드】
+  def _save(positions: dict) -> None:
+      try:
+          with open(POSITION_FILE, "w") as f:
+              json.dump(positions, f, ...)
+      except OSError as e:
+          logger.error(f"positions.json 저장 실패: {e}")
+          # ← 실패해도 return 없음, 호출자가 저장 실패 모름
+
+【발생 상황】
+  - 디스크 부족 또는 권한 부족
+  - 파일 손상 또는 경로 오류
+  - 포지션 데이터가 저장되지 않음 (다음 재시작 시 손실)
+
+【수정 방향】
+  ✅ 저장 성공/실패 반환값 제공 (bool)
+  ✅ 저장 전에 백업 파일 생성
+  ✅ 임시 파일에 쓴 후 원본 교체 (원자적)
+  ✅ 호출자에서 반환값 확인 및 롤백
+  ✅ 상세 에러 메시지 (OSError vs 기타)
+
+【테스트 필요】
+  - 디스크 부족 상황
+  - 권한 없는 디렉토리
+  - 파일 손상 시 복구
+  - 저장 실패 후 롤백
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔟  agents/sentiment_analyst.py - 외부 API 의존성 검증 부족
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  agents/sentiment_analyst.py, 라인 28-35 (fetch_recent_news 메서드)
+
+【문제 코드】
+  try:
+      res = requests.get(url, headers=headers, timeout=3)
+      if res.status_code == 200:
+          data = res.json()
+          # ... 파싱 로직
+          return titles
+  except Exception as e:
+      return []  # ← 빈 배열만 반환, 오류 정보 없음
+
+【발생 상황】
+  - 네이버 API 차단 (429 Rate limit)
+  - 타임아웃 또는 연결 실패
+  - JSON 파싱 오류
+  - 빈 배열만 반환되어 뉴스 누락 미감지
+
+【수정 방향】
+  ✅ HTTP 상태 코드별 처리 (200, 429, 기타)
+  ✅ Rate limit 감지 시 대기/재시도
+  ✅ 응답 구조 검증
+  ✅ JSON 파싱 예외 처리
+  ✅ 반환값에 성공/실패 정보 포함 (dict)
+
+【테스트 필요】
+  - API 차단 (429) 처리
+  - 타임아웃 상황
+  - JSON 파싱 실패
+  - 필드 누락 시 안전 처리
+
+
+================================================================================
+                           🔵 낮은 심각도 (4개)
+================================================================================
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣1️⃣  agents/technical_analyst.py - talib 데이터 타입 불일치
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  agents/technical_analyst.py, 라인 37-50 (process 메서드)
+
+【문제 코드】
+  daily_prices = input_data.get("daily_prices", [])
+  daily_highs = input_data.get("daily_highs", daily_prices)  # 기본값으로 prices 사용
+  daily_lows = input_data.get("daily_lows", daily_prices)
+  
+  rsi = talib.RSI(daily_prices)  # ← 데이터가 dict 배열이면 TypeError
+  macd, signal, hist = talib.MACD(daily_prices)
+  k, d = talib.STOCH(daily_highs, daily_lows, daily_prices)
+
+【발생 상황】
+  - daily_prices가 float 배열이 아님 (dict, string 포함)
+  - talib 함수는 float 배열 기대
+  - 입력값 타입 불일치 → ValueError/TypeError 발생
+
+【수정 방향】
+  ✅ 입력 데이터 타입 검증 메서드 작성
+  ✅ float 배열로 변환 (numpy array)
+  ✅ 최소 데이터 개수 확인 (20개 이상)
+  ✅ talib 계산 결과 None 처리
+  ✅ 에러 발생 시 기본값 반환 (trending, None 등)
+
+【테스트 필요】
+  - 데이터 타입 다양성 (dict, string, None)
+  - 데이터 부족 시 처리
+  - talib 계산 실패 처리
+  - 반환값 구조 일관성
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣2️⃣  telegram_listener.py - Async 함수 재연결 로직 없음
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  telegram_listener.py, 라인 116-125 (connect 메서드)
+
+【문제 코드】
+  async def connect(self) -> bool:
+      try:
+          self.client = TelegramClient(...)
+          await self.client.start(phone=self.phone_number)
+          logger.info("연결 성공")
+          return True
+      except Exception as e:
+          logger.error(f"연결 실패: {e}")
+          return False  # ← 재연결 시도 없음
+
+【발생 상황】
+  - 일시적 네트워크 오류 시 영구 실패
+  - 연결 해제 후 재연결 로직 부재
+  - 채널 모니터링 중단
+
+【수정 방향】
+  ✅ 재연결 로직 추가 (최대 N회)
+  ✅ 지수 백오프 (exponential backoff) 대기
+  ✅ 연결 상태 확인 (is_user_authorized)
+  ✅ 채널 조회 시 부분 실패 처리
+  ✅ 실패 채널 목록 반환
+
+【테스트 필요】
+  - 네트워크 단절 후 자동 재연결
+  - 일부 채널 조회 실패 시 계속 진행
+  - 최대 재시도 횟수 초과 처리
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣3️⃣  agents/agent_orchestrator.py - 에이전트 반환값 검증 없음
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  agents/agent_orchestrator.py (agent_orchestrator.process 메서드)
+
+【문제 코드】
+  sentiment_result = self.agents["sentiment"].process(input_data)  # None 가능
+  technical_result = self.agents["technical"].process(sentiment_result)  # None.get() = crash
+  risk_result = self.agents["risk"].process(technical_result)
+  # ← 한 에이전트 실패 시 전체 파이프라인 중단
+
+【발생 상황】
+  - 에이전트가 None 반환 가능
+  - 다음 단계에 None 전달 → crash
+  - 한 에이전트 오류로 전체 실패
+
+【수정 방향】
+  ✅ 각 에이전트 호출을 wrapper 함수로 감싸기
+  ✅ 반환값 None 체크 및 기본값 제공
+  ✅ 각 단계 try-except로 격리
+  ✅ 부분 실패 시에도 계속 진행 옵션
+  ✅ 성공/실패 여부 상세 기록
+
+【테스트 필요】
+  - 각 에이전트 반환값 None 처리
+  - 특정 에이전트 오류 시 전체 영향도
+  - 부분 성공/부분 실패 케이스
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1️⃣4️⃣  config.py - 환경 변수 검증 부족
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【문제 파일】
+  config.py (get_env_or_default 함수)
+
+【문제 코드】
+  def get_env_or_default(key: str, default: str = "") -> str:
+      value = os.getenv(key, default)
+      if value.startswith("your_"):
+          logger.warning(f"설정 누락: {key}")
+          return default
+      return value
+  
+  # 사용 예
+  KIS_API_KEY = get_env_or_default("KIS_API_KEY", "")  # ← 빈 문자열 허용
+
+【발생 상황】
+  - placeholder 값은 감지하지만 빈 문자열은 허용
+  - 필수 설정이 누락되어도 빈 문자열로 진행
+  - 런타임에 API 호출 시 인증 실패
+
+【수정 방향】
+  ✅ 필수/선택 파라미터 구분
+  ✅ 빈 문자열 체크 추가
+  ✅ required=True일 때 ValueError 발생
+  ✅ 모듈 로드 시 validate_config() 실행
+  ✅ 민감 정보 마스킹 (토큰, 시크릿)
+
+【테스트 필요】
+  - 필수 설정 누락 시 오류
+  - 빈 문자열 설정 감지
+  - 필수 설정 검증 함수
+
+
+================================================================================
+                           📋 즉시 수정 우선순위
+================================================================================
+
+【최우선 (이번 주)】
+  1. kis_api.py #1 - API 응답 JSON 파싱 실패 → 프로그램 중단
+  2. kis_api.py #2 - order_cash() None 반환 → AttributeError
+  3. trader.py #3 - 빈 토큰 API 호출 → 불필요한 오류
+  5. telegram_bot.py #5 - JSON 응답 처리 → 메시지 전송 실패
+
+【높은 우선순위 (1-2주)】
+  4. scheduler.py #4 - API 호출 초과 → Rate limit
+  6. analyzer.py #6 - None 처리 → 지수 오판
+  10. sentiment_analyst.py #10 - 외부 API 검증
+
+【중간 우선순위 (2-3주)】
+  7. analyzer.py #7 - user 입력값 검증
+  8. stock_data.py #8 - 배열 안전 접근
+  9. position_tracker.py #9 - 파일 저장 실패
+  11. technical_analyst.py #11 - 타입 검증
+
+【낮은 우선순위 (한 달 내)】
+  12. telegram_listener.py #12 - 재연결 로직
+  13. agent_orchestrator.py #13 - 에러 격리
+  14. config.py #14 - 환경 변수 검증
+
+================================================================================
+                              📊 테스트 범위
+================================================================================
+
+【필수 테스트】
+  - 네트워크 오류 및 타임아웃
+  - API 서버 에러 응답 (4xx, 5xx)
+  - JSON/데이터 파싱 실패
+  - 필수 필드 누락
+  - None/빈 값 입력
+
+【권장 테스트】
+  - API Rate limit (429)
+  - 부분 데이터 손실 (일부 채널/종목)
+  - 동시성 시나리오
+  - 메모리/디스크 부족
+  - 권한 오류
+
+================================================================================
+                            📝 수정 체크리스트
+================================================================================
+
+파일별 수정 필요 여부 확인:
+  
+  [ ] kis_api.py          - 4개 문제 (#1, #2, #4, 토큰 캐시)
+  [ ] trader.py           - 1개 문제 (#3, 토큰 검증)
+  [ ] scheduler.py        - 2개 문제 (#4, API 최적화)
+  [ ] telegram_bot.py     - 1개 문제 (#5)
+  [ ] analyzer.py         - 2개 문제 (#6, #7)
+  [ ] stock_data.py       - 1개 문제 (#8)
+  [ ] position_tracker.py - 1개 문제 (#9)
+  [ ] agents/sentiment_analyst.py      - 1개 문제 (#10)
+  [ ] agents/technical_analyst.py      - 1개 문제 (#11)
+  [ ] telegram_listener.py             - 1개 문제 (#12)
+  [ ] agents/agent_orchestrator.py     - 1개 문제 (#13)
+  [ ] config.py           - 1개 문제 (#14)
+
+================================================================================
+                              작성일
+================================================================================
+생성일시: 2026-05-12
+리뷰어: Code Review Agent
+버전: 1.0
+
+================================================================================
