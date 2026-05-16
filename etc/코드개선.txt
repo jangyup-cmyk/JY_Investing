@@ -1,0 +1,64 @@
+현재 프로젝트 검토결과 다음 문제점이 있는것 같어
+문제점과 수정안을 검토하고 네 의견을 제시해줘
+
+위험 상황1:
+프록시/방화벽이 HTML 에러 페이지 반환 (status 200 + HTML body)
+API 서버 중단 시 JSON 파싱 실패
+앱이 아무 메시지도 남기지 않고 중단
+
+# kis_api.py 라인 85-90 (예상)
+res = requests.post(url, json=payload, headers=headers, timeout=5)
+if res.status_code == 200:
+    self.access_token = res.json().get("access_token", "")  # ← JSON이 아니면 JSONDecodeError
+
+
+수정 방안:
+def get_access_token(self, max_retries: int = 3, retry_delay: int = 2) -> bool:
+    """토큰 발급 (응답 타입 검증 추가)"""
+    for attempt in range(max_retries):
+        try:
+            res = requests.post(url, json=payload, headers=headers, timeout=5)
+            
+            # ✅ 1단계: HTTP 상태 확인
+            if res.status_code != 200:
+                logger.error(f"토큰 발급 실패: HTTP {res.status_code}")
+                return False
+            
+            # ✅ 2단계: Content-Type 확인
+            if 'application/json' not in res.headers.get('Content-Type', ''):
+                logger.error(f"예상치 못한 응답 형식: {res.headers.get('Content-Type')}")
+                return False
+            
+            # ✅ 3단계: JSON 파싱 + rt_cd 검증
+            try:
+                data = res.json()
+            except ValueError as e:
+                logger.error(f"JSON 파싱 실패: {e}, 응답: {res.text[:200]}")
+                return False
+            
+            # ✅ 4단계: API 응답 코드 검증
+            if data.get("rt_cd") != "0":
+                logger.error(f"API 오류: {data.get('msg', 'Unknown')}")
+                return False
+            
+            # ✅ 5단계: 토큰 존재 확인
+            token = data.get("output", {}).get("access_token", "").strip()
+            if not token:
+                logger.error("토큰이 비어있습니다")
+                return False
+            
+            self.access_token = token
+            logger.info(f"✅ 토큰 발급 성공")
+            return True
+            
+        except requests.Timeout:
+            logger.warning(f"타임아웃 ({attempt + 1}/{max_retries}), 재시도...")
+            time.sleep(retry_delay)
+        except Exception as e:
+            logger.error(f"예상치 못한 오류: {e}")
+            return False
+    
+    return False
+
+------------------------------------------------------------------------------------------------------
+

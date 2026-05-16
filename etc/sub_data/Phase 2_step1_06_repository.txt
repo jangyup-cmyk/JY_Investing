@@ -1,0 +1,267 @@
+## 총평
+
+현재 코드는 **개발용 1차 버전으로는 충분히 좋습니다.**
+하지만 Phase 2에서 백필 + 실시간 수집이 동시에 붙으면, 지금 상태로는 아래 3가지가 가장 먼저 문제를 일으킬 가능성이 큽니다.
+
+* **동시성 경쟁 시 insert 충돌**
+* **업데이트 범위가 좁아서 메타데이터가 오래된 값으로 남음**
+* **예외를 삼키는데 rollback이 없어 세션 상태가 애매해짐**
+
+---
+
+# 가장 중요한 수정 포인트
+
+## 1) `select -> add` 구조는 동시성에서 깨질 수 있습니다
+
+현재 `upsert_telegram_message()`는 먼저 조회하고, 없으면 `db.add()`로 신규 삽입합니다. 이 구조는 단일 워커에서는 대체로 괜찮지만, 같은 메시지가 거의 동시에 두 경로에서 들어오면 둘 다 “없음”을 보고 insert로 들어갈 수 있습니다. 그러면 유니크 제약 충돌이 commit/flush 시점에 터질 수 있습니다. 
+
+### 왜 중요한가
+
+지금은
+
+* 실시간 이벤트
+* 백필
+* 재시작 복원
+  이 모두 같은 메시지를 다시 만질 가능성이 있습니다.
+
+### 권장
+
+최소한 `IntegrityError`를 별도로 잡아서
+
+* rollback
+* 동일 키 재조회
+* `unchanged` 또는 `updated`로 정규화
+  하는 보강이 필요합니다.
+
+즉, 이 함수는 “논리적 upsert”는 맞지만 아직 “경쟁 상황에 강한 upsert”는 아닙니다.
+
+---
+
+## 2) 기존 메시지 update 범위가 너무 좁습니다
+
+현재 update 경로에서는 사실상 아래만 갱신합니다.
+
+* 더 최신 `edited_at`일 때: `message_text_raw`, `edited_at`, `raw_payload_json`
+* `is_deleted`
+* `views`
+* `forwards` 
+
+이 구조의 문제는, 아래 필드가 나중에 더 정확한 값으로 들어와도 반영되지 않을 수 있다는 점입니다.
+
+* `sender_id`
+* `grouped_id`
+* `reply_to_message_id`
+* `collected_at`
+* 경우에 따라 `raw_payload_json` 자체
+* 필요하다면 `posted_at`
+
+예를 들어 첫 저장 때 `reply_to_message_id=None`이었는데, 뒤에 백필에서 실제 값이 들어와도 지금 코드는 갱신하지 않습니다.
+즉 **본문 수정(edit)** 은 반영하지만, **메타데이터 보강(enrichment)** 은 거의 반영하지 못합니다.
+
+### 권장
+
+업데이트 로직을 두 층으로 나누는 게 좋습니다.
+
+* **편집 기반 갱신**
+
+  * 본문
+  * edited_at
+  * raw_payload_json
+* **null → 값 보강 또는 값 차이 갱신**
+
+  * sender_id
+  * grouped_id
+  * reply_to_message_id
+  * views
+  * forwards
+  * collected_at
+
+즉 “edited_at이 최신일 때만 갱신” 규칙과 “더 나은 메타데이터가 오면 보강” 규칙을 분리하는 편이 맞습니다.
+
+---
+
+## 3) 예외를 잡고 끝내는데 rollback이 없습니다
+
+현재 `except Exception as e:`에서 로그를 남기고 `action="failed"`를 반환합니다. 그런데 이 함수 내부에는 rollback이 없습니다. 
+
+이게 왜 중요하냐면, 호출부 `persist_message_payload()`가 실패 결과를 보고 rollback하도록 설계돼 있더라도, 함수 내부에서 예외를 삼켜버리면 **실제 DB 세션이 실패 상태인지 아닌지 호출부가 명확히 알기 어렵습니다.**
+
+### 권장
+
+둘 중 하나로 고정해야 합니다.
+
+### 방법 A
+
+이 함수는 예외를 삼키지 않고 그대로 던진다.
+→ wrapper가 rollback 담당
+
+### 방법 B
+
+이 함수가 예외를 삼키되, **반드시 `await db.rollback()`까지 수행**한다.
+→ repository가 rollback 담당
+
+지금처럼 “예외는 삼키지만 rollback 주체가 불명확한 상태”가 제일 위험합니다.
+
+제 추천은 현재 구조상 **wrapper가 트랜잭션 단위를 쥐고 있다면 A 방식**입니다.
+즉 repository는 예외를 로깅만 하지 말고 올려주는 편이 더 깔끔합니다.
+
+---
+
+# 그 다음으로 중요한 포인트
+
+## 4) timezone 처리 방식은 조금 위험합니다
+
+여기 부분입니다.
+
+```python
+msg_edited_at = msg.edited_at.replace(tzinfo=timezone.utc) if msg.edited_at else None
+payload_edited_at = payload.edited_at.replace(tzinfo=timezone.utc) if payload.edited_at else None
+```
+
+이 코드는 naive datetime을 UTC로 간주하는 용도로는 이해되지만, 이미 timezone-aware 값이 들어왔을 때도 `replace()`를 쓰면 **실제 시각을 변환하지 않고 tzinfo만 덮어씁니다.**
+즉 UTC가 아닌 aware datetime이 들어오면 시각이 틀어질 수 있습니다. 
+
+### 권장
+
+헬퍼 함수로 정리하는 편이 안전합니다.
+
+```python
+def normalize_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+```
+
+---
+
+## 5) `update_channel_checkpoint()`가 상태를 너무 적극적으로 ACTIVE로 만듭니다
+
+현재는 state가 없으면 새로 만들면서 `status=ACTIVE`를 넣고, 기존 상태가 `ERROR`면 다시 `ACTIVE`로 바꿉니다. 
+
+이건 성공 메시지 기준으로는 이해되지만, 약간 조심할 부분이 있습니다.
+
+### 문제 가능성
+
+* `PAUSED` 상태 채널에 실수로 이 함수가 호출되면 ACTIVE로 오해될 수 있음
+* 상태 레코드가 없는 버그 상황을 “방어적으로 ACTIVE 생성”으로 덮어버리면 문제 원인이 숨겨질 수 있음
+
+### 권장
+
+이 함수는 “성공 체크포인트 갱신”만 담당하고, 상태 전이는 조금 더 보수적으로 두는 게 좋습니다.
+
+예를 들면:
+
+* state 없으면 생성은 하되, status는 기존 정책에 따라 결정
+* `ERROR -> ACTIVE`는 허용
+* `PAUSED`는 함부로 ACTIVE로 바꾸지 않음
+
+다만 이건 **호출 경로가 잘 통제된다면 지금도 바로 치명적이진 않습니다.**
+그래도 의도를 더 명확히 하는 편이 좋습니다.
+
+---
+
+# 사소하지만 손보면 좋은 것
+
+## 6) `import json`는 현재 사용되지 않습니다
+
+맨 위 `import json`는 이 파일 안에서는 쓰이지 않습니다. 정리해도 됩니다. 
+
+## 7) 로그에 키 정보가 더 들어가면 좋습니다
+
+현재 로그는 `upsert_message 실패: {e}` 수준입니다.
+운영 시에는 최소한 아래가 들어가야 찾기 쉽습니다.
+
+* channel_id
+* tg_message_id
+* action context
+
+예:
+
+```python
+logger.error(
+    "upsert_message 실패 channel_id=%s tg_message_id=%s error=%s",
+    payload.telegram_channel_id,
+    payload.tg_message_id,
+    e,
+)
+```
+
+## 8) `has_media=False` 하드코딩은 나중에 빚이 될 수 있습니다
+
+신규 insert에서 `has_media=False`가 고정입니다. 
+지금 payload에 media 정보가 없어서 임시로 넣으신 것 같지만, 나중에 사진/파일/앨범 메시지를 다룰 예정이면 payload에 이 값을 넣거나 translator에서 계산하는 편이 낫습니다.
+
+---
+
+# 제가 권하는 수정 우선순위
+
+## 바로 수정
+
+1. **예외/rollback 책임을 명확히**
+2. **update 대상 필드 확대**
+3. **IntegrityError 경쟁 처리 추가**
+
+## 그 다음 수정
+
+4. timezone normalize helper 도입
+5. checkpoint 상태 전이 보수화
+
+## 나중에 수정
+
+6. unused import 정리
+7. 로그 컨텍스트 강화
+8. has_media 처리 정교화
+
+---
+
+# 코드 수준에서 가장 중요한 보완 방향
+
+핵심만 압축하면 `if msg:` 블록을 이런 식으로 바꾸는 쪽이 좋습니다.
+
+```python
+is_updated = False
+
+if newer_edit:
+    update_text_fields()
+
+if payload.reply_to_message_id is not None and msg.reply_to_message_id != payload.reply_to_message_id:
+    msg.reply_to_message_id = payload.reply_to_message_id
+    is_updated = True
+
+if payload.sender_id is not None and msg.sender_id != payload.sender_id:
+    msg.sender_id = payload.sender_id
+    is_updated = True
+
+if payload.grouped_id is not None and msg.grouped_id != payload.grouped_id:
+    msg.grouped_id = payload.grouped_id
+    is_updated = True
+
+if payload.collected_at and msg.collected_at != payload.collected_at:
+    msg.collected_at = payload.collected_at
+    is_updated = True
+```
+
+즉 **본문 수정**과 **메타데이터 보강**을 분리하면 훨씬 안정적입니다.
+
+---
+
+# 최종 판단
+
+이 `repository.py`는 **방향은 맞고, 구조도 좋습니다.**
+다만 운영용으로 넘어가기 전 기준으로 보면,
+
+* **상**
+
+  * 단일 upsert 경로
+  * 결과 객체 반환
+  * checkpoint 분리
+
+* **보완 필수**
+
+  * rollback 책임
+  * 동시성 충돌 처리
+  * 메타데이터 보강 update
+
+이 정도로 정리할 수 있습니다. 

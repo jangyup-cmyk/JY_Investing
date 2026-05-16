@@ -1,0 +1,220 @@
+좋습니다.
+그럼 바로 **`collector_worker.py` 연결 수정안**을 드리겠습니다.
+
+핵심 변경은 4개입니다.
+
+1. `run_startup_tasks()`에 `collector`, `persist_func` 전달
+2. `persist_message_payload(..., is_backfill=False)` 분기 추가
+3. `persist_message_from_history()`는 `is_backfill=True`로 저장
+4. Telethon 직접 호출 대신 `client.py`의 `register_*_handler()` 사용
+
+---
+
+## `collector_worker.py` 교체 초안
+
+```python
+from __future__ import annotations
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.telegram.client import TelegramCollector
+from src.workers.startup_tasks import run_startup_tasks
+from src.infra.telegram.schemas import UpsertResult
+from src.infra.telegram.translators import telethon_to_payload
+from src.infra.db.repository import upsert_telegram_message, update_channel_checkpoint
+
+
+async def persist_message_payload(db, payload, *, is_backfill: bool = False) -> UpsertResult:
+    """
+    공통 메시지 저장 래퍼
+    - 실시간 이벤트 / 백필 모두 이 경로를 사용
+    - checkpoint 갱신 시 backfill 여부를 함께 전달
+    """
+    result = await upsert_telegram_message(db, payload)
+
+    if result.action in {"created", "updated", "unchanged"}:
+        if result.checkpoint_candidate is not None:
+            await update_channel_checkpoint(
+                db,
+                payload.telegram_channel_id,
+                result.checkpoint_candidate,
+                is_backfill=is_backfill,
+            )
+
+    return result
+
+
+async def persist_message_from_event(db, event_message, telegram_channel_id: int):
+    """실시간 이벤트 기반 저장"""
+    payload = telethon_to_payload(telegram_channel_id, event_message)
+    return await persist_message_payload(db, payload, is_backfill=False)
+
+
+async def persist_message_from_history(db, history_message, telegram_channel_id: int):
+    """백필 기반 저장"""
+    payload = telethon_to_payload(telegram_channel_id, history_message)
+    return await persist_message_payload(db, payload, is_backfill=True)
+
+
+class CollectorWorker:
+    """텔레그램 메시지 수집 및 관리를 담당하는 워커"""
+
+    def __init__(self) -> None:
+        self.is_running = False
+        self._collector: TelegramCollector | None = None
+
+    async def _handle_new_message(self, event):
+        """신규 메시지 수신 핸들러"""
+        from src.infra.db.models import TelegramChannel
+        from src.infra.db.session import get_session
+
+        db = None
+        try:
+            chat = await event.get_chat()
+            chat_id = str(chat.id)
+
+            async with get_session() as db:
+                channel = await db.scalar(
+                    select(TelegramChannel).where(TelegramChannel.tg_channel_id == chat_id)
+                )
+
+                if not channel or not channel.is_collecting:
+                    return
+
+                await persist_message_from_event(db, event.message, channel.id)
+                await db.commit()
+
+        except Exception as e:
+            logger.error(f"이벤트 저장 중 오류 발생: {e}")
+            if db is not None:
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+
+    async def _handle_edited_message(self, event):
+        """수정 메시지 수신 핸들러"""
+        await self._handle_new_message(event)
+
+    async def start(self) -> None:
+        """
+        워커 시작
+
+        수집 원칙:
+        - 선택 채널 활성화 시 최근 3일 또는 최근 1,000건 백필
+        - 백필 완료 후 실시간 이벤트 수집 전환
+        """
+        logger.info("Collector Worker 시작 중...")
+
+        self._collector = TelegramCollector()
+
+        try:
+            await self._collector.connect(interactive=False)
+        except Exception as e:
+            logger.error(f"텔레그램 연결 실패: {e}. 인증을 먼저 완료해야 합니다.")
+            return
+
+        # STEP 2 연결 포인트
+        await run_startup_tasks(
+            collector=self._collector,
+            persist_func=persist_message_from_history,
+        )
+
+        # Telethon 세부 구현은 client wrapper에 위임
+        self._collector.register_new_message_handler(self._handle_new_message)
+        self._collector.register_edited_message_handler(self._handle_edited_message)
+
+        self.is_running = True
+        logger.info("Collector Worker 수집 루프 진입 - 실시간 모니터링 중...")
+
+        try:
+            await self._collector.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"수집 루프 비정상 종료: {e}")
+        finally:
+            self.is_running = False
+
+    async def stop(self) -> None:
+        """워커 정지"""
+        logger.info("Collector Worker 정지 중...")
+        self.is_running = False
+        if self._collector:
+            await self._collector.disconnect()
+```
+
+---
+
+## 이 수정으로 바로 달라지는 점
+
+### 1. 백필이 실제로 worker 경로에 연결됩니다
+
+기존:
+
+```python
+await run_startup_tasks()
+```
+
+변경:
+
+```python
+await run_startup_tasks(
+    collector=self._collector,
+    persist_func=persist_message_from_history,
+)
+```
+
+이제 `startup_tasks.py`에서 실제 history 순회가 가능해집니다.
+
+### 2. 백필과 실시간이 같은 저장 터널을 타되 구분도 됩니다
+
+* 실시간: `is_backfill=False`
+* 백필: `is_backfill=True`
+
+이렇게 해야 `update_channel_checkpoint()`에서
+
+* `last_collected_at`
+* `last_backfill_at`
+* 상태 전이
+  를 더 정확히 처리할 수 있습니다.
+
+### 3. worker가 Telethon 내부 구현을 덜 알게 됩니다
+
+기존 `add_event_handler(..., events.NewMessage)` 직접 호출 대신,
+이제는 `client.py`의 래퍼 메서드만 쓰게 됩니다.
+
+---
+
+## 같이 확인할 것 2개
+
+### A. `client.py`에 아래 메서드가 있어야 합니다
+
+```python
+def register_new_message_handler(self, handler):
+    self.client.add_event_handler(handler, events.NewMessage)
+
+def register_edited_message_handler(self, handler):
+    self.client.add_event_handler(handler, events.MessageEdited)
+```
+
+### B. `update_channel_checkpoint()`가 `is_backfill` 인자를 받아야 합니다
+
+이미 제가 앞서 제안한 형태처럼 아래 시그니처면 됩니다.
+
+```python
+async def update_channel_checkpoint(
+    db,
+    channel_id: int,
+    message_id: int,
+    *,
+    collected_at=None,
+    is_backfill: bool = False,
+):
+    ...
+```
+
+---
+
+
+
+

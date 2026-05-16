@@ -1,0 +1,316 @@
+좋습니다. 그럼 바로 **붙여넣기용 테스트 초안**으로 이어가겠습니다.
+
+지금 단계에서 가장 실전적인 건 2개입니다.
+
+* **파이프라인 스모크 테스트 1개**
+
+  * `persist_message() -> NORMALIZE job 생성 -> preprocess_worker.run_once() -> SINGLE_MESSAGE_SUMMARY job 생성 -> inference_worker.run_once()`
+* **scheduler 테스트 2개**
+
+  * stuck job 복구됨
+  * 복구 대상 없으면 0건
+
+아래 코드는 **앞서 정리한 최소 패치가 반영되었다는 전제**입니다.
+특히 아래 4개가 먼저 맞아 있어야 합니다.
+
+* `AnalysisJobService.fail_job()` 존재
+* `create_job_if_not_exists()`에서 `JobTargetType`, `default_max_attempts` 정상
+* `PreprocessWorker`가 `payload_holder` 방식으로 `preprocess_result_id` 전달
+* `SchedulerWorker._recover_stuck_jobs()`가 `int` 반환
+
+---
+
+# 1) `tests/workers/test_pipeline_smoke.py`
+
+```python
+import pytest
+from sqlalchemy import select
+
+from src.infra.db.session import AsyncSessionLocal
+from src.infra.db.models import (
+    AnalysisJob,
+    JobStatus,
+    JobType,
+    NormalizedTelegramMessage,
+    AnalysisResult,  # 실제 결과 모델명으로 교체 필요할 수 있음
+)
+from src.services.analysis_job_service import AnalysisJobService
+from src.services.message_ingest_service import MessageIngestService
+from src.services.worker_services import PreprocessService, InferenceService
+from src.workers.preprocess_worker import PreprocessWorker
+from src.workers.inference_worker import InferenceWorker
+
+
+@pytest.mark.asyncio
+async def test_smoke_persist_preprocess_inference_pipeline():
+    job_service = AnalysisJobService()
+    ingest_service = MessageIngestService(job_service=job_service)
+    preprocess_service = PreprocessService()
+    inference_service = InferenceService()
+
+    # 1) 메시지 저장 + NORMALIZE job 생성
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            result = await ingest_service.persist_message(
+                session,
+                channel_id=1,
+                telegram_message_no=10001,
+                raw_text="삼성전자 관련 테스트 속보 메시지",
+                published_at=None,
+                collected_at=None,
+                raw_payload={"source": "pytest"},
+            )
+
+    async with AsyncSessionLocal() as session:
+        normalize_jobs = (
+            await session.execute(
+                select(AnalysisJob).where(
+                    AnalysisJob.telegram_message_id == result.telegram_message_id,
+                    AnalysisJob.job_type == JobType.NORMALIZE.value,
+                )
+            )
+        ).scalars().all()
+
+        assert len(normalize_jobs) == 1
+        assert normalize_jobs[0].status == JobStatus.PENDING.value
+
+    # 2) preprocess worker 실행
+    preprocess_worker = PreprocessWorker(
+        session_factory=AsyncSessionLocal,
+        job_service=job_service,
+        preprocess_service=preprocess_service,
+        worker_name="test-preprocess-worker",
+        poll_interval=0.1,
+    )
+
+    handled = await preprocess_worker.run_once()
+    assert handled == 1
+
+    # 3) normalize 결과 + summary job 생성 확인
+    async with AsyncSessionLocal() as session:
+        normalized_rows = (
+            await session.execute(select(NormalizedTelegramMessage))
+        ).scalars().all()
+        assert len(normalized_rows) >= 1
+
+        summary_jobs = (
+            await session.execute(
+                select(AnalysisJob).where(
+                    AnalysisJob.telegram_message_id == result.telegram_message_id,
+                    AnalysisJob.job_type == JobType.SINGLE_MESSAGE_SUMMARY.value,
+                )
+            )
+        ).scalars().all()
+
+        assert len(summary_jobs) == 1
+        assert summary_jobs[0].payload_json is not None
+        assert summary_jobs[0].payload_json["preprocess_result_id"] is not None
+
+    # 4) inference worker 실행
+    inference_worker = InferenceWorker(
+        session_factory=AsyncSessionLocal,
+        job_service=job_service,
+        inference_service=inference_service,
+        worker_name="test-inference-worker",
+        poll_interval=0.1,
+    )
+
+    handled = await inference_worker.run_once()
+    assert handled == 1
+
+    # 5) inference 결과 + job 완료 상태 확인
+    async with AsyncSessionLocal() as session:
+        results = (await session.execute(select(AnalysisResult))).scalars().all()
+        assert len(results) >= 1
+
+        jobs = (
+            await session.execute(
+                select(AnalysisJob).where(
+                    AnalysisJob.telegram_message_id == result.telegram_message_id
+                )
+            )
+        ).scalars().all()
+
+        status_map = {job.job_type: job.status for job in jobs}
+        assert status_map[JobType.NORMALIZE.value] == JobStatus.SUCCEEDED.value
+        assert status_map[JobType.SINGLE_MESSAGE_SUMMARY.value] == JobStatus.SUCCEEDED.value
+```
+
+---
+
+# 2) `tests/workers/test_scheduler_worker.py`
+
+## 테스트 1: 만료된 RUNNING job 복구
+
+```python
+import pytest
+from datetime import datetime, timedelta, timezone
+
+from src.infra.db.session import AsyncSessionLocal
+from src.infra.db.models import AnalysisJob, JobStatus, JobTargetType, JobType
+from src.services.worker_services import SchedulerService
+from src.workers.scheduler_worker import SchedulerWorker
+
+UTC = timezone.utc
+
+
+@pytest.mark.asyncio
+async def test_scheduler_recovers_expired_running_jobs():
+    now = datetime.now(UTC)
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            stuck_job = AnalysisJob(
+                job_type=JobType.NORMALIZE.value,
+                status=JobStatus.RUNNING.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=100,
+                telegram_message_id=100,
+                attempt_count=1,
+                max_attempts=3,
+                worker_name="old-worker",
+                lease_expires_at=now - timedelta(minutes=5),
+            )
+            session.add(stuck_job)
+
+    worker = SchedulerWorker(
+        session_factory=AsyncSessionLocal,
+        scheduler_service=SchedulerService(),
+        worker_name="test-scheduler",
+        poll_interval=0.1,
+    )
+
+    handled = await worker.run_once()
+    assert handled is True
+
+    async with AsyncSessionLocal() as session:
+        row = await session.get(AnalysisJob, stuck_job.id)
+        assert row.status == JobStatus.PENDING.value
+        assert row.worker_name is None
+        assert row.lease_expires_at is None
+```
+
+## 테스트 2: 복구 대상 없으면 False
+
+```python
+import pytest
+from datetime import datetime, timedelta, timezone
+
+from src.infra.db.session import AsyncSessionLocal
+from src.infra.db.models import AnalysisJob, JobStatus, JobTargetType, JobType
+from src.services.worker_services import SchedulerService
+from src.workers.scheduler_worker import SchedulerWorker
+
+UTC = timezone.utc
+
+
+@pytest.mark.asyncio
+async def test_scheduler_returns_false_when_no_stuck_jobs():
+    now = datetime.now(UTC)
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            healthy_job = AnalysisJob(
+                job_type=JobType.NORMALIZE.value,
+                status=JobStatus.RUNNING.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=101,
+                telegram_message_id=101,
+                attempt_count=1,
+                max_attempts=3,
+                worker_name="healthy-worker",
+                lease_expires_at=now + timedelta(minutes=10),
+            )
+            session.add(healthy_job)
+
+    worker = SchedulerWorker(
+        session_factory=AsyncSessionLocal,
+        scheduler_service=SchedulerService(),
+        worker_name="test-scheduler",
+        poll_interval=0.1,
+    )
+
+    handled = await worker.run_once()
+    assert handled is False
+```
+
+---
+
+# 3) 선택 테스트: retry 상태 회귀 확인
+
+이건 꼭 넣는 편이 좋습니다.
+현재 repository에서 `mark_retry()`가 `RETRY_PENDING`이 아니라 **반드시 `PENDING`으로 돌아가야** 다음 claim 대상이 됩니다.
+
+`tests/repositories/test_analysis_job_retry.py`
+
+```python
+import pytest
+from datetime import datetime, timedelta, timezone
+
+from src.infra.db.session import AsyncSessionLocal
+from src.infra.db.models import AnalysisJob, JobStatus, JobTargetType, JobType
+from src.infra.db.repositories.analysis_job_repository import AnalysisJobRepository
+
+UTC = timezone.utc
+
+
+@pytest.mark.asyncio
+async def test_mark_retry_sets_job_back_to_pending():
+    repo = AnalysisJobRepository()
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            job = AnalysisJob(
+                job_type=JobType.NORMALIZE.value,
+                status=JobStatus.RUNNING.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=200,
+                telegram_message_id=200,
+                attempt_count=1,
+                max_attempts=3,
+                worker_name="worker-a",
+            )
+            session.add(job)
+            await session.flush()
+
+            repo.mark_retry(
+                session,
+                job,
+                error_code="TEST_ERROR",
+                error_message="retry needed",
+                next_available_at=datetime.now(UTC) + timedelta(minutes=1),
+            )
+
+        refreshed = await session.get(AnalysisJob, job.id)
+        assert refreshed.status == JobStatus.PENDING.value
+        assert refreshed.worker_name is None
+        assert refreshed.lease_expires_at is None
+```
+
+---
+
+# 4) 실행 순서
+
+테스트는 이 순서가 가장 좋습니다.
+
+```bash
+pytest tests/repositories/test_analysis_job_retry.py -q
+pytest tests/workers/test_scheduler_worker.py -q
+pytest tests/workers/test_pipeline_smoke.py -q
+```
+
+---
+
+# 5) 가장 먼저 실패할 가능성이 높은 부분
+
+테스트가 깨지면 보통 여기서 먼저 걸립니다.
+
+* `AnalysisResult` 모델명이 실제 프로젝트와 다름
+* `MessageIngestService.persist_message()`의 `TelegramMessage`, `MessageVersion` 필드명이 실제 모델과 다름
+* `PreprocessService.run_normalize_job()`가 반환하는 값이 `NormalizedTelegramMessage.id`가 아님
+* `InferenceService.run_single_message_summary_job()` 저장 모델명이 `AnalysisResult`가 아님
+* `JobStatus` enum 값이 `SUCCEEDED`가 아니라 `DONE` 같은 다른 이름임
+
+즉, **구조는 맞고 모델명/필드명만 프로젝트 실코드에 맞춰 미세조정하면 되는 상태**입니다.
+
+다음으로 가장 자연스러운 작업은 `MessageIngestService.persist_message()`가 실제 `TelegramMessage`, `MessageVersion` 모델 필드명과 정확히 맞는지 점검하는 것입니다.

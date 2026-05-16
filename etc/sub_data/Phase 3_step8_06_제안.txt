@@ -1,0 +1,258 @@
+좋습니다. 지금 단계에서는 `analysis_job_repository.py`를 **서비스/워커가 기대하는 계약에 맞춰 먼저 고정**하는 게 맞습니다. 현재 서비스는 `enqueue_job`, `get_existing_job`, `claim_next_job`, `get_by_id`, `mark_succeeded`, `mark_retry`, `mark_dead`, `touch_heartbeat`, `find_stuck_jobs`를 전제로 동작하고 있고, 워커들은 `claim_next_job()`과 `fail_job()/complete_job()` 흐름에 직접 의존합니다. 또 `PreprocessWorker`는 후속 job payload에 `preprocess_result_id`를 넘겨야 하고, `InferenceWorker`는 그 값을 읽어 `NormalizedTelegramMessage`를 조회합니다. `SchedulerWorker`는 stuck job 복구를 위해 `recover_stuck_jobs()`를 호출합니다.   
+
+아래 초안은 그 계약에 맞춘 **붙여넣기용 `analysis_job_repository.py`** 입니다.
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.infra.db.models import AnalysisJob, JobStatus
+
+UTC = timezone.utc
+
+
+class AnalysisJobRepository:
+    def __init__(self, lease_seconds: int = 300):
+        self.lease_seconds = lease_seconds
+
+    async def enqueue_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_type: str,
+        target_type: str,
+        target_id: int | None = None,
+        telegram_message_id: int | None = None,
+        message_version_id: int | None = None,
+        priority: int = 100,
+        idempotency_key: str | None = None,
+        payload_json: dict | None = None,
+        max_attempts: int = 3,
+    ) -> AnalysisJob:
+        """
+        새 작업 생성.
+        idempotency_key 가 있으면 중복 생성 방지.
+        """
+        if idempotency_key:
+            existing = await session.scalar(
+                select(AnalysisJob).where(AnalysisJob.idempotency_key == idempotency_key)
+            )
+            if existing is not None:
+                return existing
+
+        job = AnalysisJob(
+            job_type=job_type,
+            status=JobStatus.PENDING.value,
+            target_type=target_type,
+            target_id=target_id,
+            telegram_message_id=telegram_message_id,
+            message_version_id=message_version_id,
+            priority=priority,
+            idempotency_key=idempotency_key,
+            payload_json=payload_json,
+            attempt_count=0,
+            max_attempts=max_attempts,
+            next_available_at=datetime.now(UTC),
+        )
+        session.add(job)
+        await session.flush()
+        return job
+
+    async def get_existing_job(
+        self,
+        session: AsyncSession,
+        *,
+        telegram_message_id: int,
+        message_version_id: int | None,
+        job_type: str,
+    ) -> AnalysisJob | None:
+        """
+        동일 메시지/버전/작업타입 기준 중복 방지용 조회.
+        DEAD 는 제외하고, 아직 의미 있는 job 이 있으면 반환.
+        """
+        stmt = (
+            select(AnalysisJob)
+            .where(AnalysisJob.telegram_message_id == telegram_message_id)
+            .where(AnalysisJob.job_type == job_type)
+            .where(AnalysisJob.status != JobStatus.DEAD.value)
+        )
+
+        if message_version_id is None:
+            stmt = stmt.where(AnalysisJob.message_version_id.is_(None))
+        else:
+            stmt = stmt.where(AnalysisJob.message_version_id == message_version_id)
+
+        stmt = stmt.order_by(AnalysisJob.id.desc())
+        return await session.scalar(stmt)
+
+    async def get_by_id(
+        self,
+        session: AsyncSession,
+        job_id: int,
+    ) -> AnalysisJob | None:
+        return await session.get(AnalysisJob, job_id)
+
+    async def claim_next_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_type: str,
+        worker_name: str,
+    ) -> AnalysisJob | None:
+        """
+        다음 실행 가능한 PENDING job 을 선점.
+        Postgres/MySQL 계열이면 SKIP LOCKED 패턴이 가장 안전하다.
+        """
+        now = datetime.now(UTC)
+        lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+
+        stmt = (
+            select(AnalysisJob)
+            .where(AnalysisJob.job_type == job_type)
+            .where(AnalysisJob.status == JobStatus.PENDING.value)
+            .where(
+                or_(
+                    AnalysisJob.next_available_at.is_(None),
+                    AnalysisJob.next_available_at <= now,
+                )
+            )
+            .order_by(AnalysisJob.priority.asc(), AnalysisJob.id.asc())
+            .with_for_update(skip_locked=True)
+        )
+
+        result = await session.execute(stmt)
+        job = result.scalar_one_or_none()
+        if job is None:
+            return None
+
+        job.status = JobStatus.RUNNING.value
+        job.worker_name = worker_name
+        job.leased_at = now
+        job.lease_expires_at = lease_expires_at
+        job.heartbeat_at = now
+        job.started_at = job.started_at or now
+        job.attempt_count = (job.attempt_count or 0) + 1
+
+        await session.flush()
+        return job
+
+    def mark_succeeded(
+        self,
+        session: AsyncSession,
+        job: AnalysisJob,
+    ) -> None:
+        now = datetime.now(UTC)
+        job.status = JobStatus.SUCCEEDED.value
+        job.completed_at = now
+        job.worker_name = None
+        job.lease_expires_at = None
+        job.heartbeat_at = now
+        job.last_error_code = None
+        job.last_error_message = None
+
+    def mark_retry(
+        self,
+        session: AsyncSession,
+        job: AnalysisJob,
+        *,
+        error_code: str,
+        error_message: str,
+        next_available_at: datetime,
+    ) -> None:
+        job.status = JobStatus.PENDING.value
+        job.worker_name = None
+        job.lease_expires_at = None
+        job.last_error_code = error_code
+        job.last_error_message = error_message
+        job.next_available_at = next_available_at
+        job.heartbeat_at = datetime.now(UTC)
+
+    def mark_dead(
+        self,
+        session: AsyncSession,
+        job: AnalysisJob,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        now = datetime.now(UTC)
+        job.status = JobStatus.DEAD.value
+        job.completed_at = now
+        job.worker_name = None
+        job.lease_expires_at = None
+        job.last_error_code = error_code
+        job.last_error_message = error_message
+        job.heartbeat_at = now
+
+    def touch_heartbeat(
+        self,
+        session: AsyncSession,
+        job: AnalysisJob,
+    ) -> None:
+        now = datetime.now(UTC)
+        job.heartbeat_at = now
+        job.lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+
+    async def find_stuck_jobs(
+        self,
+        session: AsyncSession,
+        *,
+        timeout_seconds: int = 1800,
+    ) -> list[AnalysisJob]:
+        """
+        RUNNING 상태인데 lease 가 만료된 작업을 반환.
+        timeout_seconds 는 외부 서비스 시그니처와 맞추기 위해 받지만,
+        현재 모델에서는 lease_expires_at 기준 복구가 더 직접적이다.
+        """
+        now = datetime.now(UTC)
+
+        stmt = (
+            select(AnalysisJob)
+            .where(AnalysisJob.status == JobStatus.RUNNING.value)
+            .where(AnalysisJob.lease_expires_at.is_not(None))
+            .where(AnalysisJob.lease_expires_at < now)
+            .order_by(AnalysisJob.id.asc())
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+```
+
+지금 이 초안에서 가장 중요한 부분은 세 군데입니다.
+
+첫째, `enqueue_job()`이 `payload_json`, `max_attempts`, `idempotency_key`를 받아야 현재 서비스의 `create_job_if_not_exists()` 및 후속 job 생성 경로와 맞습니다. 현재 서비스는 실제로 그 인자들을 넘기고 있습니다.
+
+둘째, `claim_next_job()`은 워커가 같은 job을 동시에 집지 않도록 가능한 한 원자적으로 선점해야 합니다. 현재 `PreprocessWorker`와 `InferenceWorker`는 이 메서드가 job 선점을 책임진다는 전제 위에 있습니다.
+
+셋째, `find_stuck_jobs()`는 `SchedulerWorker`가 호출하는 recovery 흐름의 기반입니다. 현재 스케줄러는 복구 서비스가 반환한 건수를 기준으로 동작하려는 구조입니다. 
+
+### 바로 같이 볼 체크포인트
+
+* DB가 PostgreSQL/MySQL이면 `with_for_update(skip_locked=True)`가 적합합니다.
+* SQLite라면 이 선점 방식은 그대로 안 될 수 있으니, 그 경우엔 `SELECT → 조건부 UPDATE` 방식으로 바꿔야 합니다.
+* `AnalysisJob` 모델에 아래 필드가 실제로 있어야 합니다.
+
+  * `status`
+  * `job_type`
+  * `target_type`
+  * `target_id`
+  * `telegram_message_id`
+  * `message_version_id`
+  * `priority`
+  * `idempotency_key`
+  * `payload_json`
+  * `attempt_count`
+  * `max_attempts`
+  * `worker_name`
+  * `leased_at`
+  * `lease_expires_at`
+  * `heartbeat_at`
+  * `next_available_at`
+  * `started_at`
+  * `completed_at`
+  * `last_error_code`
+  * `last_error_message`
+
+지금 가장 자연스러운 다음 작업은 **실제 `analysis_job_repository.py` 파일을 작성한 뒤, 제가 방금 준 스모크 테스트 초안을 당신 프로젝트 import 경로 기준으로 맞춰서 완성하는 것**입니다.

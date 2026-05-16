@@ -1,0 +1,233 @@
+맞습니다. 지금 단계에서는 **설계 문장을 더 늘리는 것보다, 실제 코드와 1:1 대조표를 만드는 작업**이 가장 자연스럽습니다.
+
+다만 이 대화에서 바로 확인 가능한 코드 파일은 아직 없어서, 지금은 실제 판정을 임의로 넣을 수는 없습니다. 대신 **바로 복붙해서 쓸 수 있는 실전 점검표**를 드리겠습니다. 모델/서비스 파일을 붙이면 이 형식 그대로 `체크 완료 / 누락 / 수정 필요`로 채워서 이어가면 됩니다.
+
+---
+
+## 1) 지금 해야 하는 작업의 목적
+
+목적은 단순합니다.
+
+* **설계가 코드에 반영되었는지**
+* **반영은 되었지만 연결이 덜 된 부분이 있는지**
+* **겉보기엔 있어도 run loop/트랜잭션/상태전이가 어긋나는지**
+
+이 3가지를 실제 파일 기준으로 판정하는 것입니다.
+
+---
+
+## 2) 가장 실전적인 점검 대상 범위
+
+우선 아래 범위만 보면 됩니다.
+
+### 모델 계층
+
+* `Message`
+* `MessageVersion`
+* `AnalysisJob`
+* 전처리/추론 결과 저장용 모델
+* 채널/수집 상태 모델
+
+### 서비스 계층
+
+* `AnalysisJobService`
+* 메시지 저장 서비스(`persist_message()`가 위치한 곳)
+* job 생성/claim/complete/fail/requeue 관련 서비스
+
+### 워커 계층
+
+* `PreprocessWorker`
+* `InferenceWorker`
+* `SchedulerWorker`
+* `collector_worker`
+* `run_worker.py`
+
+---
+
+## 3) 바로 쓰는 체크표 템플릿
+
+아래 표를 기준으로 채우면 됩니다.
+
+| 구분  | 점검 항목                                                            | 확인 기준                                                   | 판정 |
+| --- | ---------------------------------------------------------------- | ------------------------------------------------------- | -- |
+| 모델  | `Message`가 원문 메시지의 식별자/채널/작성시각/수집시각을 보존                          | 메시지 원본을 재현할 최소 필드 존재                                    |    |
+| 모델  | `MessageVersion`가 정규화/전처리 버전을 분리 저장                              | 원문과 전처리 결과가 덮어쓰기되지 않음                                   |    |
+| 모델  | `AnalysisJob`가 job type / status / payload / retry / lock 정보를 가짐 | 워커 큐 역할 수행 가능                                           |    |
+| 모델  | job 상태값이 명확히 분리됨                                                 | `PENDING/RUNNING/DONE/FAILED` 등 일관성                     |    |
+| 모델  | stuck job 복구용 필드 존재                                              | `locked_at`, `heartbeat_at`, `attempts`, `last_error` 등 |    |
+| 서비스 | `persist_message()`가 메시지 저장 후 후속 job 생성까지 담당                     | 수집 후 다음 파이프라인으로 자연 연결                                   |    |
+| 서비스 | 동일 메시지 중복 저장 방어가 있음                                              | unique key / upsert / existing check                    |    |
+| 서비스 | `AnalysisJobService`가 job 생성 책임을 집중 관리                           | 워커마다 중복 로직 없음                                           |    |
+| 서비스 | `claim_next_job()` 또는 동등 기능 존재                                   | 경쟁 상태에서 안전하게 1건 선점 가능                                   |    |
+| 서비스 | job 완료/실패 처리 메서드 분리                                              | 상태전이와 에러기록 일관성 확보                                       |    |
+| 서비스 | retry/requeue 정책이 코드에 명시                                         | 무한재시도/유실 방지                                             |    |
+| 워커  | `PreprocessWorker`가 입력/출력 계약이 명확                                 | Message → normalized/version/job 생성 흐름 명확               |    |
+| 워커  | `InferenceWorker`가 preprocess 결과를 전제로 동작                         | 직접 원문을 다시 뒤지지 않음                                        |    |
+| 워커  | `SchedulerWorker`가 stuck job 복구 담당                               | RUNNING 장기 체류 job 재처리 가능                                |    |
+| 워커  | 각 워커가 독립 DB 세션을 사용                                               | API/다른 워커와 세션 충돌 없음                                     |    |
+| 워커  | `run_once()` 테스트 가능한 구조                                          | 무한루프와 로직이 분리됨                                           |    |
+| 실행  | `run_worker.py`가 워커 타입별 실행 진입점 제공                                | preprocess / inference / scheduler 선택 실행 가능             |    |
+| 실행  | 설정값이 하드코딩되지 않음                                                   | batch size / poll interval / timeout 외부화                |    |
+| 테스트 | 통합 테스트가 `persist_message → preprocess → inference`를 검증           | 최소 1개 E2E 흐름 존재                                         |    |
+| 테스트 | scheduler 테스트가 stuck recovery를 검증                                | 2~3개 핵심 케이스 존재                                          |    |
+
+---
+
+## 4) 실제 판정 기준
+
+표를 채울 때는 아래 기준으로 판정하면 됩니다.
+
+### 체크 완료
+
+설계 의도와 코드가 사실상 일치하고, 호출 경로도 연결된 상태
+
+예:
+
+* `persist_message()` 호출 후 `NORMALIZE` job 생성
+* `PreprocessWorker.run_once()`가 해당 job claim 후 결과 저장
+* 저장 후 `SINGLE_MESSAGE_SUMMARY` job 생성
+
+### 누락
+
+설계에는 있는데 코드 파일 어디에도 핵심 구현이 없음
+
+예:
+
+* `SchedulerWorker` 설계는 있는데 실제 파일이 없음
+* `AnalysisJob` 모델에 `locked_at`이 없음
+* `claim_next_job()`이 아예 없음
+
+### 수정 필요
+
+구현은 있으나 실전 운용에 문제가 생길 가능성이 높은 상태
+
+예:
+
+* job claim을 단순 조회 후 update로 처리해서 경쟁 상태 발생 가능
+* worker가 API 서버 세션을 재사용
+* preprocess 결과를 version 테이블이 아니라 message 본문에 덮어씀
+* 실패 시 status만 FAILED로 바꾸고 `last_error` 기록이 없음
+
+---
+
+## 5) 파일별로 채우는 실전 버전
+
+아래처럼 파일 단위로 보는 방식이 가장 빠릅니다.
+
+### A. 모델 파일
+
+예상 확인 대상
+
+* `src/models/message.py`
+* `src/models/message_version.py`
+* `src/models/analysis_job.py`
+* `src/models/channel.py` 또는 유사 파일
+
+#### 모델 점검표
+
+| 파일                 | 항목                                             | 판정 | 메모 |
+| ------------------ | ---------------------------------------------- | -- | -- |
+| message.py         | 메시지 원문 보존 필드 존재                                |    |    |
+| message.py         | 중복 방지 key 존재                                   |    |    |
+| message_version.py | 원문과 별도 버전 저장 구조                                |    |    |
+| analysis_job.py    | job_type/status/payload 존재                     |    |    |
+| analysis_job.py    | attempts/max_attempts 존재                       |    |    |
+| analysis_job.py    | locked_at/started_at/finished_at/last_error 존재 |    |    |
+
+### B. 서비스 파일
+
+예상 확인 대상
+
+* `src/services/analysis_job_service.py`
+* `src/services/message_service.py` 또는 `persist_message()` 위치 파일
+
+#### 서비스 점검표
+
+| 파일                      | 항목                          | 판정 | 메모 |
+| ----------------------- | --------------------------- | -- | -- |
+| analysis_job_service.py | create_job 존재               |    |    |
+| analysis_job_service.py | claim_next_job 존재           |    |    |
+| analysis_job_service.py | complete_job 존재             |    |    |
+| analysis_job_service.py | fail_job/requeue_job 존재     |    |    |
+| message service         | persist_message 후 후속 job 생성 |    |    |
+| message service         | idempotency 보장              |    |    |
+
+### C. 워커 파일
+
+예상 확인 대상
+
+* `src/workers/preprocess_worker.py`
+* `src/workers/inference_worker.py`
+* `src/workers/scheduler_worker.py`
+* `src/run_worker.py`
+
+#### 워커 점검표
+
+| 파일                   | 항목                   | 판정 | 메모 |
+| -------------------- | -------------------- | -- | -- |
+| preprocess_worker.py | run_once 분리          |    |    |
+| preprocess_worker.py | NORMALIZE 계열 job만 처리 |    |    |
+| preprocess_worker.py | 성공 시 다음 job 생성       |    |    |
+| inference_worker.py  | preprocess 산출물만 사용   |    |    |
+| inference_worker.py  | 실패 시 에러 기록           |    |    |
+| scheduler_worker.py  | stuck job 탐지         |    |    |
+| scheduler_worker.py  | 재큐잉 조건 명확            |    |    |
+| run_worker.py        | 워커 타입 선택 실행          |    |    |
+
+---
+
+## 6) 실제로 채울 때 가장 먼저 보는 우선순위
+
+순서는 이렇게 가는 게 효율적입니다.
+
+1. **`AnalysisJob` 모델**
+2. **`AnalysisJobService`**
+3. **`persist_message()`**
+4. **`PreprocessWorker.run_once()`**
+5. **`InferenceWorker.run_once()`**
+6. **`SchedulerWorker`**
+7. **`run_worker.py`**
+8. **테스트 코드**
+
+이 순서로 보면, 파이프라인이 **정말 이어지는지**를 가장 빨리 판단할 수 있습니다.
+
+---
+
+## 7) 실무적으로 자주 걸리는 수정 필요 포인트
+
+실제 점검하면 보통 아래가 많이 나옵니다.
+
+### 수정 필요 가능성 높은 항목
+
+* `AnalysisJobService` 없이 워커 파일마다 job update 로직이 흩어져 있음
+* claim 로직이 원자적이지 않음
+* worker가 세션을 오래 붙잡고 있어 rollback 범위가 큼
+* 성공 후 다음 job 생성이 누락되어 파이프라인이 중간에서 끊김
+* stuck recovery 기준 시간이 코드마다 다름
+* `run_forever()` 안에 핵심 로직이 섞여 테스트가 어려움
+
+---
+
+## 8) 지금 단계에서의 가장 적절한 산출물
+
+지금 가장 좋은 결과물은 아래 형식입니다.
+
+### 산출물 형태
+
+* **파일명**
+* **확인한 핵심 코드**
+* **판정: 체크 완료 / 누락 / 수정 필요**
+* **근거 1~2줄**
+* **필요 시 패치 포인트**
+
+예시 형식:
+
+| 파일                        | 항목             | 판정    | 근거                                       | 패치 포인트                  |
+| ------------------------- | -------------- | ----- | ---------------------------------------- | ----------------------- |
+| `analysis_job.py`         | lock/retry 필드  | 수정 필요 | `status`, `attempts`는 있으나 `locked_at` 없음 | stuck recovery 기준 필드 추가 |
+| `analysis_job_service.py` | claim_next_job | 누락    | 생성/완료 메서드는 있으나 선점 메서드 없음                 | 원자적 claim API 추가        |
+| `preprocess_worker.py`    | run_once 구조    | 체크 완료 | 루프와 1회 처리 로직 분리됨                         | 없음                      |
+
+---
+
+현재 상태에서 제가 정확히 할 수 있는 최선은 여기까지입니다. **실제 모델/서비스 코드 파일을 붙이면, 다음 답변에서 이 표를 실제 상태로 바로 채워서** `체크 완료 / 누락 / 수정 필요` 판정까지 구체적으로 정리하겠습니다.

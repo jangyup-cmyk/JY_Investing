@@ -1,0 +1,587 @@
+좋습니다. 그럼 이어서 바로 **현재까지 정리한 모델 구조와 1:1로 맞춘 Alembic migration 초안**을 드리겠습니다.
+
+이번 목표는 단순합니다.
+
+* `Message`
+* `AnalysisJob`
+* `PreprocessedMessage`
+* `MessageSummary`
+
+이 4개 기준으로 **파이프라인이 실제로 돌아가기 위한 최소 컬럼 / 제약 / 인덱스**를 migration 으로 고정하는 것입니다.
+
+---
+
+# 1. 지금 기준으로 가장 자연스러운 테이블 구조
+
+먼저 기준 모델은 아래처럼 보는 게 가장 안정적입니다.
+
+## messages
+
+원문 메시지 저장
+
+핵심 컬럼:
+
+* `id`
+* `channel_id`
+* `telegram_message_id`
+* `text`
+* `sent_at`
+* `created_at`
+
+핵심 제약:
+
+* `(channel_id, telegram_message_id)` unique
+
+---
+
+## analysis_jobs
+
+파이프라인 작업 큐
+
+핵심 컬럼:
+
+* `id`
+* `message_id`
+* `job_type`
+* `status`
+* `payload`
+* `attempt_count`
+* `max_attempts`
+* `last_error`
+* `created_at`
+* `started_at`
+* `finished_at`
+* `heartbeat_at`
+
+핵심 제약:
+
+* `(message_id, job_type)` unique
+
+핵심 인덱스:
+
+* `job_type`
+* `status`
+* `(job_type, status, created_at)`
+
+---
+
+## preprocessed_messages
+
+전처리 결과 저장
+
+핵심 컬럼:
+
+* `id`
+* `message_id`
+* `normalized_text`
+* `created_at`
+* `updated_at`
+
+핵심 제약:
+
+* `message_id` unique
+
+---
+
+## message_summaries
+
+요약 결과 저장
+
+핵심 컬럼:
+
+* `id`
+* `message_id`
+* `summary_text`
+* `created_at`
+* `updated_at`
+
+핵심 제약:
+
+* `message_id` unique
+
+---
+
+# 2. Alembic migration 초안
+
+아래는 바로 붙여넣어 수정 가능한 수준의 초안입니다.
+
+예시 파일명:
+
+```text
+alembic/versions/20260322_01_create_pipeline_tables.py
+```
+
+```python
+"""create pipeline tables
+
+Revision ID: 20260322_01
+Revises: 
+Create Date: 2026-03-22 14:30:00
+
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision = "20260322_01"
+down_revision = None
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    # 1) messages
+    op.create_table(
+        "messages",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("channel_id", sa.Integer(), nullable=False),
+        sa.Column("telegram_message_id", sa.BigInteger(), nullable=False),
+        sa.Column("text", sa.Text(), nullable=True),
+        sa.Column("sent_at", sa.DateTime(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.UniqueConstraint(
+            "channel_id",
+            "telegram_message_id",
+            name="uq_messages_channel_msg",
+        ),
+    )
+    op.create_index("ix_messages_channel_id", "messages", ["channel_id"])
+    op.create_index("ix_messages_sent_at", "messages", ["sent_at"])
+
+    # 2) analysis_jobs
+    op.create_table(
+        "analysis_jobs",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("message_id", sa.Integer(), nullable=False),
+        sa.Column("job_type", sa.String(length=50), nullable=False),
+        sa.Column("status", sa.String(length=20), nullable=False),
+        sa.Column("payload", sa.JSON(), nullable=True),
+        sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("max_attempts", sa.Integer(), nullable=False, server_default="3"),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("started_at", sa.DateTime(), nullable=True),
+        sa.Column("finished_at", sa.DateTime(), nullable=True),
+        sa.Column("heartbeat_at", sa.DateTime(), nullable=True),
+        sa.ForeignKeyConstraint(
+            ["message_id"],
+            ["messages.id"],
+            name="fk_analysis_jobs_message_id_messages",
+            ondelete="CASCADE",
+        ),
+        sa.UniqueConstraint(
+            "message_id",
+            "job_type",
+            name="uq_analysis_jobs_message_job_type",
+        ),
+    )
+    op.create_index("ix_analysis_jobs_message_id", "analysis_jobs", ["message_id"])
+    op.create_index("ix_analysis_jobs_job_type", "analysis_jobs", ["job_type"])
+    op.create_index("ix_analysis_jobs_status", "analysis_jobs", ["status"])
+    op.create_index(
+        "ix_analysis_jobs_job_type_status_created_at",
+        "analysis_jobs",
+        ["job_type", "status", "created_at"],
+    )
+
+    # 3) preprocessed_messages
+    op.create_table(
+        "preprocessed_messages",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("message_id", sa.Integer(), nullable=False),
+        sa.Column("normalized_text", sa.Text(), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["message_id"],
+            ["messages.id"],
+            name="fk_preprocessed_messages_message_id_messages",
+            ondelete="CASCADE",
+        ),
+        sa.UniqueConstraint(
+            "message_id",
+            name="uq_preprocessed_messages_message_id",
+        ),
+    )
+    op.create_index(
+        "ix_preprocessed_messages_message_id",
+        "preprocessed_messages",
+        ["message_id"],
+    )
+
+    # 4) message_summaries
+    op.create_table(
+        "message_summaries",
+        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("message_id", sa.Integer(), nullable=False),
+        sa.Column("summary_text", sa.Text(), nullable=False),
+        sa.Column("created_at", sa.DateTime(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["message_id"],
+            ["messages.id"],
+            name="fk_message_summaries_message_id_messages",
+            ondelete="CASCADE",
+        ),
+        sa.UniqueConstraint(
+            "message_id",
+            name="uq_message_summaries_message_id",
+        ),
+    )
+    op.create_index(
+        "ix_message_summaries_message_id",
+        "message_summaries",
+        ["message_id"],
+    )
+
+
+def downgrade():
+    op.drop_index("ix_message_summaries_message_id", table_name="message_summaries")
+    op.drop_table("message_summaries")
+
+    op.drop_index("ix_preprocessed_messages_message_id", table_name="preprocessed_messages")
+    op.drop_table("preprocessed_messages")
+
+    op.drop_index("ix_analysis_jobs_job_type_status_created_at", table_name="analysis_jobs")
+    op.drop_index("ix_analysis_jobs_status", table_name="analysis_jobs")
+    op.drop_index("ix_analysis_jobs_job_type", table_name="analysis_jobs")
+    op.drop_index("ix_analysis_jobs_message_id", table_name="analysis_jobs")
+    op.drop_table("analysis_jobs")
+
+    op.drop_index("ix_messages_sent_at", table_name="messages")
+    op.drop_index("ix_messages_channel_id", table_name="messages")
+    op.drop_table("messages")
+```
+
+---
+
+# 3. 왜 이 migration 이 지금 구조와 잘 맞는가
+
+핵심은 세 가지입니다.
+
+## 첫째, idempotency 보장
+
+아래 3개 unique 제약이 매우 중요합니다.
+
+```python
+uq_messages_channel_msg
+uq_analysis_jobs_message_job_type
+uq_preprocessed_messages_message_id
+uq_message_summaries_message_id
+```
+
+이게 있어야
+
+* 같은 텔레그램 메시지 중복 저장
+* 같은 job 중복 생성
+* 전처리 결과 중복 insert
+* summary 결과 중복 insert
+
+를 DB 레벨에서 마지막으로 막을 수 있습니다.
+
+---
+
+## 둘째, run_once() + scheduler 흐름에 맞음
+
+`analysis_jobs` 에 아래 필드가 있어야 합니다.
+
+* `attempt_count`
+* `max_attempts`
+* `last_error`
+* `started_at`
+* `finished_at`
+* `heartbeat_at`
+
+그래야 앞에서 정리한
+
+* `claim_next_job()`
+* `complete_job()`
+* `fail_job()`
+* `requeue_stuck_jobs()`
+* `mark_dead_jobs()`
+
+가 전부 자연스럽게 맞아떨어집니다.
+
+---
+
+## 셋째, 조회 성능 최소 보장
+
+worker 가 가장 많이 하게 될 조회는 사실상 이겁니다.
+
+```sql
+WHERE job_type = ?
+  AND status IN ('PENDING', 'RETRY_PENDING')
+ORDER BY created_at
+```
+
+그래서 이 인덱스가 중요합니다.
+
+```python
+ix_analysis_jobs_job_type_status_created_at
+```
+
+이 인덱스 하나만 있어도 큐 처리 성능이 훨씬 안정됩니다.
+
+---
+
+# 4. 현재 모델 정의도 같이 맞춰야 함
+
+migration 만 있으면 끝이 아니고, SQLAlchemy 모델도 같은 구조여야 합니다.
+
+예시 초안은 아래처럼 맞추면 됩니다.
+
+## `src/models/analysis_job.py`
+
+```python
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, JSON, UniqueConstraint, Index
+from src.db.base import Base
+
+
+class AnalysisJob(Base):
+    __tablename__ = "analysis_jobs"
+
+    id = Column(Integer, primary_key=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_type = Column(String(50), nullable=False, index=True)
+    status = Column(String(20), nullable=False, index=True)
+    payload = Column(JSON, nullable=True)
+
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+    last_error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("message_id", "job_type", name="uq_analysis_jobs_message_job_type"),
+        Index("ix_analysis_jobs_job_type_status_created_at", "job_type", "status", "created_at"),
+    )
+```
+
+---
+
+## `src/models/message.py`
+
+```python
+from sqlalchemy import Column, Integer, BigInteger, DateTime, Text, UniqueConstraint
+from src.db.base import Base
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(Integer, nullable=False, index=True)
+    telegram_message_id = Column(BigInteger, nullable=False)
+    text = Column(Text, nullable=True)
+    sent_at = Column(DateTime, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("channel_id", "telegram_message_id", name="uq_messages_channel_msg"),
+    )
+```
+
+---
+
+## `src/models/preprocessed_message.py`
+
+```python
+from sqlalchemy import Column, Integer, DateTime, ForeignKey, Text, UniqueConstraint
+from src.db.base import Base
+
+
+class PreprocessedMessage(Base):
+    __tablename__ = "preprocessed_messages"
+
+    id = Column(Integer, primary_key=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    normalized_text = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("message_id", name="uq_preprocessed_messages_message_id"),
+    )
+```
+
+---
+
+## `src/models/message_summary.py`
+
+```python
+from sqlalchemy import Column, Integer, DateTime, ForeignKey, Text, UniqueConstraint
+from src.db.base import Base
+
+
+class MessageSummary(Base):
+    __tablename__ = "message_summaries"
+
+    id = Column(Integer, primary_key=True)
+    message_id = Column(Integer, ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    summary_text = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("message_id", name="uq_message_summaries_message_id"),
+    )
+```
+
+---
+
+# 5. 지금 코드와 migration 사이에서 가장 자주 어긋나는 부분
+
+실제로는 여기서 자주 깨집니다.
+
+## 1. `payload` 타입
+
+SQLite에서는 `JSON` 이 사실상 text처럼 동작할 수 있고, PostgreSQL에서는 진짜 JSON/JSONB 입니다.
+
+초기에는 `sa.JSON()` 으로 가도 충분합니다.
+나중에 PostgreSQL 최적화할 때만 `JSONB` 로 옮겨도 됩니다.
+
+---
+
+## 2. `telegram_message_id` 타입
+
+텔레그램 메시지 ID 는 보통 `Integer` 로도 되지만, 여유 있게 `BigInteger` 가 더 안전합니다.
+
+---
+
+## 3. `created_at`, `updated_at` 자동 처리
+
+초기에는 서비스 레이어에서 직접 넣는 편이 단순합니다.
+
+예:
+
+* `persist_message()` 에서 `created_at`
+* `upsert_preprocessed_message()` 에서 `created_at`, `updated_at`
+* `upsert_summary()` 에서 `created_at`, `updated_at`
+
+즉, 처음부터 DB default 에 너무 많이 맡기지 않는 편이 디버깅이 쉽습니다.
+
+---
+
+# 6. 이미 테이블이 있는데 migration 을 맞춰야 하는 경우
+
+만약 지금 테이블이 일부라도 이미 존재한다면, 새로 create 하는 대신 **alter migration** 으로 가야 합니다.
+
+그 경우 가장 우선순위는 아래입니다.
+
+## analysis_jobs 에 추가
+
+* `payload`
+* `attempt_count`
+* `max_attempts`
+* `last_error`
+* `started_at`
+* `finished_at`
+* `heartbeat_at`
+
+## unique constraint 추가
+
+* `messages(channel_id, telegram_message_id)`
+* `analysis_jobs(message_id, job_type)`
+
+## 결과 테이블 unique 추가
+
+* `preprocessed_messages.message_id`
+* `message_summaries.message_id`
+
+즉, 실제 상황이 “빈 DB”냐 “기존 DB 보정”이냐에 따라 migration 전략이 달라집니다.
+
+---
+
+# 7. 기존 DB 보정용 alter migration 예시
+
+혹시 이미 `analysis_jobs` 테이블이 있고 컬럼만 부족한 상황이면 아래 같은 방식으로 갑니다.
+
+```python
+def upgrade():
+    op.add_column("analysis_jobs", sa.Column("payload", sa.JSON(), nullable=True))
+    op.add_column("analysis_jobs", sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"))
+    op.add_column("analysis_jobs", sa.Column("max_attempts", sa.Integer(), nullable=False, server_default="3"))
+    op.add_column("analysis_jobs", sa.Column("last_error", sa.Text(), nullable=True))
+    op.add_column("analysis_jobs", sa.Column("started_at", sa.DateTime(), nullable=True))
+    op.add_column("analysis_jobs", sa.Column("finished_at", sa.DateTime(), nullable=True))
+    op.add_column("analysis_jobs", sa.Column("heartbeat_at", sa.DateTime(), nullable=True))
+
+    op.create_unique_constraint(
+        "uq_analysis_jobs_message_job_type",
+        "analysis_jobs",
+        ["message_id", "job_type"],
+    )
+
+    op.create_index(
+        "ix_analysis_jobs_job_type_status_created_at",
+        "analysis_jobs",
+        ["job_type", "status", "created_at"],
+    )
+```
+
+이건 **신규 생성형 migration** 이 아니라 **보정형 migration** 입니다.
+
+---
+
+# 8. 지금 단계에서 가장 실전적인 체크리스트
+
+Alembic 초안 반영 전에 이 5개만 먼저 보면 됩니다.
+
+## 체크 1
+
+현재 `AnalysisJob` 모델에 아래 필드가 실제로 있는가
+
+* `payload`
+* `attempt_count`
+* `max_attempts`
+* `last_error`
+* `started_at`
+* `finished_at`
+* `heartbeat_at`
+
+## 체크 2
+
+`MessageService.persist_message()` 가 `messages` + `analysis_jobs` 를 한 트랜잭션으로 저장하는가
+
+## 체크 3
+
+`PreprocessedMessage`, `MessageSummary` 가 `message_id unique` 구조인가
+
+## 체크 4
+
+현재 DB 가 비어 있는가, 아니면 기존 데이터가 있는가
+
+## 체크 5
+
+운영 DB 가 SQLite 인가 PostgreSQL 인가
+
+운영 DB 가 PostgreSQL 이면 이후 `claim_next_job()` 의 `SKIP LOCKED` 와도 훨씬 잘 맞습니다.
+
+---
+
+# 9. 지금 가장 자연스러운 다음 작업
+
+이제 순서는 이렇게 가는 게 가장 좋습니다.
+
+1. 방금 드린 migration 초안 기준으로 모델 필드 정렬
+2. Alembic revision 생성
+3. migration 적용
+4. `test_pipeline_flow.py` 실행
+5. `test_scheduler_worker.py` 실행
+6. 깨지는 필드/제약 보정
+
+---
+
+# 10. 한 줄 요약
+
+지금 필요한 Alembic 초안의 핵심은
+**`analysis_jobs` 를 단순 작업 테이블이 아니라 재시도/복구 가능한 큐 테이블로 완성하고, `message_id` 기반 unique 제약으로 파이프라인의 idempotency 를 DB 레벨에서 고정하는 것**입니다.
+
+다음 답변에서는 이어서 바로
+**현재 네 프로젝트가 “기존 테이블 보정형”인지 “신규 생성형”인지에 따라 나눈 Alembic 적용 순서**까지 정리해드리겠습니다.

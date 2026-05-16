@@ -1,0 +1,321 @@
+좋습니다. 그럼 마지막 남은 작업인 **“초안 ↔ 실제 프로젝트 코드 매핑표”** 형태로 정리하겠습니다.
+
+아래 순서대로 맞추면 됩니다.
+
+## 1) 먼저 확인할 실제 파일
+
+우선 실제 프로젝트에서 아래 파일 5개를 열어 이름만 대조하면 됩니다.
+
+* `src/infra/db/models.py`
+* `src/infra/db/session.py`
+* `src/workers/collector_worker.py`
+* `src/workers/startup_tasks.py`
+* `run_collector.py`
+
+여기서 확인할 건 딱 세 종류입니다.
+
+* **모델명/필드명**
+* **세션 팩토리 이름**
+* **공통 persist 함수 이름**
+
+---
+
+## 2) 가장 먼저 맞춰야 할 매핑표
+
+아래는 초안에서 사용한 이름과 실제 프로젝트에서 대조해야 할 항목입니다.
+
+### DB 세션
+
+초안:
+
+```python
+from src.infra.db.session import AsyncSessionLocal
+```
+
+실제 코드에서 확인:
+
+* `AsyncSessionLocal`
+* `async_session_factory`
+* `SessionLocal`
+* `get_db_session`
+
+실제 이름이 다르면 전부 그 이름으로 통일하면 됩니다.
+
+---
+
+### Message 모델
+
+초안 기준 필드:
+
+```python
+Message.channel_id
+Message.tg_message_id
+Message.tg_date_utc
+Message.message_text
+Message.edit_date_utc
+Message.raw_hash
+Message.is_deleted
+```
+
+실제 코드에서 흔한 차이:
+
+* `text`
+* `content`
+* `message`
+* `telegram_message_id`
+* `message_date`
+* `edited_at`
+
+여기서 제일 중요한 건 아래 4개입니다.
+
+* 채널 FK
+* 텔레그램 원본 message id
+* 본문 텍스트
+* 수정 시각
+
+이 네 개만 맞으면 나머지는 조정이 쉽습니다.
+
+---
+
+### Channel 모델
+
+초안 기준:
+
+```python
+Channel.id
+Channel.tg_channel_id
+Channel.title
+Channel.username
+```
+
+실제 코드에서 `telegram_channel_id`, `name`, `handle` 같은 이름일 수 있습니다.
+collector 쪽에서는 보통 `channel.id`와 `channel.tg_channel_id` 둘 다 자주 쓰이니 확인이 필요합니다.
+
+---
+
+### Job enum / result enum
+
+초안 기준:
+
+```python
+JobType.NORMALIZE
+JobType.EXTRACT_FEATURES
+JobType.SINGLE_MESSAGE_SUMMARY
+JobType.WINDOW_THEME_ANALYSIS
+
+JobStatus.PENDING
+JobStatus.RUNNING
+JobStatus.DONE
+JobStatus.DEAD_LETTER
+
+JobTargetType.MESSAGE
+JobTargetType.WINDOW
+```
+
+실제 코드가 enum이 아니라 문자열이면 이렇게 바꾸면 됩니다.
+
+```python
+job_type="normalize"
+status="pending"
+target_type="message"
+```
+
+이건 테스트 코드에도 같이 반영해야 합니다.
+
+---
+
+## 3) `collector_worker.py`에서 찾아야 할 정확한 위치
+
+실제 코드에서 아래 성격의 함수를 찾으면 됩니다.
+
+* 메시지 저장 함수
+* upsert 함수
+* 신규/편집 공통 처리 함수
+
+이름 예시는 이런 류일 가능성이 큽니다.
+
+```python
+persist_message(...)
+save_message(...)
+upsert_message(...)
+handle_message(...)
+process_message(...)
+```
+
+패치는 **이 함수 한 곳**에 넣는 것이 맞습니다.
+
+### 찾는 기준
+
+그 함수 안에 아래 코드가 있으면 거의 정답입니다.
+
+* `select(Message)...`
+* `Message(...)`
+* `session.add(message)`
+* `await session.flush()`
+* `await session.commit()`는 바깥 루프에 있을 가능성 높음
+
+즉, **실제 DB row를 만드는 지점**입니다.
+
+---
+
+## 4) `startup_tasks.py`에서 확인할 것
+
+이 파일은 수정보다 확인이 목적입니다.
+
+찾아야 하는 건 이것입니다.
+
+```python
+persist_func(...)
+```
+
+또는
+
+```python
+await persist_func(session, channel, tg_msg)
+```
+
+이 호출이 있으면 성공입니다.
+그럼 `startup_tasks.py`는 거의 그대로 두고, 주입되는 함수만 `persist_message`로 맞추면 됩니다.
+
+---
+
+## 5) 실제 반영 순서
+
+이 순서대로 하면 꼬이지 않습니다.
+
+### 1단계
+
+`models.py`에서 아래 존재 여부 확인
+
+* `MessageVersion`
+* `NormalizedMessage`
+* `MessageFeature`
+* `AnalysisJob`
+* `AnalysisResult`
+
+### 2단계
+
+`session.py`에서 세션 팩토리 실제 이름 확인
+
+### 3단계
+
+`collector_worker.py`에서 공통 persist 지점 찾기
+
+### 4단계
+
+그 함수에 아래 3개를 묶어서 삽입
+
+* `upsert_message_from_telegram`
+* `create_message_version`
+* `AnalysisJobService.enqueue_job(... NORMALIZE ...)`
+
+### 5단계
+
+`startup_tasks.py`가 그 persist 함수를 실제로 타는지 확인
+
+### 6단계
+
+`run_collector.py` 실시간 신규/편집 이벤트도 같은 persist 함수를 타는지 확인
+
+---
+
+## 6) 가장 자주 생기는 충돌 4가지
+
+### 1. Message 본문 필드명이 다름
+
+초안:
+
+```python
+message.message_text
+```
+
+실제:
+
+```python
+message.text
+message.content
+message.body
+```
+
+이 경우 preprocess/inference/collector 전부 같은 이름으로 바꿔야 합니다.
+
+---
+
+### 2. edit 시각 필드명이 다름
+
+초안:
+
+```python
+message.edit_date_utc
+```
+
+실제:
+
+```python
+message.edited_at
+message.edit_at
+message.telegram_edited_at
+```
+
+이건 version 생성과 edit 감지에 직접 영향이 있습니다.
+
+---
+
+### 3. enum이 아니라 string
+
+이 경우 테스트 assertion과 worker 코드 둘 다 string 기준으로 바꿔야 합니다.
+
+예:
+
+```python
+if job.job_type == "normalize":
+```
+
+---
+
+### 4. 세션 팩토리 이름 불일치
+
+초안:
+
+```python
+AsyncSessionLocal
+```
+
+실제 이름이 다르면 worker 전체 import를 맞춰야 합니다.
+
+---
+
+## 7) 실제 매핑 체크리스트
+
+아래 체크리스트대로 보면 빠릅니다.
+
+```text
+[ ] Message 모델 본문 필드명 확인
+[ ] Message 모델 편집시각 필드명 확인
+[ ] Message 모델 tg_message_id 필드명 확인
+[ ] Channel 모델 tg_channel_id 필드명 확인
+[ ] AnalysisJob / enum 실제 정의 확인
+[ ] AsyncSessionLocal 실제 이름 확인
+[ ] collector_worker 공통 persist 함수 위치 확인
+[ ] startup_tasks가 persist_func를 실제로 호출하는지 확인
+[ ] run_collector 실시간 신규/편집 이벤트가 같은 persist를 타는지 확인
+[ ] enqueue_job 내부 commit 없음 확인
+```
+
+---
+
+## 8) 적용 후 바로 돌릴 테스트 순서
+
+```bash
+python -m pytest tests/services/test_analysis_job_service.py -vv
+python -m pytest tests/workers/test_collector_persist.py -vv
+python -m pytest tests/workers/test_preprocess_worker.py -vv
+python -m pytest tests/workers/test_inference_worker.py -vv
+```
+
+여기서 `test_collector_persist.py`가 먼저 통과해야 합니다.
+그게 안 되면 뒤 파이프라인은 전부 의미가 줄어듭니다.
+
+---
+
+

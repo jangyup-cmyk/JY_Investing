@@ -1,0 +1,65 @@
+검토 결과부터 말씀드리면, **방향은 좋고 핵심 아이디어도 맞습니다.** 특히 `FloodWait`를 “즉시 실패”가 아니라 **연기 가능한 백필 작업**으로 분리한 점, 그리고 한 번의 백필 루프 안에서 `last_success_message_id`를 잡아 `offset_id`로 재개하려는 발상은 좋습니다. Telethon 1.42 기준으로 `iter_messages()`는 기본적으로 **최신→과거 순**으로 내려가고, `offset_id`는 **해당 ID보다 더 오래된 메시지만** 가져오는 배타적 기준이므로, 한 호출 내부에서의 resume 자체는 논리적으로 맞습니다. 또한 Telethon은 작은 FloodWait는 임계값 이하에서 자동 sleep하고, 정확한 제한치는 공식적으로 고정 정책이 없다고 안내합니다.  ([Telethon Documentation][1])
+
+다만, **“현재 구현이 정말 마지막 메시지 기준으로 재시작 후에도 이어받느냐”**라는 질문에는 답이 **아직 완전한 resume는 아니다**입니다. 이유는 `iter_channel_messages()` 안의 `last_success_message_id`는 **함수 호출 동안만 살아 있는 메모리 상태**이고, DB에 남는 `last_collected_message_id`는 `update_channel_checkpoint()`에서 **더 큰 ID일 때만 갱신**되기 때문입니다. 백필은 최신→과거로 내려가므로, 실제로 백필이 진행될수록 메시지 ID는 작아지는데, 현재 체크포인트는 “가장 최근에 본 큰 ID”만 유지합니다. 그래서 워커 재시작이나 `BackfillDeferredError` 이후 다음 사이클에서는 **이전 백필의 중간 지점이 아니라 다시 최신 구간부터 읽게 되고**, 중복 방지는 `upsert`에 의존하게 됩니다. 즉, **한 함수 호출 안의 resume는 있음 / 프로세스 재기동을 넘는 backfill resume는 아직 없음**이 정확한 진단입니다.   ([Telethon Documentation][1])
+
+가장 치명적인 부분은 **트랜잭션 경계**입니다. `startup_tasks.py`에서는 채널 하나의 백필을 돌리는 동안 메시지를 계속 `persist_func()`로 저장하지만, **채널 백필이 다 끝난 뒤에야 한 번만 commit**합니다. 그런데 중간에 `BackfillDeferredError`가 나면 `rollback()`을 호출하므로, 그 채널에서 그동안 flush만 되고 커밋되지 않았던 메시지들은 **전부 날아갑니다.** 즉, FloodWait가 터지기 전까지 이미 성공적으로 읽고 DB에 넣었다고 생각한 메시지들도 실제로는 사라질 수 있습니다. 이 구조에서는 “부분 성공 후 이어가기”가 아니라 “부분 성공처럼 보였다가 전부 롤백”이 됩니다. 
+
+그 다음으로 위험한 부분은 `repository.py`의 `IntegrityError` 처리입니다. insert 경쟁이 나면 `await db.rollback()`을 한 뒤 `"unchanged"`를 반환하는데, 이 rollback은 **해당 메시지 한 건만 취소하는 게 아니라 같은 세션의 미커밋 작업 전체를 되돌립니다.** 실시간 이벤트처럼 메시지마다 바로 commit하는 경로에서는 피해가 제한적일 수 있지만, 현재 백필은 한 채널 전체를 하나의 큰 트랜잭션처럼 쓰고 있어서, **중간에 중복 한 건만 나와도 그 이전에 쌓아둔 백필 결과가 모두 롤백될 수 있습니다.** 그리고 나서 함수는 겉보기에는 정상처럼 `"unchanged"`를 반환하므로, 상위 로직이 손실을 인지하기 어렵습니다. 이 부분은 지금 구조에서 가장 먼저 수정해야 할 결함입니다.  
+
+또 하나는 **실시간 수집 블라인드 구간**입니다. 현재 워커는 `connect()` 후에 먼저 `run_startup_tasks()`로 백필을 끝내고, **그 다음에야** `NewMessage`와 `MessageEdited` 핸들러를 등록합니다. 채널 수가 많거나 FloodWait로 백필이 길어지면, 그 시간 동안 들어온 실시간 메시지는 이벤트 핸들러 경로로는 잡히지 않을 수 있습니다. README의 목표가 “실시간 수집 및 백필 엔진”이라면, 운영 관점에서는 백필보다 **실시간 리스너를 먼저 붙이고**, 백필은 별도 태스크로 돌리거나, 최소한 리스너 등록 후 짧은 catch-up 패스를 한 번 더 도는 편이 안전합니다. 
+
+정리하면, **FloodWait 대응 정책 자체는 괜찮지만, 그 정책이 실제 내구성을 가지려면 저장 단위와 resume cursor를 분리해야 합니다.** Telethon 문서상 `FloodWait`의 공식 “최대 재시도 횟수”나 “몇 초 이상이면 실패 처리” 같은 기준은 없습니다. 오히려 문서가 말하는 것은 제한치가 상황별로 다르고, 작은 wait는 `flood_sleep_threshold` 이하에서 자동 처리되며, `iter_messages()` 쪽은 필요하면 `wait_time`을 주어 rate limit을 완화하라는 정도입니다. 따라서 현재의 `max_retry_count=2`, `max_single_wait_seconds=300`, `max_total_wait_seconds=600`은 **라이브러리 정책이 아니라 제품 정책**으로 보는 게 맞고, 그 자체는 나쁘지 않지만 근거를 README나 설정값으로 명시하는 편이 좋습니다. ([Telethon Documentation][2])
+
+제가 권하는 수정 우선순위는 이렇습니다.
+
+첫째, **체크포인트를 둘로 나누는 것**입니다. 지금의 `last_collected_message_id`는 실시간/재기동 high-watermark 용도로 두고, 백필용으로는 별도의 `backfill_next_offset_id` 또는 `last_backfilled_oldest_message_id`를 두는 편이 맞습니다. 그래야 “실시간은 최신 이후 이어받기”와 “백필은 더 오래된 쪽으로 이어가기”가 충돌하지 않습니다. 현재 하나의 필드로 둘을 같이 처리하려다 보니 의미가 섞였습니다. 
+
+둘째, **백필 commit 단위를 잘게 쪼개야** 합니다. 채널 전체 종료 후 1회 commit이 아니라, 예를 들어 50~200건 단위로 commit하고, defer가 나면 **직전까지의 저장분과 백필 cursor를 남긴 뒤 종료**해야 합니다. 그래야 `BackfillDeferredError`가 “이번 사이클은 여기까지”라는 의미를 갖습니다. 지금처럼 rollback으로 전부 날리면 defer의 의미가 사라집니다. 
+
+셋째, `IntegrityError`에는 **세션 전체 rollback 대신 savepoint 또는 DB-native upsert**를 쓰는 편이 낫습니다. SQLite/SQLAlchemy 조합이면 `INSERT ... ON CONFLICT DO UPDATE` 계열로 바꾸는 것이 가장 깔끔합니다. 지금처럼 “select 후 insert, 충돌 시 rollback” 패턴은 동시성에 취약하고, 특히 대량 백필에서 손실 범위를 키웁니다. 
+
+넷째, **실시간 핸들러 등록을 백필보다 먼저** 두는 것이 좋습니다. 현실적으로는 “리스너 등록 → 실시간 이벤트는 즉시 적재 → 별도 태스크로 백필 → 마지막에 짧은 catch-up 백필 1회”가 가장 안전합니다. 지금 구조는 Phase 2 검증 목표 중 “실시간 5초 이내 적재”에는 맞더라도, 긴 startup backfill과 같이 운영할 때는 공백이 생길 수 있습니다. 
+
+한 줄 결론으로 적으면 이렇습니다.
+**현재 FloodWait 대응 로직은 ‘한 번의 백필 호출 내부’에서는 합리적이지만, ‘프로세스 재시작/다음 사이클까지 포함한 진짜 resume’로 보기는 어렵습니다.** 진짜 resume로 만들려면 **백필 cursor의 영속화, 배치 commit, IntegrityError 처리 개선**이 필수입니다.   
+
+`walkthrough.md`를 올려주시면, 제가 지금 드린 구조 리뷰와 실제 테스트 결과를 대조해서 “설계상 문제인지, 테스트에서 이미 검증된 부분인지”까지 더 정확히 좁혀드리겠습니다.
+
+
+업로드해주신 `Phase 2_Report.md`와 `walkthrough.md`까지 반영해서 다시 보면, **문서 품질은 좋지만 핵심 두 주장에는 과장이 있습니다.** 문서에는 `FloodWait` 발생 시 “마지막 성공 `offset_id` 기준으로 정확히 재개”하고, “워커 재시작 시 누락 없이 이어받기”가 검증됐다고 적혀 있습니다. 그런데 실제 코드 기준으로는 **한 번의 `iter_channel_messages()` 호출 내부 resume는 성립**하지만, **defer 이후 다음 사이클/프로세스 재시작까지 포함한 영속 resume는 아직 성립하지 않습니다.**   
+
+핵심부터 말하면, `client.py`의 FloodWait 처리 자체는 방향이 맞습니다. `last_success_message_id`를 메모리에 유지하다가 `offset_id=last_success_message_id`로 다시 `iter_messages()`를 호출하므로, **같은 함수 호출 안에서**는 마지막 성공 지점 다음의 더 오래된 메시지부터 이어서 읽게 됩니다. Telethon 문서도 기본 조회 순서를 **최신→과거**로 설명하고, `offset_id`는 **해당 ID보다 이전(older) 메시지만, 배타적으로** 가져온다고 명시합니다. 따라서 이 부분만 놓고 보면 walkthrough의 resume 설명은 **부분적으로는 정확**합니다. 또 `flood_sleep_threshold=30`이므로 30초 이하 FloodWait는 라이브러리가 자동 sleep하고, 그보다 큰 값만 현재 코드의 `except FloodWaitError`로 넘어옵니다.  ([Telethon Documentation][1])
+
+문제는 그 resume 상태가 **영속화되지 않는다는 점**입니다. 현재 모델에는 커서성 필드가 `last_collected_message_id` 하나뿐이고, `last_backfill_at`은 시각(timestamp)일 뿐 백필 재개용 메시지 커서는 아닙니다. 그런데 `update_channel_checkpoint()`는 `message_id > last_collected_message_id`일 때만 갱신합니다. 백필은 최신에서 과거로 내려가므로 메시지 ID가 점점 작아지는데, 이런 구조에서는 백필이 진행될수록 **오래된 쪽으로 얼마나 내려갔는지 DB에 남지 않습니다.** 문서의 “체크포인트 분리”는 실제로는 **시간 필드 분리**에 가깝고, **실시간 커서와 백필 커서 분리**는 아닙니다. 그래서 defer 후 다음 사이클이나 워커 재시작 시에는 “백필 중간 지점부터 재개”가 아니라, 다시 최신 쪽에서 시작해 `upsert`로 중복을 흡수하는 형태에 더 가깝습니다.    
+
+두 번째로 더 큰 문제는 **트랜잭션 경계**입니다. `startup_tasks.py`를 보면 채널 하나의 백필이 끝난 뒤에야 `mark_backfill_completed()`와 함께 `db.commit()`을 합니다. 즉, 채널 백필 도중에 저장된 메시지들은 모두 같은 큰 트랜잭션 안에 있습니다. 그런데 `BackfillDeferredError`가 발생하면 바로 `db.rollback()`을 호출한 뒤 상태만 `PENDING_BACKFILL`로 남깁니다. 이 말은 곧 **FloodWait 직전까지 성공적으로 읽어서 flush된 메시지들도 전부 롤백**된다는 뜻입니다. 따라서 문서의 “이번 사이클은 연기하고 다음 사이클에 이어간다”는 표현은 현재 코드와 완전히 일치하지 않습니다. 지금 구조는 “연기”라기보다 **부분 진행분을 버리고 다시 시도**에 가깝습니다. 
+
+세 번째로, `repository.py`의 `IntegrityError` 처리도 지금 구조에서는 위험합니다. 신규 insert 도중 충돌이 나면 `await db.rollback()` 후 `"unchanged"`를 반환하는데, 이 rollback은 **해당 insert 한 건만 취소하는 게 아니라 같은 세션의 미커밋 변경 전체를 날립니다.** 백필이 채널 단위 대형 트랜잭션이기 때문에, 중간에 중복 한 건만 충돌해도 그 이전까지 적재한 메시지와 체크포인트 변경이 함께 사라질 수 있습니다. 그런데 함수는 겉으로는 `"unchanged"`를 반환하므로 상위 레벨에서는 손실을 정상 처리로 오해할 여지가 있습니다. 이 부분은 실제 운영 안정성 관점에서 가장 먼저 손봐야 할 결함입니다. 
+
+네 번째는 **실시간 공백 구간**입니다. `collector_worker.py`를 보면 연결 후 먼저 `run_startup_tasks()`를 실행하고, 그 다음에야 `NewMessage`와 `MessageEdited` 핸들러를 등록합니다. 이 순서에서는 startup backfill 동안 발생한 신규 메시지가 이벤트 핸들러에 잡히지 않을 수 있습니다. Telethon 문서도 `catch_up()`는 **이벤트 핸들러를 등록한 뒤** 호출해서 오프라인 동안 놓친 업데이트를 처리하라고 설명합니다. 지금 구현은 그 순서와 반대이기 때문에, README/보고서의 “실시간 + 백필 안정적 완성”이라는 표현은 다소 앞서 나간 평가입니다.  ([Telethon Documentation][1])
+
+그래서 현재 상태를 가장 정확하게 표현하면 이렇게 정리할 수 있습니다.
+
+* **맞는 부분**: 같은 `iter_channel_messages()` 호출 안에서의 FloodWait resume, `PENDING_BACKFILL` 유지 정책, Telethon 의존성 캡슐화, 실시간/백필 공용 persist 경로 설계.   
+* **아직 아닌 부분**: defer 이후 다음 사이클까지 이어지는 진짜 resume, 워커 재시작 시 중간 백필 지점 복구, startup 중 실시간 무손실 보장.    
+
+우선순위를 정하면 수정 순서는 이게 맞습니다.
+
+1. **백필 전용 커서 추가**
+   `last_collected_message_id`와 별도로 `backfill_next_offset_id` 또는 `oldest_backfilled_message_id`를 두는 게 필요합니다. 실시간 high-watermark와 백필 low-watermark를 분리해야 문서의 “체크포인트 분리”가 실제로 성립합니다.  
+
+2. **배치 단위 commit**
+   채널 전체 종료 후 1회 commit이 아니라, 예를 들어 50~200건 단위로 commit하고 같은 트랜잭션에서 백필 커서도 같이 저장해야 합니다. 그래야 defer가 나도 “여기까지는 확정 저장”이 됩니다. 
+
+3. **`IntegrityError` 처리 개선**
+   세션 전체 rollback 대신 DB-native upsert(`ON CONFLICT`)나 savepoint/nested transaction으로 바꾸는 편이 맞습니다. 지금 방식은 백필 대량 적재 시 손실 범위가 너무 큽니다. 
+
+4. **실시간 핸들러 선등록 + catch-up**
+   권장 순서는 “connect → handler 등록 → catch_up() → startup backfill 또는 짧은 gap fill”입니다. 지금 구조보다 훨씬 안전합니다.  ([Telethon Documentation][1])
+
+문서 문구도 지금 상태에 맞게 조금만 낮춰 쓰는 게 좋습니다.
+현재 문서의 “정확히 그 지점부터 재개”는 **“동일 백필 호출 내에서는 마지막 성공 메시지 기준으로 재개”**로,
+“워커 재시작 시 누락 없는 이어받기”는 **“실시간 high-watermark 복구 및 중복 방지 upsert 검증 완료, 백필 중간지점 영속 resume는 후속 보강 예정”** 정도로 바꾸면 코드와 더 잘 맞습니다.  
+
+결론만 한 줄로 적으면, **지금 구현은 Phase 2의 좋은 베타 버전이지만, FloodWait/Resume를 “완성”으로 부르기엔 아직 이릅니다.** 현재는 “호출 내부 resume + 중복 흡수형 재시도” 수준이고, 진짜 운영형 resume로 올라가려면 **백필 커서 영속화, commit 분할, `IntegrityError` 처리 개선, startup 실시간 공백 제거**가 필요합니다.
+

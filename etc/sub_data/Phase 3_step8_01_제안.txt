@@ -1,0 +1,229 @@
+좋습니다. 그럼 바로 **현재 코드와 목표 구조를 1:1로 대조할 때 쓰는 갭 분석표**로 정리하겠습니다.
+
+지금 단계의 목적은 하나입니다.
+
+**“무엇이 빠졌는지 빠르게 찾고, 어떤 순서로 메워야 하는지 고정하는 것”**
+
+아래 표는 **현재 실제 코드에 체크 표시하면서 보는 점검표**로 쓰시면 됩니다.
+
+---
+
+# 1. 모델 기준 갭 분석표
+
+## A. `Message`
+
+| 점검 항목                                      | 목표 상태            |               누락 시 영향 |  우선순위 |
+| ------------------------------------------ | ---------------- | --------------------: | ----: |
+| `id`                                       | PK 존재            |              기본 식별 불가 |    높음 |
+| `channel_id`                               | `nullable=False` |        채널 단위 중복 제어 불가 |    높음 |
+| `telegram_message_id`                      | `nullable=False` | 원본 메시지 idempotency 붕괴 |    높음 |
+| `text`                                     | 원문 저장 가능         |          전처리 입력 누락 가능 |    높음 |
+| `sent_at`                                  | 존재               |        시간 기반 분석/정렬 약화 |    중간 |
+| `created_at`                               | 존재               |           적재 시점 추적 불가 |    높음 |
+| unique `(channel_id, telegram_message_id)` | 존재               |          동일 메시지 중복 저장 | 매우 높음 |
+
+### 확인 결과 해석
+
+* 이 테이블은 사실상 **collector idempotency의 마지막 방어선**입니다.
+* unique 제약이 없으면 `persist_message()` 만으로는 부족합니다.
+
+---
+
+## B. `AnalysisJob`
+
+| 점검 항목                                  | 목표 상태               |            누락 시 영향 |  우선순위 |
+| -------------------------------------- | ------------------- | -----------------: | ----: |
+| `id`                                   | PK 존재               |          job 식별 불가 |    높음 |
+| `message_id`                           | FK to `messages.id` |        파이프라인 연결 붕괴 | 매우 높음 |
+| `job_type`                             | 문자열 컬럼 존재           |           단계 구분 불가 | 매우 높음 |
+| `status`                               | 문자열 컬럼 존재           |         큐 상태 관리 불가 | 매우 높음 |
+| `payload`                              | nullable 허용         |             확장성 저하 |    중간 |
+| `attempt_count`                        | 기본값 0               |        retry 관리 불가 | 매우 높음 |
+| `max_attempts`                         | 기본값 3               |   poison job 차단 불가 |    높음 |
+| `last_error`                           | text                |        실패 원인 추적 불가 |    높음 |
+| `created_at`                           | 존재                  |      큐 정렬/감사 추적 약화 | 매우 높음 |
+| `started_at`                           | 존재                  |        stuck 판단 불가 |    높음 |
+| `finished_at`                          | 존재                  |        완료 시각 추적 불가 |    중간 |
+| `heartbeat_at`                         | 있으면 더 좋음            |    장기 작업 복구 정확도 저하 |    중간 |
+| unique `(message_id, job_type)`        | 존재                  |    동일 단계 job 중복 생성 | 매우 높음 |
+| index `(job_type, status, created_at)` | 존재                  | worker claim 성능 저하 |    높음 |
+
+### 확인 결과 해석
+
+이 테이블은 단순 로그가 아니라 **실행 큐**입니다.
+여기서 빠진 필드가 있으면 worker/service 리팩토링이 안정적으로 안 붙습니다.
+
+---
+
+## C. `PreprocessedMessage`
+
+| 점검 항목             | 목표 상태            |          누락 시 영향 |  우선순위 |
+| ----------------- | ---------------- | ---------------: | ----: |
+| `id`              | PK 존재            |         기본 식별 문제 |    낮음 |
+| `message_id`      | FK + unique      | 같은 메시지 전처리 중복 저장 | 매우 높음 |
+| `normalized_text` | `nullable=False` |  inference 입력 없음 | 매우 높음 |
+| `created_at`      | 존재               |         생성 추적 불가 |    중간 |
+| `updated_at`      | 존재               |        재처리 추적 불가 |    중간 |
+
+### 확인 결과 해석
+
+이 테이블은 **전처리 결과 캐시** 역할입니다.
+`message_id unique` 가 없으면 retry 시 row 가 누적될 수 있습니다.
+
+---
+
+## D. `MessageSummary`
+
+| 점검 항목          | 목표 상태            |         누락 시 영향 |  우선순위 |
+| -------------- | ---------------- | --------------: | ----: |
+| `id`           | PK 존재            |        기본 식별 문제 |    낮음 |
+| `message_id`   | FK + unique      |   summary 중복 저장 | 매우 높음 |
+| `summary_text` | `nullable=False` |       최종 산출물 없음 | 매우 높음 |
+| `created_at`   | 존재               |        생성 추적 불가 |    중간 |
+| `updated_at`   | 존재               | 재시도 결과 갱신 추적 불가 |    중간 |
+
+### 확인 결과 해석
+
+이 테이블도 `upsert_summary()` 를 전제로 하므로 **`message_id unique`가 사실상 필수**입니다.
+
+---
+
+# 2. 서비스/로직 기준 갭 분석표
+
+## A. `MessageService.persist_message()`
+
+| 점검 항목                 | 목표 상태                                  |     누락 시 영향 |  우선순위 |
+| --------------------- | -------------------------------------- | ----------: | ----: |
+| 기존 메시지 조회             | `(channel_id, telegram_message_id)` 기준 |    중복 저장 가능 | 매우 높음 |
+| message 저장            | 정상                                     |    원문 적재 실패 | 매우 높음 |
+| 초기 `NORMALIZE` job 생성 | 같은 트랜잭션에서 수행                           | 저장 후 job 누락 | 매우 높음 |
+| IntegrityError 처리     | 중복 저장 시 기존 row 반환                      | 재시도 시 예외 폭발 |    높음 |
+
+### 목표 계약
+
+`persist_message()` 1회 호출 결과:
+
+* `messages` 1건
+* `NORMALIZE` job 1건
+
+---
+
+## B. `AnalysisJobService`
+
+| 메서드                          | 목표 상태                            |           누락 시 영향 |  우선순위 |
+| ---------------------------- | -------------------------------- | ----------------: | ----: |
+| `create_job_if_not_exists()` | 존재                               |     중복 job 방지 어려움 |    높음 |
+| `claim_next_job()`           | `PENDING/RETRY_PENDING` claim 가능 |   worker 경쟁/중복 처리 | 매우 높음 |
+| `complete_job()`             | 결과 저장 + DONE + 다음 job 생성         |             상태 꼬임 | 매우 높음 |
+| `fail_job()`                 | retry/dead 전환                    |          실패 복구 불가 | 매우 높음 |
+| `requeue_stuck_jobs()`       | 오래된 RUNNING 복구                   |      비정상 종료 복구 불가 |    높음 |
+| `mark_dead_jobs()`           | max_attempts 초과 격리               | poison job 무한 재시도 |    높음 |
+
+---
+
+## C. `PreprocessWorker.run_once()`
+
+| 점검 항목                            | 목표 상태 |              누락 시 영향 |  우선순위 |
+| -------------------------------- | ----- | -------------------: | ----: |
+| `claim_next_job("NORMALIZE")` 사용 | 예     |            job 관리 중복 | 매우 높음 |
+| 원문 조회 후 normalize                | 예     |               전처리 실패 |    높음 |
+| `complete_job()` 으로 결과 저장        | 예     | 전처리/다음 job 분리 commit | 매우 높음 |
+| 실패 시 `fail_job()` 호출             | 예     |            실패 상태 미기록 |    높음 |
+| 반환값 `1/0` 계약 유지                  | 예     |       run loop 해석 혼란 |    중간 |
+
+---
+
+## D. `InferenceWorker.run_once()`
+
+| 점검 항목                                         | 목표 상태 |           누락 시 영향 |  우선순위 |
+| --------------------------------------------- | ----- | ----------------: | ----: |
+| `claim_next_job("SINGLE_MESSAGE_SUMMARY")` 사용 | 예     |       중복 claim 가능 | 매우 높음 |
+| 전처리 결과 조회                                     | 예     |     summary 입력 없음 | 매우 높음 |
+| `summary_client.summarize()` 호출               | 예     |          실제 추론 누락 |    높음 |
+| `upsert_summary()`                            | 예     | retry 시 결과 row 중복 | 매우 높음 |
+| 실패 시 `RETRY_PENDING` 또는 `DEAD`                | 예     |         재시도 경로 붕괴 |    높음 |
+
+---
+
+## E. Scheduler / Recovery
+
+| 점검 항목                                    | 목표 상태            |           누락 시 영향 |  우선순위 |
+| ---------------------------------------- | ---------------- | ----------------: | ----: |
+| 오래된 RUNNING 복구                           | 예                | 종료 중단 후 job 영구 정체 |    높음 |
+| `attempt_count >= max_attempts` → `DEAD` | 예                |  poison job 무한 반복 | 매우 높음 |
+| timeout 기준                               | job_type 별 또는 공통 |        오복구/미복구 가능 |    중간 |
+
+---
+
+# 3. 테스트 기준 갭 분석표
+
+## 반드시 있어야 하는 테스트
+
+| 테스트명                                                                | 목적          |  우선순위 |
+| ------------------------------------------------------------------- | ----------- | ----: |
+| `test_pipeline_run_once_happy_path`                                 | 정상 플로우 검증   | 매우 높음 |
+| `test_pipeline_inference_failure_sets_retry_pending`                | 실패 상태 전이 검증 | 매우 높음 |
+| `test_pipeline_inference_retry_then_success`                        | 재시도 성공 검증   |    높음 |
+| `test_requeue_stuck_running_job_to_retry_pending`                   | stuck 복구 검증 |    높음 |
+| `test_requeue_stuck_running_job_to_dead_when_max_attempts_exceeded` | dead 격리 검증  |    높음 |
+
+---
+
+# 4. 가장 먼저 확인해야 할 “빨간불” 항목
+
+실제로 현재 코드에서 가장 먼저 체크해야 할 건 아래 8개입니다.
+
+## 1단계 빨간불
+
+1. `messages` 에 `(channel_id, telegram_message_id)` unique 가 있는가
+2. `analysis_jobs` 에 `(message_id, job_type)` unique 가 있는가
+3. `analysis_jobs` 에 `attempt_count`, `max_attempts`, `last_error` 가 있는가
+4. `persist_message()` 가 초기 `NORMALIZE` job 을 같은 트랜잭션에서 생성하는가
+5. `PreprocessWorker` 가 `SINGLE_MESSAGE_SUMMARY` job 을 생성하는가
+6. `InferenceWorker` 가 `upsert_summary()` 구조인가
+7. 실패 시 `RETRY_PENDING` 또는 `DEAD` 로 남는가
+8. stuck `RUNNING` 복구 경로가 있는가
+
+이 8개 중 1개라도 빠지면 지금 파이프라인은 아직 “실전형”이라고 보기 어렵습니다.
+
+---
+
+# 5. 권장 우선순위
+
+## P0
+
+* `AnalysisJob` 컬럼 보강
+* 두 개의 핵심 unique 제약
+* `persist_message()` + 초기 job 생성
+* `claim_next_job()` / `complete_job()` / `fail_job()`
+
+## P1
+
+* `PreprocessedMessage`, `MessageSummary` 의 `message_id unique`
+* `PreprocessWorker`, `InferenceWorker` 리팩토링
+* happy path / failure path 테스트
+
+## P2
+
+* scheduler recovery
+* retry 성공 테스트
+* heartbeat 기반 고도화
+
+---
+
+# 6. 완료 기준
+
+아래가 모두 충족되면 이번 단계는 끝난 것으로 봐도 됩니다.
+
+* 같은 텔레그램 메시지를 두 번 넣어도 `messages` 와 `NORMALIZE` job 이 1건만 남음
+* `persist_message() → preprocess_worker.run_once() → inference_worker.run_once()` 가 통과함
+* inference 실패 시 `RETRY_PENDING` 으로 남음
+* 두 번째 실행에서 성공하면 `attempt_count == 2`, 결과 row 는 1건만 남음
+* 오래된 `RUNNING` job 은 scheduler 가 복구함
+* max_attempts 초과 job 은 `DEAD` 처리됨
+
+---
+
+# 7. 지금 가장 자연스러운 다음 작업
+
+이제 가장 실전적인 다음 단계는 **현재 실제 모델/서비스 코드 파일을 기준으로, 위 표를 “체크 완료 / 누락 / 수정 필요” 형태로 채워 넣는 것**입니다.

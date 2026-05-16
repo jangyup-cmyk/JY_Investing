@@ -1,0 +1,761 @@
+좋습니다. 그럼 바로 **현재 흐름에 맞는 패치 형태(diff 스타일)** 로 정리하겠습니다.
+
+아래는 다음 구조를 기준으로 작성했습니다.
+
+* `src/services/message_service.py`
+* `src/services/analysis_job_service.py` ← 신규
+* `src/services/preprocess_service.py` ← 신규
+* `src/services/summary_service.py` ← 신규
+* `src/workers/preprocess_worker.py`
+* `src/workers/inference_worker.py`
+* `src/run_worker.py` 또는 `run_worker.py`
+
+가정한 모델명은 다음 4개입니다.
+
+* `Message`
+* `AnalysisJob`
+* `PreprocessedMessage`
+* `MessageSummary`
+
+현재 이름이 다르면 **import 경로와 모델명만 치환**하면 됩니다.
+
+---
+
+## 1) `src/services/analysis_job_service.py` 신규 추가
+
+```diff
+*** Begin Patch
+*** Add File: src/services/analysis_job_service.py
++from __future__ import annotations
++
++from dataclasses import dataclass
++from datetime import datetime, timedelta
++from typing import Callable, Optional
++
++from sqlalchemy.exc import IntegrityError
++
++from src.models.analysis_job import AnalysisJob
++
++
++class JobStatus:
++    PENDING = "PENDING"
++    RUNNING = "RUNNING"
++    DONE = "DONE"
++    FAILED = "FAILED"
++    RETRY_PENDING = "RETRY_PENDING"
++    DEAD = "DEAD"
++
++
++@dataclass
++class ClaimedJob:
++    job_id: int
++    message_id: int
++    job_type: str
++    payload: dict | None
++    attempt_count: int
++    max_attempts: int
++
++
++class AnalysisJobService:
++    def __init__(
++        self,
++        db_session_factory,
++        now_fn: Callable[[], datetime] | None = None,
++        default_max_attempts: int = 3,
++        use_skip_locked: bool = True,
++    ):
++        self.db_session_factory = db_session_factory
++        self.now_fn = now_fn or datetime.utcnow
++        self.default_max_attempts = default_max_attempts
++        self.use_skip_locked = use_skip_locked
++
++    def create_job_if_not_exists(
++        self,
++        message_id: int,
++        job_type: str,
++        payload: dict | None = None,
++        max_attempts: int | None = None,
++    ) -> bool:
++        now = self.now_fn()
++
++        with self.db_session_factory() as session:
++            existing = (
++                session.query(AnalysisJob)
++                .filter(
++                    AnalysisJob.message_id == message_id,
++                    AnalysisJob.job_type == job_type,
++                )
++                .one_or_none()
++            )
++            if existing is not None:
++                return False
++
++            session.add(
++                AnalysisJob(
++                    message_id=message_id,
++                    job_type=job_type,
++                    status=JobStatus.PENDING,
++                    payload=payload,
++                    attempt_count=0,
++                    max_attempts=max_attempts or self.default_max_attempts,
++                    last_error=None,
++                    created_at=now,
++                    started_at=None,
++                    finished_at=None,
++                    heartbeat_at=None,
++                )
++            )
++
++            try:
++                session.commit()
++                return True
++            except IntegrityError:
++                session.rollback()
++                return False
++
++    def claim_next_job(self, job_type: str) -> Optional[ClaimedJob]:
++        now = self.now_fn()
++
++        with self.db_session_factory() as session:
++            query = (
++                session.query(AnalysisJob)
++                .filter(
++                    AnalysisJob.job_type == job_type,
++                    AnalysisJob.status.in_(
++                        [JobStatus.PENDING, JobStatus.RETRY_PENDING]
++                    ),
++                )
++                .order_by(AnalysisJob.created_at.asc(), AnalysisJob.id.asc())
++            )
++
++            if self.use_skip_locked:
++                try:
++                    query = query.with_for_update(skip_locked=True)
++                except Exception:
++                    pass
++
++            job = query.first()
++            if job is None:
++                return None
++
++            if job.status not in (JobStatus.PENDING, JobStatus.RETRY_PENDING):
++                return None
++
++            job.status = JobStatus.RUNNING
++            job.attempt_count = (job.attempt_count or 0) + 1
++            job.started_at = now
++            job.heartbeat_at = now
++            job.finished_at = None
++            job.last_error = None
++            session.commit()
++
++            return ClaimedJob(
++                job_id=job.id,
++                message_id=job.message_id,
++                job_type=job.job_type,
++                payload=job.payload,
++                attempt_count=job.attempt_count,
++                max_attempts=job.max_attempts,
++            )
++
++    def complete_job(
++        self,
++        job_id: int,
++        result_handler,
++        next_job_type: str | None = None,
++        next_payload: dict | None = None,
++        next_max_attempts: int | None = None,
++    ) -> None:
++        now = self.now_fn()
++
++        with self.db_session_factory() as session:
++            job = session.query(AnalysisJob).filter(AnalysisJob.id == job_id).one()
++
++            if job.status != JobStatus.RUNNING:
++                raise ValueError(f"job {job_id} is not RUNNING")
++
++            result_handler(session)
++
++            job.status = JobStatus.DONE
++            job.finished_at = now
++            job.heartbeat_at = now
++            job.last_error = None
++
++            if next_job_type is not None:
++                existing = (
++                    session.query(AnalysisJob)
++                    .filter(
++                        AnalysisJob.message_id == job.message_id,
++                        AnalysisJob.job_type == next_job_type,
++                    )
++                    .one_or_none()
++                )
++                if existing is None:
++                    session.add(
++                        AnalysisJob(
++                            message_id=job.message_id,
++                            job_type=next_job_type,
++                            status=JobStatus.PENDING,
++                            payload=next_payload,
++                            attempt_count=0,
++                            max_attempts=next_max_attempts or self.default_max_attempts,
++                            last_error=None,
++                            created_at=now,
++                            started_at=None,
++                            finished_at=None,
++                            heartbeat_at=None,
++                        )
++                    )
++
++            session.commit()
++
++    def fail_job(
++        self,
++        job_id: int,
++        error: Exception | str,
++        retryable: bool = True,
++    ) -> None:
++        now = self.now_fn()
++        error_text = str(error)
++
++        with self.db_session_factory() as session:
++            job = session.query(AnalysisJob).filter(AnalysisJob.id == job_id).one()
++
++            if job.status != JobStatus.RUNNING:
++                raise ValueError(f"job {job_id} is not RUNNING")
++
++            job.finished_at = now
++            job.heartbeat_at = now
++            job.last_error = error_text
++
++            if retryable and job.attempt_count < job.max_attempts:
++                job.status = JobStatus.RETRY_PENDING
++            elif retryable and job.attempt_count >= job.max_attempts:
++                job.status = JobStatus.DEAD
++            else:
++                job.status = JobStatus.FAILED
++
++            session.commit()
++
++    def requeue_stuck_jobs(
++        self,
++        job_type: str | None = None,
++        timeout_seconds: int = 600,
++    ) -> int:
++        now = self.now_fn()
++        threshold = now - timedelta(seconds=timeout_seconds)
++
++        with self.db_session_factory() as session:
++            query = (
++                session.query(AnalysisJob)
++                .filter(
++                    AnalysisJob.status == JobStatus.RUNNING,
++                    AnalysisJob.started_at.isnot(None),
++                    AnalysisJob.started_at < threshold,
++                )
++            )
++
++            if job_type is not None:
++                query = query.filter(AnalysisJob.job_type == job_type)
++
++            jobs = query.all()
++            count = 0
++            for job in jobs:
++                if job.attempt_count >= job.max_attempts:
++                    job.status = JobStatus.DEAD
++                else:
++                    job.status = JobStatus.RETRY_PENDING
++                job.finished_at = now
++                job.last_error = job.last_error or "stuck job recovered by scheduler"
++                count += 1
++
++            session.commit()
++            return count
+*** End Patch
+```
+
+---
+
+## 2) `src/services/preprocess_service.py` 신규 추가
+
+```diff
+*** Begin Patch
+*** Add File: src/services/preprocess_service.py
++from __future__ import annotations
++
++from src.models.message import Message
++from src.models.preprocessed_message import PreprocessedMessage
++
++
++class PreprocessService:
++    def get_message(self, session, message_id: int):
++        return (
++            session.query(Message)
++            .filter(Message.id == message_id)
++            .one_or_none()
++        )
++
++    def normalize_text(self, text: str) -> str:
++        if text is None:
++            return ""
++        normalized = text.strip()
++        normalized = " ".join(normalized.split())
++        return normalized
++
++    def upsert_preprocessed_message(self, session, message_id: int, normalized_text: str):
++        row = (
++            session.query(PreprocessedMessage)
++            .filter(PreprocessedMessage.message_id == message_id)
++            .one_or_none()
++        )
++
++        if row is None:
++            row = PreprocessedMessage(
++                message_id=message_id,
++                normalized_text=normalized_text,
++            )
++            session.add(row)
++        else:
++            row.normalized_text = normalized_text
+*** End Patch
+```
+
+---
+
+## 3) `src/services/summary_service.py` 신규 추가
+
+```diff
+*** Begin Patch
+*** Add File: src/services/summary_service.py
++from __future__ import annotations
++
++from src.models.preprocessed_message import PreprocessedMessage
++from src.models.message_summary import MessageSummary
++
++
++class SummaryService:
++    def get_preprocessed_message(self, session, message_id: int):
++        return (
++            session.query(PreprocessedMessage)
++            .filter(PreprocessedMessage.message_id == message_id)
++            .one_or_none()
++        )
++
++    def upsert_summary(self, session, message_id: int, summary_text: str):
++        row = (
++            session.query(MessageSummary)
++            .filter(MessageSummary.message_id == message_id)
++            .one_or_none()
++        )
++
++        if row is None:
++            row = MessageSummary(
++                message_id=message_id,
++                summary_text=summary_text,
++            )
++            session.add(row)
++        else:
++            row.summary_text = summary_text
+*** End Patch
+```
+
+---
+
+## 4) `src/services/message_service.py` 패치
+
+핵심은 **메시지 저장 + 초기 NORMALIZE job 생성**을 같은 트랜잭션으로 묶는 것입니다.
+
+```diff
+*** Begin Patch
+*** Update File: src/services/message_service.py
+@@
+-from datetime import datetime
++from datetime import datetime
++from sqlalchemy.exc import IntegrityError
++
++from src.models.analysis_job import AnalysisJob
++from src.services.analysis_job_service import JobStatus
+@@
+ class MessageService:
+     def __init__(self, db_session_factory, default_max_attempts: int = 3):
+         self.db_session_factory = db_session_factory
+         self.default_max_attempts = default_max_attempts
+ 
+@@
+     def persist_message(
+         self,
+         channel_id: int,
+         telegram_message_id: int,
+         text: str,
+         sent_at,
+         raw_payload: dict | None = None,
+     ):
+         now = datetime.utcnow()
+ 
+         with self.db_session_factory() as session:
+             existing = (
+                 session.query(Message)
+                 .filter(
+                     Message.channel_id == channel_id,
+                     Message.telegram_message_id == telegram_message_id,
+                 )
+                 .one_or_none()
+             )
+             if existing is not None:
+                 return existing
+ 
+             msg = Message(
+                 channel_id=channel_id,
+                 telegram_message_id=telegram_message_id,
+                 text=text,
+                 sent_at=sent_at,
+                 created_at=now,
+             )
+             session.add(msg)
+             session.flush()
++
++            session.add(
++                AnalysisJob(
++                    message_id=msg.id,
++                    job_type="NORMALIZE",
++                    status=JobStatus.PENDING,
++                    payload=raw_payload,
++                    attempt_count=0,
++                    max_attempts=self.default_max_attempts,
++                    last_error=None,
++                    created_at=now,
++                    started_at=None,
++                    finished_at=None,
++                    heartbeat_at=None,
++                )
++            )
+ 
+-            session.commit()
+-            return msg
++            try:
++                session.commit()
++                return msg
++            except IntegrityError:
++                session.rollback()
++                existing = (
++                    session.query(Message)
++                    .filter(
++                        Message.channel_id == channel_id,
++                        Message.telegram_message_id == telegram_message_id,
++                    )
++                    .one()
++                )
++                return existing
+*** End Patch
+```
+
+---
+
+## 5) `src/workers/preprocess_worker.py` 패치
+
+핵심은 worker 가 직접 job 상태를 바꾸지 않고, `AnalysisJobService` 를 통해 claim/complete/fail 하도록 바꾸는 것입니다.
+
+```diff
+*** Begin Patch
+*** Update File: src/workers/preprocess_worker.py
+@@
+-from ...
++from src.services.analysis_job_service import AnalysisJobService
+ 
+ 
+ class PreprocessWorker:
++    JOB_TYPE = "NORMALIZE"
++    NEXT_JOB_TYPE = "SINGLE_MESSAGE_SUMMARY"
++
+     def __init__(
+         self,
+         db_session_factory,
+-        ...
++        job_service: AnalysisJobService,
++        preprocess_service,
+     ):
+         self.db_session_factory = db_session_factory
+-        ...
++        self.job_service = job_service
++        self.preprocess_service = preprocess_service
+ 
+     def run_once(self) -> int:
+-        # 기존 로직 제거
+-        ...
++        claimed = self.job_service.claim_next_job(self.JOB_TYPE)
++        if claimed is None:
++            return 0
++
++        try:
++            with self.db_session_factory() as session:
++                message = self.preprocess_service.get_message(
++                    session=session,
++                    message_id=claimed.message_id,
++                )
++                if message is None:
++                    raise ValueError(
++                        f"message not found for message_id={claimed.message_id}"
++                    )
++
++            normalized_text = self.preprocess_service.normalize_text(message.text)
++
++            def result_handler(session):
++                self.preprocess_service.upsert_preprocessed_message(
++                    session=session,
++                    message_id=claimed.message_id,
++                    normalized_text=normalized_text,
++                )
++
++            self.job_service.complete_job(
++                job_id=claimed.job_id,
++                result_handler=result_handler,
++                next_job_type=self.NEXT_JOB_TYPE,
++            )
++            return 1
++
++        except Exception as e:
++            self.job_service.fail_job(
++                job_id=claimed.job_id,
++                error=e,
++                retryable=True,
++            )
++            return 0
+*** End Patch
+```
+
+---
+
+## 6) `src/workers/inference_worker.py` 패치
+
+```diff
+*** Begin Patch
+*** Update File: src/workers/inference_worker.py
+@@
+-from ...
++from src.services.analysis_job_service import AnalysisJobService
+ 
+ 
+ class InferenceWorker:
++    JOB_TYPE = "SINGLE_MESSAGE_SUMMARY"
++
+     def __init__(
+         self,
+         db_session_factory,
+-        ...
++        job_service: AnalysisJobService,
++        summary_service,
++        summary_client,
+     ):
+         self.db_session_factory = db_session_factory
+-        ...
++        self.job_service = job_service
++        self.summary_service = summary_service
++        self.summary_client = summary_client
+ 
+     def run_once(self) -> int:
+-        # 기존 로직 제거
+-        ...
++        claimed = self.job_service.claim_next_job(self.JOB_TYPE)
++        if claimed is None:
++            return 0
++
++        try:
++            with self.db_session_factory() as session:
++                preprocessed = self.summary_service.get_preprocessed_message(
++                    session=session,
++                    message_id=claimed.message_id,
++                )
++                if preprocessed is None:
++                    raise ValueError(
++                        f"preprocessed row not found for message_id={claimed.message_id}"
++                    )
++
++            summary_text = self.summary_client.summarize(
++                preprocessed.normalized_text
++            )
++
++            def result_handler(session):
++                self.summary_service.upsert_summary(
++                    session=session,
++                    message_id=claimed.message_id,
++                    summary_text=summary_text,
++                )
++
++            self.job_service.complete_job(
++                job_id=claimed.job_id,
++                result_handler=result_handler,
++                next_job_type=None,
++            )
++            return 1
++
++        except Exception as e:
++            self.job_service.fail_job(
++                job_id=claimed.job_id,
++                error=e,
++                retryable=True,
++            )
++            return 0
+*** End Patch
+```
+
+---
+
+## 7) `src/run_worker.py` 또는 `run_worker.py` 패치
+
+`worker_type` 으로 분기하는 구조로 맞추면 가장 깔끔합니다.
+
+```diff
+*** Begin Patch
+*** Update File: src/run_worker.py
+@@
+ import time
+ 
+-from ...
++from src.db import SessionLocal
++from src.services.analysis_job_service import AnalysisJobService
++from src.services.preprocess_service import PreprocessService
++from src.services.summary_service import SummaryService
++from src.workers.preprocess_worker import PreprocessWorker
++from src.workers.inference_worker import InferenceWorker
++from src.clients.summary_client import SummaryClient
+ 
+ 
+ def build_worker(worker_type: str):
+-    ...
++    db_session_factory = SessionLocal
++    job_service = AnalysisJobService(
++        db_session_factory=db_session_factory,
++        use_skip_locked=True,
++    )
++
++    if worker_type == "preprocess":
++        return PreprocessWorker(
++            db_session_factory=db_session_factory,
++            job_service=job_service,
++            preprocess_service=PreprocessService(),
++        )
++
++    if worker_type == "inference":
++        return InferenceWorker(
++            db_session_factory=db_session_factory,
++            job_service=job_service,
++            summary_service=SummaryService(),
++            summary_client=SummaryClient(),
++        )
++
++    raise ValueError(f"unsupported worker_type={worker_type}")
+ 
+ 
+ def run_forever(worker_type: str, idle_sleep: float = 1.0, max_sleep: float = 5.0):
+-    ...
++    worker = build_worker(worker_type)
++    empty_count = 0
++
++    while True:
++        processed = worker.run_once()
++
++        if processed > 0:
++            empty_count = 0
++            continue
++
++        empty_count += 1
++        sleep_seconds = min(max_sleep, idle_sleep + (empty_count // 5))
++        time.sleep(sleep_seconds)
+*** End Patch
+```
+
+---
+
+## 8) 모델에 꼭 넣어야 하는 제약
+
+이 부분은 코드보다 중요합니다.
+가능하면 모델 또는 Alembic migration 에 아래 제약을 넣으십시오.
+
+### `messages`
+
+```python
+UniqueConstraint("channel_id", "telegram_message_id", name="uq_messages_channel_msg")
+```
+
+### `analysis_jobs`
+
+```python
+UniqueConstraint("message_id", "job_type", name="uq_analysis_jobs_message_job_type")
+```
+
+### `preprocessed_messages`
+
+```python
+UniqueConstraint("message_id", name="uq_preprocessed_messages_message_id")
+```
+
+### `message_summaries`
+
+```python
+UniqueConstraint("message_id", name="uq_message_summaries_message_id")
+```
+
+이 제약이 있어야 재시도나 중복 저장 때 구조가 덜 흔들립니다.
+
+---
+
+## 9) 지금 패치 후 바로 확인할 smoke flow
+
+패치 적용 후 바로 확인할 최소 흐름은 이것입니다.
+
+```python
+persist_message(...)
+preprocess_worker.run_once()
+inference_worker.run_once()
+```
+
+그 다음 DB 상태가 아래처럼 나오면 1차 성공입니다.
+
+* `analysis_jobs`
+
+  * `NORMALIZE` → `DONE`
+  * `SINGLE_MESSAGE_SUMMARY` → `DONE`
+* `preprocessed_messages` 1건
+* `message_summaries` 1건
+
+---
+
+## 10) 가장 먼저 깨질 가능성이 높은 지점
+
+지금 패치 적용 후 흔히 바로 깨지는 부분은 4개입니다.
+
+### 1. `AnalysisJob` 필드 불일치
+
+현재 모델에 `payload`, `heartbeat_at`, `last_error`, `max_attempts` 가 없으면 먼저 모델/마이그레이션 보완이 필요합니다.
+
+### 2. `Message` 필드명 불일치
+
+`telegram_message_id` 대신 `external_message_id` 같은 이름이면 패치에서 그 부분만 바꾸면 됩니다.
+
+### 3. `summary_client` 인터페이스 불일치
+
+지금 예시는 `summarize(text)` 기준입니다.
+현재 프로젝트가 `generate_summary(text)` 나 `infer(text)` 구조면 맞춰서 바꾸면 됩니다.
+
+### 4. worker 생성자 시그니처 불일치
+
+기존 worker 가 다른 의존성을 받고 있으면, 기존 의존성을 유지한 채 `job_service`, `preprocess_service`, `summary_service` 만 추가하면 됩니다.
+
+---
+
+## 11) 바로 다음으로 가장 좋은 작업
+
+이 패치 다음에는 두 개만 바로 붙이면 됩니다.
+
+1. `tests/integration/test_pipeline_flow.py`
+
+   * happy path 1개
+   * inference failure 1개
+
+2. `scheduler_worker.py`
+
+   * `requeue_stuck_jobs()` 연결
+   * stuck recovery 테스트 2개
+
+원하시면 다음 답변에서 바로 이어서
+**현재 패치에 맞춘 `test_pipeline_flow.py` 전체 초안**을 붙여드리겠습니다.

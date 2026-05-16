@@ -1,0 +1,694 @@
+좋습니다.
+그럼 바로 이어서, 방금 정리한 최종 흐름을 기준으로 **실제 DB 구조를 어떻게 잡아야 하는지**를 “운영 가능한 형태”로 구체화해보겠습니다.
+
+핵심은 아래 5개입니다.
+
+1. `messages` : 현재 메시지 최신 상태
+2. `message_versions` : 메시지 원문/수정 이력
+3. `analysis_jobs` : 워커가 처리할 작업 큐
+4. `message_preprocess_results` : 전처리 결과
+5. `message_inference_results` : AI 추론 결과
+
+여기에 이미 쓰고 있을 가능성이 높은 `channels` 정도가 붙습니다.
+
+---
+
+# 1. 전체 관계를 먼저 보면
+
+흐름상 관계는 이렇게 이해하시면 됩니다.
+
+* **채널 1개**에는 **메시지 여러 개**
+* **메시지 1개**에는 **버전 여러 개**
+* **메시지 1개**에는 **job 여러 개**
+* **메시지 1개**에는 **전처리 결과 여러 개(버전별)**
+* **메시지 1개**에는 **추론 결과 여러 개(모델/프롬프트 버전별)**
+
+즉, “현재 최신값”과 “과거 처리 이력”을 분리하는 구조입니다.
+
+---
+
+# 2. `messages` 테이블
+
+이 테이블은 **현재 메시지의 최신 상태**를 담습니다.
+워커들이 가장 자주 조회하는 중심 테이블입니다.
+
+예시 컬럼 구조는 아래처럼 잡는 것이 자연스럽습니다.
+
+```sql
+messages
+- id                       BIGINT PK
+- channel_id               BIGINT NOT NULL
+- telegram_message_id      BIGINT NOT NULL
+- posted_at                DATETIME NOT NULL
+- edited_at                DATETIME NULL
+- sender_id                BIGINT NULL
+- raw_text                 TEXT NULL
+- has_media                BOOLEAN NOT NULL DEFAULT FALSE
+- message_type             VARCHAR(50) NULL
+- latest_version_no        INT NOT NULL DEFAULT 1
+- latest_version_id        BIGINT NULL
+- status                   VARCHAR(30) NOT NULL DEFAULT 'ACTIVE'
+- created_at               DATETIME NOT NULL
+- updated_at               DATETIME NOT NULL
+```
+
+## 각 컬럼의 의미
+
+### `channel_id`
+
+어느 텔레그램 채널/그룹의 메시지인지 식별합니다.
+
+### `telegram_message_id`
+
+텔레그램 내부 메시지 번호입니다.
+실제 중복 방지 핵심 키입니다.
+
+### `posted_at`, `edited_at`
+
+원본 게시 시간과 수정 시간을 구분해서 저장해야 합니다.
+수정 메시지 재처리 판단에 중요합니다.
+
+### `raw_text`
+
+현재 최신 원문입니다.
+최신값은 여기서 빠르게 조회하고, 상세 이력은 `message_versions`에서 봅니다.
+
+### `latest_version_no`, `latest_version_id`
+
+현재 이 메시지가 몇 번째 버전인지 바로 알 수 있게 합니다.
+워커와 재처리 로직이 단순해집니다.
+
+### `status`
+
+예를 들면:
+
+* `ACTIVE`
+* `DELETED`
+* `SKIPPED`
+
+텔레그램에서 삭제/비공개 처리된 경우까지 대응하려면 유용합니다.
+
+## 필수 제약조건
+
+가장 중요합니다.
+
+```sql
+UNIQUE(channel_id, telegram_message_id)
+```
+
+이게 있어야 같은 메시지가 재수집돼도 중복 insert를 막을 수 있습니다.
+
+## 추천 인덱스
+
+```sql
+INDEX idx_messages_channel_posted_at (channel_id, posted_at)
+INDEX idx_messages_updated_at (updated_at)
+INDEX idx_messages_latest_version_id (latest_version_id)
+```
+
+---
+
+# 3. `message_versions` 테이블
+
+이 테이블은 **원문 이력 관리의 핵심**입니다.
+
+메시지가 수정될 수 있기 때문에, `messages.raw_text`만 믿고 가면 나중에
+
+* 이전 분석이 어떤 텍스트 기준인지
+* 수정 전/후 차이가 무엇인지
+  알 수 없게 됩니다.
+
+예시 구조:
+
+```sql
+message_versions
+- id                       BIGINT PK
+- message_id               BIGINT NOT NULL
+- version_no               INT NOT NULL
+- raw_text                 TEXT NULL
+- edited_at                DATETIME NULL
+- text_hash                VARCHAR(64) NOT NULL
+- change_type              VARCHAR(30) NOT NULL DEFAULT 'INITIAL'
+- created_at               DATETIME NOT NULL
+```
+
+## 핵심 포인트
+
+### `message_id`
+
+`messages.id`를 참조합니다.
+
+### `version_no`
+
+1, 2, 3 ... 식으로 증가합니다.
+
+### `text_hash`
+
+아주 중요합니다.
+수정 이벤트가 들어와도 실제 텍스트가 동일할 수 있으므로, 해시를 비교해서
+
+* 진짜 변경인지
+* 형식상 재수집인지
+  판단할 수 있습니다.
+
+### `change_type`
+
+예:
+
+* `INITIAL`
+* `EDIT`
+* `REFETCH`
+* `RESTORE`
+
+운영 중 추적이 편합니다.
+
+## 필수 제약조건
+
+```sql
+UNIQUE(message_id, version_no)
+UNIQUE(message_id, text_hash)
+```
+
+두 번째 유니크는 텍스트가 완전히 같은 버전이 중복 저장되는 것을 막는 데 도움이 됩니다.
+
+---
+
+# 4. `analysis_jobs` 테이블
+
+이 테이블이 이번 구조의 중심입니다.
+사실상 **워커 큐 + 상태 머신** 역할을 합니다.
+
+예시 구조:
+
+```sql
+analysis_jobs
+- id                       BIGINT PK
+- job_type                 VARCHAR(50) NOT NULL
+- message_id               BIGINT NOT NULL
+- message_version_id       BIGINT NULL
+- status                   VARCHAR(30) NOT NULL
+- priority                 INT NOT NULL DEFAULT 100
+- payload_json             JSON NULL
+- retry_count              INT NOT NULL DEFAULT 0
+- max_retries              INT NOT NULL DEFAULT 3
+- available_at             DATETIME NOT NULL
+- claimed_at               DATETIME NULL
+- heartbeat_at             DATETIME NULL
+- finished_at              DATETIME NULL
+- worker_id                VARCHAR(100) NULL
+- error_code               VARCHAR(100) NULL
+- error_message            TEXT NULL
+- created_at               DATETIME NOT NULL
+- updated_at               DATETIME NOT NULL
+```
+
+---
+
+## 4-1. `job_type`
+
+초기에는 최소 2개면 됩니다.
+
+* `NORMALIZE`
+* `SINGLE_MESSAGE_SUMMARY`
+
+추후 확장 가능:
+
+* `EVENT_EXTRACTION`
+* `TICKER_EXTRACTION`
+* `EMBEDDING`
+* `CLUSTERING`
+
+즉, 구조는 처음부터 확장 가능하게 잡되, 지금은 2개만 정확히 돌리는 게 맞습니다.
+
+---
+
+## 4-2. `status`
+
+추천 상태값은 아래 정도가 실용적입니다.
+
+* `PENDING`
+* `IN_PROGRESS`
+* `SUCCEEDED`
+* `FAILED`
+* `RETRY_WAIT`
+* `CANCELLED`
+
+처음부터 너무 많이 늘릴 필요는 없고, 이 정도면 운영 충분합니다.
+
+---
+
+## 4-3. `message_version_id`
+
+이 컬럼이 특히 중요합니다.
+
+왜냐하면 **어느 버전의 메시지에 대한 job인지 고정**해야 하기 때문입니다.
+
+예를 들어 메시지가 수정되면:
+
+* `messages.latest_version_id`는 새 값으로 바뀌지만
+* 예전 버전 기준 job은 예전 버전을 가리켜야 합니다.
+
+그래야 job 실행 중간에 메시지 최신 내용이 바뀌어도
+“처리 대상”이 흔들리지 않습니다.
+
+즉, **job은 message_id만이 아니라 version_id까지 고정하는 것이 안정적**입니다.
+
+---
+
+## 4-4. `available_at`
+
+바로 처리 가능한 시각입니다.
+재시도 시 backoff를 걸 때 유용합니다.
+
+예:
+
+* 지금 실패 → 1분 뒤 재시도
+* 그 다음 실패 → 5분 뒤 재시도
+
+그럼 `available_at`만 밀어두고 워커는 `available_at <= now()`인 job만 가져가면 됩니다.
+
+---
+
+## 4-5. `claimed_at`, `heartbeat_at`, `worker_id`
+
+스케줄러 복구용 핵심입니다.
+
+* `claimed_at` : 워커가 가져간 시각
+* `heartbeat_at` : 처리 중 살아있음을 남기는 시각
+* `worker_id` : 어느 워커 인스턴스가 처리 중인지
+
+스케줄러는 이걸 기준으로
+“이 job은 잡혀 갔지만 너무 오래 멈췄다”를 판단합니다.
+
+---
+
+## 4-6. 필수 유니크/인덱스
+
+가장 중요한 설계 포인트입니다.
+
+### 중복 job 방지
+
+최소한 아래 형태가 필요합니다.
+
+```sql
+UNIQUE(job_type, message_version_id)
+```
+
+이렇게 하면 같은 버전에 대해 같은 종류의 job이 중복 생성되지 않습니다.
+
+단, “재처리 이력까지 모두 남기고 싶다”면 이 유니크를 느슨하게 하고 별도 run 개념을 둘 수도 있습니다.
+하지만 **현재 단계에서는 중복 방지가 우선**이라 위 방식이 더 낫습니다.
+
+### 추천 인덱스
+
+```sql
+INDEX idx_jobs_claim (job_type, status, available_at, priority, id)
+INDEX idx_jobs_stuck (status, claimed_at, heartbeat_at)
+INDEX idx_jobs_message (message_id)
+```
+
+---
+
+# 5. `message_preprocess_results` 테이블
+
+이 테이블은 `NORMALIZE` job의 산출물입니다.
+
+예시 구조:
+
+```sql
+message_preprocess_results
+- id                       BIGINT PK
+- message_id               BIGINT NOT NULL
+- message_version_id       BIGINT NOT NULL
+- normalize_job_id         BIGINT NOT NULL
+- normalized_text          TEXT NOT NULL
+- cleaned_text             TEXT NULL
+- language_code            VARCHAR(20) NULL
+- token_count              INT NULL
+- line_count               INT NULL
+- char_count               INT NULL
+- has_url                  BOOLEAN NOT NULL DEFAULT FALSE
+- has_ticker_hint          BOOLEAN NOT NULL DEFAULT FALSE
+- preprocess_version       VARCHAR(50) NOT NULL
+- created_at               DATETIME NOT NULL
+```
+
+## 왜 별도 테이블이 좋은가
+
+처음에는 `messages`에 컬럼 몇 개 추가해서 끝내고 싶을 수 있습니다.
+하지만 그렇게 하면:
+
+* 버전별 결과 관리가 어려워지고
+* 전처리 로직이 바뀌었을 때 이전 결과 보존이 힘들고
+* 어떤 job 결과인지 추적이 어렵습니다
+
+그래서 별도 테이블이 좋습니다.
+
+## 핵심 제약조건
+
+```sql
+UNIQUE(message_version_id, preprocess_version)
+UNIQUE(normalize_job_id)
+```
+
+즉, 같은 메시지 버전과 같은 전처리 로직 버전에 대해 결과는 하나만 있게 합니다.
+
+---
+
+# 6. `message_inference_results` 테이블
+
+이 테이블은 `SINGLE_MESSAGE_SUMMARY` job의 결과입니다.
+
+예시 구조:
+
+```sql
+message_inference_results
+- id                       BIGINT PK
+- message_id               BIGINT NOT NULL
+- message_version_id       BIGINT NOT NULL
+- preprocess_result_id     BIGINT NOT NULL
+- inference_job_id         BIGINT NOT NULL
+- task_type                VARCHAR(50) NOT NULL
+- model_name               VARCHAR(100) NOT NULL
+- prompt_version           VARCHAR(50) NOT NULL
+- summary_text             TEXT NULL
+- keywords_json            JSON NULL
+- entities_json            JSON NULL
+- sentiment_label          VARCHAR(30) NULL
+- confidence_score         DECIMAL(5,4) NULL
+- raw_response_json        JSON NULL
+- created_at               DATETIME NOT NULL
+```
+
+## 핵심 컬럼 설명
+
+### `preprocess_result_id`
+
+AI는 원문이 아니라 전처리 결과를 입력으로 삼는 게 이상적이므로, 그 연결고리를 남겨야 합니다.
+
+### `model_name`, `prompt_version`
+
+나중에 “같은 메시지를 다른 모델로 다시 돌렸을 때” 비교가 가능합니다.
+
+### `raw_response_json`
+
+운영 초반에는 꽤 유용합니다.
+파싱 오류, 모델 출력 이상, 필드 누락 등을 디버깅하기 쉽습니다.
+
+단, 너무 커질 수 있으니 장기적으로는 보존 정책을 둘 수 있습니다.
+
+## 추천 유니크 조건
+
+```sql
+UNIQUE(task_type, message_version_id, model_name, prompt_version)
+UNIQUE(inference_job_id)
+```
+
+이렇게 하면 같은 버전/같은 모델/같은 프롬프트 조합의 중복 결과 저장을 막을 수 있습니다.
+
+---
+
+# 7. 상태 전이 흐름을 테이블 기준으로 풀어보면
+
+메시지 1건이 들어왔을 때 실제 DB에서 일어나는 일은 아래 순서입니다.
+
+## 1단계. 수집
+
+`persist_message()` 실행
+
+* `messages` upsert
+* `message_versions` insert
+* `analysis_jobs`에 `NORMALIZE` job insert
+
+즉, 여기까지가 수집 트랜잭션입니다.
+
+---
+
+## 2단계. 전처리 워커
+
+`PreprocessWorker`
+
+* `analysis_jobs`에서 `NORMALIZE/PENDING` claim
+* `message_versions` 읽기
+* 전처리 수행
+* `message_preprocess_results` insert
+* `analysis_jobs`에 `SINGLE_MESSAGE_SUMMARY` job insert
+* 기존 `NORMALIZE` job → `SUCCEEDED`
+
+---
+
+## 3단계. 추론 워커
+
+`InferenceWorker`
+
+* `analysis_jobs`에서 `SINGLE_MESSAGE_SUMMARY/PENDING` claim
+* `message_preprocess_results` 읽기
+* 모델 호출
+* `message_inference_results` insert
+* summary job → `SUCCEEDED`
+
+---
+
+## 4단계. 복구
+
+`SchedulerWorker`
+
+* `IN_PROGRESS`인데 오래 멈춘 job 탐색
+* `retry_count < max_retries`면 `RETRY_WAIT` 또는 `PENDING` 복귀
+* 초과면 `FAILED`
+
+---
+
+# 8. `persist_message()`가 실제로 보장해야 하는 것
+
+이 함수가 제일 중요합니다.
+실무적으로는 아래 순서를 추천합니다.
+
+## 신규 메시지인 경우
+
+1. `(channel_id, telegram_message_id)`로 기존 `messages` 조회
+2. 없으면 `messages` insert
+3. `version_no = 1`로 `message_versions` insert
+4. `messages.latest_version_no/latest_version_id/raw_text/edited_at` 갱신
+5. `analysis_jobs(NORMALIZE)` insert
+6. commit
+
+## 이미 있는 메시지인 경우
+
+1. 기존 latest version 조회
+2. 새 `raw_text` 해시 비교
+3. 같으면 skip 또는 metadata만 update
+4. 다르면 `message_versions` 새 버전 insert
+5. `messages.latest_version_no/latest_version_id/raw_text/edited_at` update
+6. 새 버전에 대한 `NORMALIZE` job insert
+7. commit
+
+즉, “메시지 저장”과 “후속 job 생성”을 분리하면 안 되고, **가급적 한 트랜잭션으로 묶어야 합니다.**
+
+---
+
+# 9. 워커가 job을 가져가는 방식
+
+이 부분도 설계상 매우 중요합니다.
+
+가장 이상적인 패턴은 사실상 아래와 같습니다.
+
+## claim 조건
+
+* `status = 'PENDING'`
+* `available_at <= now()`
+* `job_type = target_type`
+
+그리고 가져가자마자:
+
+* `status = 'IN_PROGRESS'`
+* `claimed_at = now()`
+* `heartbeat_at = now()`
+* `worker_id = <현재 워커 식별값>`
+
+로 바꿉니다.
+
+중요한 점은 **선택과 상태 변경이 원자적으로 처리되어야 한다**는 것입니다.
+그래야 여러 워커가 동시에 같은 job을 잡지 않습니다.
+
+DB가 허용하면 보통 다음 계열 패턴을 씁니다.
+
+* `SELECT ... FOR UPDATE SKIP LOCKED`
+* 그 후 즉시 `UPDATE status='IN_PROGRESS'`
+
+이 구조가 가장 안전합니다.
+
+---
+
+# 10. SchedulerWorker 기준에서 stuck job 판정은 어떻게 할까
+
+운영 초기에는 너무 복잡하게 가지 말고 아래 정도면 충분합니다.
+
+## stuck 기준 예시
+
+* `status = 'IN_PROGRESS'`
+* `heartbeat_at IS NULL AND claimed_at < now() - 10분`
+  또는
+* `heartbeat_at < now() - 10분`
+
+즉, 잡아갔는데 10분 이상 생존 신호가 없으면 stuck으로 간주합니다.
+
+## 복구 로직 예시
+
+### 재시도 가능
+
+* `retry_count + 1 < max_retries`
+* `status = 'RETRY_WAIT'`
+* `retry_count += 1`
+* `available_at = now() + backoff`
+* `error_code = 'STUCK_TIMEOUT'`
+
+### 재시도 한도 초과
+
+* `status = 'FAILED'`
+* `finished_at = now()`
+* `error_code = 'STUCK_MAX_RETRIES_EXCEEDED'`
+
+---
+
+# 11. 지금 단계에서 “반드시 있어야 하는 컬럼”과 “나중에 붙여도 되는 컬럼”
+
+이건 우선순위상 중요합니다.
+
+## 지금 반드시 있어야 하는 것
+
+* `messages`: latest 상태, 유니크 키
+* `message_versions`: 버전 이력, 텍스트 해시
+* `analysis_jobs`: 상태, retry, claimed_at, available_at
+* `message_preprocess_results`: version 연결
+* `message_inference_results`: preprocess 연결, model/prompt 버전
+
+## 나중에 붙여도 되는 것
+
+* 상세 token usage
+* latency ms
+* provider 응답 원문 전체
+* prompt 템플릿 전문 저장
+* 분산 tracing id
+* 샤딩/파티셔닝용 필드
+
+처음부터 다 넣으려 하면 오히려 적용이 늦어집니다.
+
+---
+
+# 12. Alembic migration 순서
+
+migration도 순서가 중요합니다.
+
+추천 순서는 아래입니다.
+
+## 1차 migration
+
+* `message_versions` 생성
+* `analysis_jobs` 생성
+* `messages`에 `latest_version_no`, `latest_version_id`, `status` 등 추가
+
+## 2차 migration
+
+* `message_preprocess_results` 생성
+
+## 3차 migration
+
+* `message_inference_results` 생성
+
+## 4차 migration
+
+* 인덱스/유니크/성능 튜닝
+
+처음부터 한 migration에 다 때려 넣어도 되지만, 실제 적용 중 rollback이나 검증 편의성은 나눠가는 쪽이 낫습니다.
+
+---
+
+# 13. 최소 테스트 세트
+
+이 구조라면 테스트는 아래 6개가 핵심입니다.
+
+## 1) `persist_message()` 신규 메시지 테스트
+
+검증:
+
+* `messages` 1건 생성
+* `message_versions` 1건 생성
+* `NORMALIZE` job 1건 생성
+
+## 2) `persist_message()` 수정 메시지 테스트
+
+검증:
+
+* 기존 `messages`는 유지
+* `message_versions` 새 버전 추가
+* 새 버전 기준 `NORMALIZE` job 생성
+
+## 3) `PreprocessWorker` 성공 테스트
+
+검증:
+
+* `NORMALIZE` job → `SUCCEEDED`
+* preprocess 결과 저장
+* `SINGLE_MESSAGE_SUMMARY` job 생성
+
+## 4) `InferenceWorker` 성공 테스트
+
+검증:
+
+* summary job → `SUCCEEDED`
+* inference 결과 저장
+
+## 5) `SchedulerWorker` stuck 복구 테스트
+
+검증:
+
+* 오래된 `IN_PROGRESS` job이 `PENDING` 또는 `RETRY_WAIT`로 복구
+
+## 6) 중복 방지 테스트
+
+검증:
+
+* 같은 버전에 같은 job이 두 번 생성되지 않음
+* 같은 결과가 이중 저장되지 않음
+
+---
+
+# 14. 지금 이 구조로 가면 코드도 이렇게 나뉘는 게 맞습니다
+
+## `repositories/`
+
+* `message_repository.py`
+* `message_version_repository.py`
+* `analysis_job_repository.py`
+* `preprocess_result_repository.py`
+* `inference_result_repository.py`
+
+## `services/`
+
+* `message_persistence_service.py`
+* `analysis_job_service.py`
+* `preprocess_service.py`
+* `inference_service.py`
+
+## `workers/`
+
+* `collector_worker.py`
+* `preprocess_worker.py`
+* `inference_worker.py`
+* `scheduler_worker.py`
+
+즉, repository는 DB 접근, service는 업무 규칙, worker는 실행 루프를 담당합니다.
+
+이 분리가 되어야 테스트가 쉬워집니다.
+
+---
+
+# 15. 한 문장으로 정리하면
+
+이번 구조의 본질은 이겁니다.
+
+**“메시지의 최신 상태와 이력을 분리하고, 각 처리 단계를 job으로 명시화해서, 실패·중복·수정·재처리를 모두 제어 가능하게 만드는 구조”**입니다.
+
+---
+

@@ -1,0 +1,385 @@
+좋습니다. 지금은 **세 파일만 최소 수정**하면 됩니다.
+
+핵심 이유는 이렇습니다.
+`analysis_job_service.py`는 `JobTargetType.MESSAGE.value`와 `self.default_max_attempts`를 쓰지만 해당 import/속성이 없고, `await self.job_repo.enqueue_job(...)`를 호출합니다. 그런데 repository의 `enqueue_job()`은 현재 sync 메서드입니다. 또 워커들은 `fail_job()`를 호출하지만 서비스에는 그 메서드가 없습니다. `preprocess_worker.py`는 `next_payload={"preprocess_result_id": res_id}`를 넘기고 있고, `inference_worker.py`는 그 payload의 `preprocess_result_id`를 바로 읽습니다. `scheduler_worker.py`는 `self.session_factory` 대신 `AsyncSessionLocal()`을 직접 쓰고, `_recover_stuck_jobs()`는 값을 반환하지 않는데 `run_once()`는 `recovered > 0`을 비교합니다. Repository 쪽은 `mark_retry()`를 `RETRY_PENDING`으로 바꾸지만 `claim_next_job()`은 `PENDING`만 집습니다.     
+
+아래 3개만 먼저 바꾸면 배선이 맞습니다.
+
+## 1) `analysis_job_service.py`
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Awaitable
+
+from src.infra.db.constants import JobStatus
+from src.infra.db.repositories.analysis_job_repository import AnalysisJobRepository
+from src.common.logger import logger
+from src.infra.db.models import AnalysisJob, JobTargetType
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+
+@dataclass
+class ClaimedJob:
+    job_id: int
+    message_id: int | None
+    job_type: str
+    payload: dict | None
+    attempt_count: int
+    max_attempts: int
+
+
+class AnalysisJobService:
+    def __init__(
+        self,
+        job_repo: AnalysisJobRepository | None = None,
+        default_max_attempts: int = 3,
+    ):
+        self.job_repo = job_repo or AnalysisJobRepository()
+        self.default_max_attempts = default_max_attempts
+
+    async def enqueue_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_type: str,
+        target_type: str,
+        target_id: int | None = None,
+        telegram_message_id: int | None = None,
+        message_version_id: int | None = None,
+        priority: int = 100,
+        idempotency_key: str | None = None,
+        payload_json: dict | None = None,
+        max_attempts: int | None = None,
+    ):
+        return self.job_repo.enqueue_job(
+            session,
+            job_type=job_type,
+            target_type=target_type,
+            target_id=target_id,
+            telegram_message_id=telegram_message_id,
+            message_version_id=message_version_id,
+            priority=priority,
+            idempotency_key=idempotency_key,
+            payload_json=payload_json,
+            max_attempts=max_attempts or self.default_max_attempts,
+        )
+
+    async def create_job_if_not_exists(
+        self,
+        session: AsyncSession,
+        *,
+        telegram_message_id: int,
+        job_type: str,
+        message_version_id: int | None = None,
+        payload: dict | None = None,
+        priority: int = 5,
+        max_attempts: int | None = None,
+    ) -> bool:
+        existing = await self.job_repo.get_existing_job(
+            session,
+            telegram_message_id=telegram_message_id,
+            message_version_id=message_version_id,
+            job_type=job_type,
+        )
+        if existing:
+            return False
+
+        self.job_repo.enqueue_job(
+            session,
+            job_type=job_type,
+            target_type=JobTargetType.MESSAGE.value,
+            target_id=telegram_message_id,
+            telegram_message_id=telegram_message_id,
+            message_version_id=message_version_id,
+            payload_json=payload,
+            priority=priority,
+            max_attempts=max_attempts or self.default_max_attempts,
+        )
+        return True
+
+    async def claim_next_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_type: str,
+        worker_name: str,
+    ) -> ClaimedJob | None:
+        job = await self.job_repo.claim_next_job(
+            session,
+            job_type=job_type,
+            worker_name=worker_name,
+        )
+        if not job:
+            return None
+
+        return ClaimedJob(
+            job_id=job.id,
+            message_id=job.telegram_message_id,
+            job_type=job.job_type,
+            payload=job.payload_json,
+            attempt_count=job.attempt_count,
+            max_attempts=job.max_attempts,
+        )
+
+    async def complete_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_id: int,
+        result_handler: Callable[[AsyncSession], Awaitable[None]],
+        next_job_type: str | None = None,
+        next_payload: dict | None = None,
+    ) -> None:
+        job = await self.job_repo.get_by_id(session, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+
+        await result_handler(session)
+        self.job_repo.mark_succeeded(session, job)
+
+        if next_job_type:
+            self.job_repo.enqueue_job(
+                session,
+                job_type=next_job_type,
+                target_type=job.target_type,
+                target_id=job.target_id,
+                telegram_message_id=job.telegram_message_id,
+                message_version_id=job.message_version_id,
+                payload_json=next_payload,
+                priority=job.priority,
+                max_attempts=job.max_attempts,
+            )
+
+    async def mark_done(self, session: AsyncSession, job_id: int):
+        job = await self.job_repo.get_by_id(session, job_id)
+        if job:
+            self.job_repo.mark_succeeded(session, job)
+
+    async def mark_failed(
+        self,
+        session: AsyncSession,
+        job: AnalysisJob,
+        error_code: str,
+        error_message: str,
+        retryable: bool = True,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+
+        if retryable and job.attempt_count < job.max_attempts:
+            next_available_at = now + self._compute_backoff(job.attempt_count)
+            self.job_repo.mark_retry(
+                session,
+                job,
+                error_code=error_code,
+                error_message=error_message,
+                next_available_at=next_available_at,
+            )
+            logger.info(
+                f"[AnalysisJobService] Job {job.id} marked for retry at {next_available_at} "
+                f"(attempt {job.attempt_count})"
+            )
+            return
+
+        self.job_repo.mark_dead(session, job, error_code, error_message)
+        logger.warning(f"[AnalysisJobService] Job {job.id} marked as DEAD: {error_code}")
+
+    async def fail_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_id: int,
+        error,
+        retryable: bool = True,
+    ) -> None:
+        job = await self.job_repo.get_by_id(session, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+
+        error_code = error.__class__.__name__ if isinstance(error, Exception) else "JOB_ERROR"
+        error_message = str(error)
+
+        await self.mark_failed(
+            session,
+            job=job,
+            error_code=error_code,
+            error_message=error_message,
+            retryable=retryable,
+        )
+
+    async def heartbeat(self, session: AsyncSession, job_id: int):
+        job = await self.job_repo.get_by_id(session, job_id)
+        if job:
+            self.job_repo.touch_heartbeat(session, job)
+
+    async def recover_stuck_jobs(self, session: AsyncSession, timeout_seconds: int = 1800) -> int:
+        jobs = await self.job_repo.find_stuck_jobs(session, timeout_seconds=timeout_seconds)
+        for job in jobs:
+            job.status = JobStatus.PENDING.value
+            job.worker_name = None
+            job.lease_expires_at = None
+        return len(jobs)
+
+    @staticmethod
+    def _compute_backoff(attempt_count: int) -> timedelta:
+        backoff_map = {0: 1, 1: 5, 2: 15}
+        minutes = backoff_map.get(attempt_count, 30)
+        return timedelta(minutes=minutes)
+```
+
+이 수정으로 서비스의 세 문제를 같이 정리합니다.
+`JobTargetType`/`default_max_attempts`를 채우고, repository의 sync `enqueue_job()` 호출에 맞춰 `await`를 제거하고, 워커가 실제로 호출하는 `fail_job()`도 추가하는 방식입니다.  
+
+## 2) `preprocess_worker.py`
+
+```python
+from __future__ import annotations
+
+import hashlib
+import re
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.db.models import (
+    AnalysisJob,
+    JobStatus,
+    JobTargetType,
+    JobType,
+    TelegramMessage,
+    TelegramMessageFeature,
+    MessageVersion,
+    NormalizedTelegramMessage,
+)
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+from src.services.worker_services import PreprocessService
+from src.workers.base_worker import BaseWorker
+
+
+class PreprocessWorker(BaseWorker):
+    async def run_once(self) -> int:
+        async with self.session_factory() as session:
+            job = await self.job_service.claim_next_job(
+                session,
+                job_type=JobType.NORMALIZE.value,
+                worker_name=self.worker_name,
+            )
+            if not job:
+                return 0
+
+            await session.commit()
+
+        try:
+            payload_holder = {"preprocess_result_id": None}
+
+            async with self.session_factory() as session:
+                async with session.begin():
+                    async def result_save_handler(s):
+                        result_id = await self.preprocess_service.run_normalize_job(
+                            s,
+                            job.job_id,
+                        )
+                        payload_holder["preprocess_result_id"] = result_id
+
+                    await self.job_service.complete_job(
+                        session,
+                        job_id=job.job_id,
+                        result_handler=result_save_handler,
+                        next_job_type=JobType.SINGLE_MESSAGE_SUMMARY.value,
+                        next_payload=payload_holder,
+                    )
+
+            logger.info(f"[{self.worker_name}] Job {job.job_id} handled successfully.")
+            return 1
+
+        except Exception as e:
+            logger.exception(f"[{self.worker_name}] Failed to handle job {job.job_id}: {e}")
+            async with self.session_factory() as session:
+                async with session.begin():
+                    await self.job_service.fail_job(
+                        session,
+                        job_id=job.job_id,
+                        error=e,
+                        retryable=True,
+                    )
+            return 0
+
+    def _hash(self, value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+```
+
+현재 파일은 `res_id`를 스칼라로 두고 `next_payload={"preprocess_result_id": res_id}`를 바로 넘기고 있습니다. 그런데 inference는 그 payload에서 `preprocess_result_id`를 바로 읽습니다. 그래서 가변 dict를 먼저 넘기고 handler 안에서 값을 채우는 방식이 가장 작은 수정입니다.  
+
+## 3) `scheduler_worker.py`
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from sqlalchemy import select, update
+
+from src.common.logger import logger
+from src.infra.db.models import AnalysisJob, JobStatus
+from src.services.worker_services import SchedulerService
+from src.workers.base_worker import BaseWorker
+
+UTC = timezone.utc
+
+
+class SchedulerWorker(BaseWorker):
+    def __init__(self, session_factory, scheduler_service, worker_name, poll_interval):
+        super().__init__(worker_name=worker_name, poll_interval=poll_interval)
+        self.session_factory = session_factory
+        self.service = scheduler_service
+
+    async def run_once(self) -> bool:
+        recovered = await self._recover_stuck_jobs()
+        return recovered > 0
+
+    async def _recover_stuck_jobs(self) -> int:
+        try:
+            async with self.session_factory() as session:
+                count = await self.service.recover_stuck_jobs(session)
+                if count > 0:
+                    await session.commit()
+                    logger.info(f"[{self.worker_name}] Recovered {count} stuck jobs.")
+                return count
+        except Exception as e:
+            logger.error(f"[{self.worker_name}] Error during stuck job recovery: {e}")
+            return 0
+```
+
+현재 파일은 `self.session_factory`를 받았는데도 `AsyncSessionLocal()`을 직접 열고 있고, `_recover_stuck_jobs()`가 반환값 없이 끝납니다. 이 수정으로 `run_once()`의 `recovered > 0` 비교가 정상 동작합니다. 
+
+## 같이 꼭 바꿔야 하는 repository 1줄
+
+이건 세 파일 바깥이지만, 지금 구조에선 반드시 같이 고쳐야 합니다.
+
+```python
+def mark_retry(
+    self,
+    session: AsyncSession,
+    job: AnalysisJob,
+    error_code: str,
+    error_message: str,
+    next_available_at: datetime,
+) -> None:
+    job.status = JobStatus.PENDING.value
+    job.attempt_count += 1
+    job.available_at = next_available_at
+    job.error_code = error_code
+    job.error_message = error_message
+    job.worker_name = None
+    job.claimed_at = None
+    job.lease_expires_at = None
+```
+
+현재 repository는 `mark_retry()`에서 `RETRY_PENDING`으로 바꾸는데, `claim_next_job()`은 `PENDING`만 조회합니다. 이 상태면 retry job이 다시 실행되지 않을 수 있습니다. 
+
+이 4개까지 반영하면 그다음은 `persist_message() → preprocess_worker.run_once() → inference_worker.run_once()` 스모크 테스트로 바로 넘어가면 됩니다.

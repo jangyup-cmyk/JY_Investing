@@ -1,0 +1,607 @@
+좋습니다. 이번에는 **실제 패치에 바로 옮기기 쉬운 diff 스타일 초안**으로 적겠습니다.
+
+현재 구조상 `collector_worker.py`는 실시간 신규/편집 메시지를 DB에 적재하는 저장 루프를 담당하고, `startup_tasks.py`는 `persist_func`를 주입받아 백필을 오케스트레이션하도록 설계돼 있습니다. 또 Phase 2의 핵심 강점은 `begin_nested()` savepoint, 100건 단위 batch commit, cursor-based resume, 편집 메시지 반영 정합성입니다. 따라서 이번 패치는 **이벤트 핸들러가 아니라 공통 persist 지점**에 넣어야 하고, **enqueue는 기존 트랜잭션 안**에 태워야 합니다.   
+
+아래 diff는 실제 코드가 없어서 **함수명은 예시**입니다. 다만 패치 위치와 책임 분리는 현재 문서 구조와 맞춘 형태입니다. 
+
+---
+
+## 1) `collector_worker.py` 패치 핵심
+
+핵심 원칙은 네 가지입니다.
+
+* 신규/편집/백필이 **공통으로 타는 persist 함수** 하나를 기준으로 패치
+* `message upsert → version 생성 → normalize job enqueue`를 **같은 세션/같은 savepoint**에서 처리
+* `AnalysisJobService.enqueue_job()`은 **commit 하지 않음**
+* idempotency key는 반드시 **`message_id` + `version_id` + version tag** 기준으로 구성
+
+이렇게 해야 현재 백필 엔진의 batch commit/savepoint/resume 구조를 유지할 수 있습니다.  
+
+---
+
+## 2) `collector_worker.py` diff 초안
+
+### A. import 추가
+
+```diff
+diff --git a/src/workers/collector_worker.py b/src/workers/collector_worker.py
+index 1111111..2222222 100644
+--- a/src/workers/collector_worker.py
++++ b/src/workers/collector_worker.py
+@@
++from hashlib import sha256
++
++from sqlalchemy import select
++
++from src.services.analysis_job_service import AnalysisJobService
++from src.infra.db.models import (
++    AnalysisJob,
++    JobType,
++    JobTargetType,
++    MessageVersion,
++)
+```
+
+---
+
+### B. 공통 persist 함수 확장
+
+아래 예시는 `persist_message()`라는 이름으로 적었지만, 실제 코드에서는 문서상 “DB 저장 루프” 역할을 하는 함수에 넣으면 됩니다. 실시간/백필 공통 경로여야 합니다.  
+
+```diff
+diff --git a/src/workers/collector_worker.py b/src/workers/collector_worker.py
+index 2222222..3333333 100644
+--- a/src/workers/collector_worker.py
++++ b/src/workers/collector_worker.py
+@@
+-async def persist_message(session: AsyncSession, channel, tg_msg) -> Message:
+-    message = await upsert_message_from_telegram(session, channel, tg_msg)
+-    return message
++async def persist_message(session: AsyncSession, channel, tg_msg) -> Message:
++    """
++    신규/편집/백필 공통 영속화 지점
++    - messages upsert
++    - message_versions 생성/갱신
++    - normalize analysis job enqueue
++    """
++    async with session.begin_nested():
++        message, changed = await upsert_message_from_telegram(session, channel, tg_msg)
++
++        # 재수집/중복 유입으로 실질 변경이 없으면 여기서 종료
++        if not changed:
++            return message
++
++        version = await create_message_version(session, message, tg_msg)
++        await session.flush()
++
++        await AnalysisJobService.enqueue_job(
++            session,
++            job_type=JobType.NORMALIZE,
++            target_type=JobTargetType.MESSAGE,
++            target_id=message.id,
++            idempotency_key=f"normalize:message:{message.id}:version:{version.id}:cv1",
++            payload_json={
++                "message_id": message.id,
++                "version_id": version.id,
++                "channel_id": message.channel_id,
++                "tg_message_id": message.tg_message_id,
++                "cleaning_version": "v1",
++            },
++            priority=100,
++            max_attempts=3,
++        )
++
++        return message
+```
+
+여기서 중요한 점은 `begin_nested()` 안에 enqueue를 넣는 것입니다. 현재 문서에 따르면 Phase 2는 이미 savepoint 기반으로 중복/부분실패를 흡수하고 있으므로, 이 흐름을 그대로 가져가야 합니다.  
+
+---
+
+### C. `upsert_message_from_telegram()` 반환값 변경
+
+중복 job 생성을 막으려면 `changed` 플래그가 필요합니다.
+
+```diff
+diff --git a/src/workers/collector_worker.py b/src/workers/collector_worker.py
+index 3333333..4444444 100644
+--- a/src/workers/collector_worker.py
++++ b/src/workers/collector_worker.py
+@@
+-async def upsert_message_from_telegram(session: AsyncSession, channel, tg_msg) -> Message:
++async def upsert_message_from_telegram(session: AsyncSession, channel, tg_msg) -> tuple[Message, bool]:
+     existing = await session.scalar(
+         select(Message).where(
+             Message.channel_id == channel.id,
+             Message.tg_message_id == tg_msg.id,
+         )
+     )
+ 
+     if existing is None:
+         message = Message(
+             channel_id=channel.id,
+             tg_message_id=tg_msg.id,
+             tg_date_utc=tg_msg.date,
+             message_text=tg_msg.message,
+             edit_date_utc=getattr(tg_msg, "edit_date", None),
++            raw_hash=_sha256(tg_msg.message or ""),
+         )
+         session.add(message)
+         await session.flush()
+-        return message
++        return message, True
+ 
+-    existing.message_text = tg_msg.message
+-    existing.edit_date_utc = getattr(tg_msg, "edit_date", None)
+-    await session.flush()
+-    return existing
++    new_text = tg_msg.message or ""
++    new_edit_date = getattr(tg_msg, "edit_date", None)
++    new_hash = _sha256(new_text)
++
++    changed = False
++
++    if existing.message_text != new_text:
++        existing.message_text = new_text
++        changed = True
++
++    if existing.edit_date_utc != new_edit_date:
++        existing.edit_date_utc = new_edit_date
++        changed = True
++
++    if existing.raw_hash != new_hash:
++        existing.raw_hash = new_hash
++        changed = True
++
++    if changed:
++        await session.flush()
++
++    return existing, changed
+```
+
+이렇게 해야 재수집이나 replay 시 normalize job이 계속 늘어나는 문제를 막을 수 있습니다. 현재 Phase 2가 “중복 수집 0건”과 “resume 정합성”을 강하게 요구하므로, 이 조건 분기는 꼭 필요합니다.  
+
+---
+
+### D. `create_message_version()` 추가
+
+편집 메시지 반영을 위해 `version` 계보를 남겨야 합니다. Phase 2 검증 항목에도 원본 편집 메시지 실시간 반영이 포함돼 있습니다. 
+
+```diff
+diff --git a/src/workers/collector_worker.py b/src/workers/collector_worker.py
+index 4444444..5555555 100644
+--- a/src/workers/collector_worker.py
++++ b/src/workers/collector_worker.py
+@@
++async def create_message_version(session: AsyncSession, message: Message, tg_msg) -> MessageVersion:
++    current = await session.scalar(
++        select(MessageVersion).where(
++            MessageVersion.message_id == message.id,
++            MessageVersion.is_current.is_(True),
++        )
++    )
++
++    new_text = tg_msg.message or ""
++    new_hash = _sha256(new_text)
++    new_edit_date = getattr(tg_msg, "edit_date", None)
++
++    # 실질 변화 없으면 기존 current 재사용
++    if current and current.raw_hash == new_hash:
++        return current
++
++    if current:
++        current.is_current = False
++        next_version_no = current.version_no + 1
++    else:
++        next_version_no = 1
++
++    version = MessageVersion(
++        message_id=message.id,
++        version_no=next_version_no,
++        message_text=new_text,
++        raw_hash=new_hash,
++        edit_date_utc=new_edit_date,
++        is_current=True,
++    )
++    session.add(version)
++    await session.flush()
++    return version
++
++
++def _sha256(value: str) -> str:
++    return sha256(value.encode("utf-8")).hexdigest()
+```
+
+---
+
+### E. 이벤트 핸들러는 얇게 유지
+
+실시간 신규/편집 이벤트는 공통 persist만 호출해야 합니다.
+
+```diff
+diff --git a/src/workers/collector_worker.py b/src/workers/collector_worker.py
+index 5555555..6666666 100644
+--- a/src/workers/collector_worker.py
++++ b/src/workers/collector_worker.py
+@@
+ async def on_new_message(event):
+     async with AsyncSessionLocal() as session:
+-        await persist_message(session, channel=..., tg_msg=event.message)
++        await persist_message(session, channel=..., tg_msg=event.message)
+         await session.commit()
+@@
+ async def on_edited_message(event):
+     async with AsyncSessionLocal() as session:
+-        await persist_message(session, channel=..., tg_msg=event.message)
++        await persist_message(session, channel=..., tg_msg=event.message)
+         await session.commit()
+```
+
+이벤트 핸들러 안에서 직접 `AnalysisJobService.enqueue_job()`를 호출하지 말고 persist만 타게 두는 게 좋습니다. 백필 경로도 같은 persist를 타야 하기 때문입니다. 문서상 `startup_tasks.py`가 `persist_func`를 주입받는 이유도 바로 이 공통화입니다.  
+
+---
+
+## 3) `startup_tasks.py` 패치 포인트
+
+`startup_tasks.py`는 가급적 안 건드리고, 이미 있는 `persist_func` 주입 구조를 그대로 활용하는 게 맞습니다. 문서상 이 파일의 설계 목적이 “worker와 persistence 함수의 결합도 완화”이기 때문입니다. 
+
+즉, 여기서는 로직 변경보다 **호출 대상 persist 함수가 확장된 버전인지 확인**만 하면 됩니다.
+
+```diff
+diff --git a/src/workers/startup_tasks.py b/src/workers/startup_tasks.py
+index aaaaaaa..bbbbbbb 100644
+--- a/src/workers/startup_tasks.py
++++ b/src/workers/startup_tasks.py
+@@
+-async def run_startup_backfill(collector, persist_func, ...):
++async def run_startup_backfill(collector, persist_func, ...):
+     ...
+     async for tg_msg in collector.iter_channel_messages(...):
+-        await persist_func(session, channel, tg_msg)
++        await persist_func(session, channel, tg_msg)
+     ...
+```
+
+여기서는 diff상 변화가 없어 보여도 괜찮습니다. 핵심은 **주입되는 `persist_func` 구현체가 이미 version 생성과 normalize enqueue까지 포함한 상태**라는 점입니다.
+
+---
+
+## 4) `AnalysisJobService`에서 꼭 지켜야 할 조건
+
+이건 매우 중요합니다.
+
+### `enqueue_job()` 내부에서 commit 금지
+
+현재 백필 엔진은 100건 단위 batch commit을 통해 FloodWait나 중간 실패에도 이전 작업분을 보존하도록 설계돼 있습니다. `enqueue_job()`가 내부에서 commit을 해버리면 이 구조가 깨집니다.  
+
+즉, 아래처럼 flush까지만 해야 합니다.
+
+```python
+job = AnalysisJob(...)
+session.add(job)
+await session.flush()
+return job
+```
+
+### 중복이면 기존 job 반환
+
+resume/replay/backfill 재실행을 안전하게 처리하려면 필요합니다.
+
+```python
+existing = await session.scalar(
+    select(AnalysisJob).where(
+        AnalysisJob.job_type == job_type,
+        AnalysisJob.idempotency_key == idempotency_key,
+    )
+)
+if existing:
+    return existing
+```
+
+---
+
+## 5) pytest 테스트 시나리오 초안
+
+현재 문서상 pytest 기반 24개 핵심 시나리오를 이미 운영 중이고, 검증 포인트로 중복 방지, 트랜잭션 롤백, 이어받기, 편집 메시지 반영 등이 명시돼 있습니다. 따라서 이번 테스트도 그 철학에 맞춰 가야 합니다. 
+
+아래는 **이번 패치 후 최소한 추가해야 하는 테스트 세트**입니다.
+
+---
+
+### 테스트 1: 신규 메시지 저장 시 normalize job 생성
+
+목적:
+
+* 신규 메시지 1건 저장
+* `message_versions` 1건 생성
+* `analysis_jobs(normalize)` 1건 생성
+
+```python
+async def test_persist_message_creates_version_and_normalize_job(async_session):
+    channel = await make_channel(async_session)
+    tg_msg = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 수주 기대감",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=None,
+    )
+
+    msg = await persist_message(async_session, channel, tg_msg)
+    await async_session.commit()
+
+    stored = await get_message(async_session, channel.id, 101)
+    versions = await list_versions(async_session, stored.id)
+    jobs = await list_jobs(async_session, target_id=stored.id, job_type="normalize")
+
+    assert stored is not None
+    assert len(versions) == 1
+    assert versions[0].is_current is True
+    assert len(jobs) == 1
+    assert jobs[0].idempotency_key.startswith(f"normalize:message:{stored.id}:version:")
+```
+
+---
+
+### 테스트 2: 동일 메시지 재수집 시 job 중복 생성 없음
+
+목적:
+
+* 동일 본문/동일 edit_date 메시지를 다시 저장
+* 새 version 없음
+* 새 normalize job 없음
+
+```python
+async def test_persist_message_same_payload_does_not_duplicate_job(async_session):
+    channel = await make_channel(async_session)
+
+    tg_msg = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 수주 기대감",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=None,
+    )
+
+    await persist_message(async_session, channel, tg_msg)
+    await async_session.commit()
+
+    await persist_message(async_session, channel, tg_msg)
+    await async_session.commit()
+
+    stored = await get_message(async_session, channel.id, 101)
+    versions = await list_versions(async_session, stored.id)
+    jobs = await list_jobs(async_session, target_id=stored.id, job_type="normalize")
+
+    assert len(versions) == 1
+    assert len(jobs) == 1
+```
+
+이 테스트는 현재 프로젝트의 “중복 적재 0건” 철학과 직접 맞닿아 있습니다. 
+
+---
+
+### 테스트 3: 편집 메시지 수신 시 새 version + 새 normalize job 생성
+
+목적:
+
+* 최초 저장 후 edit된 메시지 저장
+* 기존 current version 해제
+* 새 current version 생성
+* normalize job 2건째 생성
+
+```python
+async def test_persist_message_edit_creates_new_version_and_new_job(async_session):
+    channel = await make_channel(async_session)
+
+    original = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 수주 기대감",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=None,
+    )
+    edited = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 대형 수주 기대감 확대",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=aware_dt("2026-03-22T09:05:00+00:00"),
+    )
+
+    await persist_message(async_session, channel, original)
+    await async_session.commit()
+
+    await persist_message(async_session, channel, edited)
+    await async_session.commit()
+
+    stored = await get_message(async_session, channel.id, 101)
+    versions = await list_versions(async_session, stored.id, order_by="version_no")
+    jobs = await list_jobs(async_session, target_id=stored.id, job_type="normalize")
+
+    assert len(versions) == 2
+    assert versions[0].is_current is False
+    assert versions[1].is_current is True
+    assert versions[1].message_text == "삼성전자 005930 대형 수주 기대감 확대"
+    assert len(jobs) == 2
+```
+
+이 테스트는 문서에 명시된 “원본 편집 메시지 실시간 반영 여부” 검증과 정확히 연결됩니다. 
+
+---
+
+### 테스트 4: enqueue 중복 충돌 시 기존 job 반환
+
+목적:
+
+* 같은 idempotency key로 `enqueue_job()` 두 번 호출
+* job 1건만 유지
+
+```python
+async def test_enqueue_job_is_idempotent(async_session, message):
+    job1 = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=f"normalize:message:{message.id}:version:1:cv1",
+        payload_json={"message_id": message.id, "version_id": 1},
+    )
+    await async_session.commit()
+
+    job2 = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=f"normalize:message:{message.id}:version:1:cv1",
+        payload_json={"message_id": message.id, "version_id": 1},
+    )
+    await async_session.commit()
+
+    jobs = await list_jobs(async_session, target_id=message.id, job_type="normalize")
+
+    assert len(jobs) == 1
+    assert job1.id == job2.id
+```
+
+---
+
+### 테스트 5: savepoint 안에서 한 건 실패해도 다른 건 유지
+
+목적:
+
+* 백필 루프에서 여러 메시지 persist
+* 중간 한 건이 예외 발생
+* 이전 성공건 + 이후 성공건은 유지
+
+이 테스트는 현재 Phase 2의 savepoint 철학을 깨지 않았는지 검증하는 핵심 테스트입니다. 
+
+```python
+async def test_backfill_loop_savepoint_keeps_other_rows(async_session, monkeypatch):
+    channel = await make_channel(async_session)
+
+    msgs = [
+        FakeTelegramMessage(id=1, message="a", date=aware_dt("2026-03-22T09:00:00+00:00")),
+        FakeTelegramMessage(id=2, message="b", date=aware_dt("2026-03-22T09:01:00+00:00")),
+        FakeTelegramMessage(id=3, message="c", date=aware_dt("2026-03-22T09:02:00+00:00")),
+    ]
+
+    original = create_message_version
+
+    async def broken_create_version(session, message, tg_msg):
+        if tg_msg.id == 2:
+            raise ValueError("forced failure")
+        return await original(session, message, tg_msg)
+
+    monkeypatch.setattr("src.workers.collector_worker.create_message_version", broken_create_version)
+
+    for tg_msg in msgs:
+        try:
+            await persist_message(async_session, channel, tg_msg)
+        except ValueError:
+            pass
+
+    await async_session.commit()
+
+    all_messages = await list_messages(async_session, channel.id)
+    all_jobs = await list_jobs(async_session, job_type="normalize")
+
+    assert [m.tg_message_id for m in all_messages] == [1, 3]
+    assert len(all_jobs) == 2
+```
+
+---
+
+### 테스트 6: preprocess worker가 normalize → extract_features → summary job까지 연결
+
+목적:
+
+* normalize job 1건 준비
+* `PreprocessWorker.run_once()` 두 번
+* `normalized_messages`, `message_features`, `single_message_summary` job 생성 확인
+
+이 테스트는 Phase 3에서 Phase 4로 이어지는 파이프라인 연결을 검증합니다. 문서상 다음 단계가 정확히 이 순서입니다. 
+
+```python
+async def test_preprocess_worker_pipeline(async_session, seeded_normalize_job):
+    worker = PreprocessWorker(worker_name="test-preprocess", poll_interval=0.01)
+
+    handled1 = await worker.run_once()
+    handled2 = await worker.run_once()
+
+    assert handled1 is True
+    assert handled2 is True
+
+    normalized = await list_normalized_messages(async_session)
+    features = await list_message_features(async_session)
+    summary_jobs = await list_jobs(async_session, job_type="single_message_summary")
+
+    assert len(normalized) == 1
+    assert len(features) == 1
+    assert len(summary_jobs) == 1
+```
+
+---
+
+### 테스트 7: `run_worker.py` CLI 파싱
+
+목적:
+
+* `--type preprocess` 입력 시 preprocess worker 선택
+* `--type inference` 입력 시 inference worker 선택
+
+이건 큰 테스트는 아니지만, 단일 진입점 구조가 깨지지 않았는지 빠르게 검증하는 용도로 좋습니다.
+
+```python
+def test_run_worker_parser_preprocess():
+    parser = build_parser()
+    args = parser.parse_args(["--type", "preprocess"])
+    assert args.type == "preprocess"
+
+def test_run_worker_parser_inference():
+    parser = build_parser()
+    args = parser.parse_args(["--type", "inference", "--job-types", "single_message_summary"])
+    assert args.type == "inference"
+    assert args.job_types == ["single_message_summary"]
+```
+
+---
+
+## 6) 테스트 파일 권장 배치
+
+현재 `tests/` 폴더가 이미 존재하므로 아래처럼 쪼개는 편이 좋습니다. 
+
+```text
+tests/
+  workers/
+    test_collector_persist.py
+    test_preprocess_worker.py
+    test_inference_worker.py
+    test_run_worker_cli.py
+  services/
+    test_analysis_job_service.py
+```
+
+---
+
+## 7) 가장 먼저 깨질 가능성이 높은 부분
+
+이번 패치에서 가장 위험한 부분은 두 개입니다.
+
+하나는 **`enqueue_job()` 안에서 commit이 들어가는 경우**입니다. 이러면 현재 문서의 batch commit/savepoint 설계가 무너질 가능성이 큽니다. 
+
+다른 하나는 **persist 지점이 아니라 이벤트 핸들러에 enqueue를 넣는 경우**입니다. 그러면 백필과 실시간 처리 정책이 달라지고, `startup_tasks.py`가 왜 `persist_func`를 주입받는지의 설계 의미가 사라집니다. 
+
+---
+
+## 8) 최종 권장 순서
+
+실행 순서는 이렇게 가는 것이 가장 안전합니다.
+
+1. `collector_worker.py` 공통 persist 함수 패치
+2. `AnalysisJobService` idempotent enqueue 확정
+3. `tests/services/test_analysis_job_service.py` 추가
+4. `tests/workers/test_collector_persist.py` 추가
+5. `PreprocessWorker` 연결 테스트 추가
+6. 마지막에 `InferenceWorker` 연결
+
+이 순서가 현재 Phase 2의 강점인 안정성과 정합성을 보존하면서 Phase 3로 넘어가는 가장 낮은 리스크 경로입니다. 문서상 현재는 수집 인프라가 이미 안정적이고, 다음 단계가 전처리와 분석으로 명확히 정리돼 있습니다. 
+
+

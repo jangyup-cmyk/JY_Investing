@@ -1,0 +1,287 @@
+좋습니다. 그럼 바로 **`pytest.ini` 정리안**과 **실행 커맨드 권장안**을 현재 구조 기준으로 드리겠습니다.
+
+## 1) 권장 `pytest.ini`
+
+프로젝트 루트에 `pytest.ini`를 두는 형태가 가장 무난합니다.
+
+```ini
+[pytest]
+minversion = 7.0
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+
+addopts = 
+    -ra
+    -q
+
+asyncio_mode = auto
+
+markers =
+    unit: 빠른 단위 테스트
+    integration: DB/워커/서비스 통합 테스트
+    slow: 상대적으로 오래 걸리는 테스트
+```
+
+이 설정의 핵심은 아래입니다.
+
+* `testpaths = tests`
+  → 루트에서 `pytest`만 쳐도 `tests/`만 탐색
+* `python_files = test_*.py`
+  → 테스트 파일 네이밍 규칙 고정
+* `asyncio_mode = auto`
+  → `pytest-asyncio`와 함께 async 테스트를 자연스럽게 실행
+* `markers`
+  → 나중에 워커 통합 테스트와 빠른 단위 테스트를 분리하기 쉬움
+
+---
+
+## 2) 권장 개발 의존성
+
+최소한 아래 정도는 맞춰두는 편이 좋습니다.
+
+```txt
+pytest
+pytest-asyncio
+```
+
+커버리지까지 보려면:
+
+```txt
+pytest
+pytest-asyncio
+pytest-cov
+```
+
+`requirements-dev.txt`가 있다면 그쪽에 넣는 걸 권장합니다.
+
+예시:
+
+```txt
+pytest>=7.0
+pytest-asyncio>=0.21
+pytest-cov>=4.0
+```
+
+버전 핀은 프로젝트 정책에 맞게 더 엄격하게 묶으셔도 됩니다.
+
+---
+
+## 3) 가장 자주 쓸 실행 커맨드
+
+### 전체 테스트
+
+```bash
+pytest
+```
+
+### 자세히 보기
+
+```bash
+pytest -vv
+```
+
+### 특정 파일만
+
+```bash
+pytest tests/workers/test_collector_persist.py -vv
+pytest tests/workers/test_preprocess_worker.py -vv
+pytest tests/workers/test_inference_worker.py -vv
+pytest tests/services/test_analysis_job_service.py -vv
+```
+
+### 특정 테스트 하나만
+
+```bash
+pytest tests/workers/test_preprocess_worker.py -k normalize -vv
+pytest tests/services/test_analysis_job_service.py -k claim_next_job -vv
+```
+
+### 워커 테스트만
+
+```bash
+pytest tests/workers -vv
+```
+
+### 서비스 테스트만
+
+```bash
+pytest tests/services -vv
+```
+
+---
+
+## 4) 마커 기반 실행 권장안
+
+테스트가 늘어나면 marker를 붙이는 게 매우 유용합니다.
+
+예를 들면:
+
+```python
+import pytest
+
+@pytest.mark.unit
+async def test_enqueue_job_is_idempotent(...):
+    ...
+
+@pytest.mark.integration
+async def test_normalize_then_extract_pipeline_end_to_end(...):
+    ...
+```
+
+그럼 실행은 이렇게 나눌 수 있습니다.
+
+### unit만
+
+```bash
+pytest -m unit -vv
+```
+
+### integration만
+
+```bash
+pytest -m integration -vv
+```
+
+### slow 제외
+
+```bash
+pytest -m "not slow" -vv
+```
+
+---
+
+## 5) 커버리지 권장 커맨드
+
+`pytest-cov`를 넣었다면 아래 정도가 실용적입니다.
+
+### 전체 커버리지
+
+```bash
+pytest --cov=src --cov-report=term-missing
+```
+
+### 특정 모듈 중심
+
+```bash
+pytest --cov=src/services --cov=src/workers --cov-report=term-missing
+```
+
+### HTML 리포트
+
+```bash
+pytest --cov=src --cov-report=html
+```
+
+그러면 `htmlcov/index.html`로 결과를 볼 수 있습니다.
+
+---
+
+## 6) 지금 구조 기준 추천 실행 순서
+
+현재 단계에서는 아래 순서로 돌리는 것이 가장 좋습니다.
+
+### 1단계: 서비스 레이어 확인
+
+```bash
+pytest tests/services/test_analysis_job_service.py -vv
+```
+
+### 2단계: collector persist 확인
+
+```bash
+pytest tests/workers/test_collector_persist.py -vv
+```
+
+### 3단계: preprocess 파이프라인 확인
+
+```bash
+pytest tests/workers/test_preprocess_worker.py -vv
+```
+
+### 4단계: inference 파이프라인 확인
+
+```bash
+pytest tests/workers/test_inference_worker.py -vv
+```
+
+### 5단계: 전체 통합 확인
+
+```bash
+pytest tests -vv
+```
+
+이 순서가 좋은 이유는, 문제 발생 시 어디서 깨졌는지 바로 좁힐 수 있기 때문입니다.
+
+---
+
+## 7) Windows 기준 실행 예시
+
+사용 환경이 Windows라면 보통 아래처럼 실행하면 됩니다.
+
+### 가상환경 활성화 후
+
+```bash
+pytest
+```
+
+### 또는 직접
+
+```bash
+.venv\Scripts\pytest -vv
+```
+
+### Python 모듈 방식
+
+```bash
+python -m pytest -vv
+```
+
+개인적으로는 **`python -m pytest` 방식**을 권장합니다.
+환경 경로 문제를 덜 탑니다.
+
+---
+
+## 8) 추천 `Makefile` 대체 느낌의 명령 모음
+
+Windows에서도 배치 파일이나 문서에 이렇게 정리해두면 편합니다.
+
+```bash
+python -m pytest tests/services/test_analysis_job_service.py -vv
+python -m pytest tests/workers/test_collector_persist.py -vv
+python -m pytest tests/workers/test_preprocess_worker.py -vv
+python -m pytest tests/workers/test_inference_worker.py -vv
+python -m pytest tests -vv
+python -m pytest --cov=src --cov-report=term-missing
+```
+
+---
+
+## 9) 지금 단계에서 추가로 추천하는 것
+
+`pytest.ini`와 함께 `tests/__init__.py`는 굳이 없어도 되지만,
+테스트 헬퍼 import가 많아지면 `tests/helpers/` 구조를 두는 편이 좋습니다.
+
+권장 구조는 이렇습니다.
+
+```text
+tests/
+  conftest.py
+  services/
+    test_analysis_job_service.py
+  workers/
+    test_collector_persist.py
+    test_preprocess_worker.py
+    test_inference_worker.py
+  helpers/
+    factories.py
+    fake_telegram.py
+    db_asserts.py
+```
+
+지금은 아직 `conftest.py` 하나로도 충분하고, 테스트가 더 늘어나면 그때 분리하면 됩니다.
+
+---
+
+

@@ -1,0 +1,592 @@
+좋습니다. 그럼 바로 **현재까지 정리한 서비스/워커 구조에 맞춘 `tests/integration/test_pipeline_flow.py` 전체 초안**으로 이어가겠습니다.
+
+아래 초안은 다음 전제를 기준으로 합니다.
+
+* `MessageService.persist_message()` 가 초기 `NORMALIZE` job 생성
+* `PreprocessWorker.run_once()` 가 `NORMALIZE` 처리 후 `SINGLE_MESSAGE_SUMMARY` job 생성
+* `InferenceWorker.run_once()` 가 summary 저장 후 job 완료
+* `AnalysisJob.status` 는 문자열 상태값 사용
+* 모델명
+
+  * `Message`
+  * `AnalysisJob`
+  * `PreprocessedMessage`
+  * `MessageSummary`
+
+현재 프로젝트 이름이 다르면 **import 경로와 필드명만 치환**하면 됩니다.
+
+---
+
+# 1) 권장 파일 구조
+
+```text
+tests/
+  conftest.py
+  integration/
+    test_pipeline_flow.py
+```
+
+---
+
+# 2) `tests/conftest.py` 보강 초안
+
+기존 `conftest.py` 가 없다면 아래 형태로 시작하면 됩니다.
+
+```python
+from datetime import datetime
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from src.db.base import Base
+from src.services.message_service import MessageService
+from src.services.analysis_job_service import AnalysisJobService
+from src.services.preprocess_service import PreprocessService
+from src.services.summary_service import SummaryService
+from src.workers.preprocess_worker import PreprocessWorker
+from src.workers.inference_worker import InferenceWorker
+
+
+class FakeSummaryClient:
+    def summarize(self, text: str) -> str:
+        return f"[SUMMARY] {text[:100]}"
+
+
+class FailingSummaryClient:
+    def summarize(self, text: str) -> str:
+        raise RuntimeError("mock llm timeout")
+
+
+@pytest.fixture
+def engine():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    try:
+        yield engine
+    finally:
+        Base.metadata.drop_all(engine)
+
+
+@pytest.fixture
+def db_session_factory(engine):
+    return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+@pytest.fixture
+def job_service(db_session_factory):
+    return AnalysisJobService(
+        db_session_factory=db_session_factory,
+        use_skip_locked=False,  # SQLite 테스트 환경 fallback
+    )
+
+
+@pytest.fixture
+def preprocess_service():
+    return PreprocessService()
+
+
+@pytest.fixture
+def summary_service():
+    return SummaryService()
+
+
+@pytest.fixture
+def message_service(db_session_factory):
+    return MessageService(db_session_factory=db_session_factory)
+
+
+@pytest.fixture
+def preprocess_worker(db_session_factory, job_service, preprocess_service):
+    return PreprocessWorker(
+        db_session_factory=db_session_factory,
+        job_service=job_service,
+        preprocess_service=preprocess_service,
+    )
+
+
+@pytest.fixture
+def inference_worker(
+    db_session_factory,
+    job_service,
+    summary_service,
+):
+    return InferenceWorker(
+        db_session_factory=db_session_factory,
+        job_service=job_service,
+        summary_service=summary_service,
+        summary_client=FakeSummaryClient(),
+    )
+
+
+@pytest.fixture
+def failing_inference_worker(
+    db_session_factory,
+    job_service,
+    summary_service,
+):
+    return InferenceWorker(
+        db_session_factory=db_session_factory,
+        job_service=job_service,
+        summary_service=summary_service,
+        summary_client=FailingSummaryClient(),
+    )
+```
+
+---
+
+# 3) `tests/integration/test_pipeline_flow.py` 전체 초안
+
+```python
+from datetime import datetime
+
+from src.models.message import Message
+from src.models.analysis_job import AnalysisJob
+from src.models.preprocessed_message import PreprocessedMessage
+from src.models.message_summary import MessageSummary
+from src.services.analysis_job_service import JobStatus
+
+
+def get_job(session, message_id: int, job_type: str) -> AnalysisJob:
+    return (
+        session.query(AnalysisJob)
+        .filter(
+            AnalysisJob.message_id == message_id,
+            AnalysisJob.job_type == job_type,
+        )
+        .one()
+    )
+
+
+def test_pipeline_run_once_happy_path(
+    db_session_factory,
+    message_service,
+    preprocess_worker,
+    inference_worker,
+):
+    # 1. 원문 메시지 저장
+    persisted = message_service.persist_message(
+        channel_id=1,
+        telegram_message_id=1001,
+        text="삼성전자 자사주 소각 관련 공시 속보",
+        sent_at=datetime(2026, 3, 22, 9, 0, 0),
+        raw_payload={
+            "id": 1001,
+            "text": "삼성전자 자사주 소각 관련 공시 속보",
+        },
+    )
+
+    # 2. 저장 직후 상태 확인
+    with db_session_factory() as session:
+        msg = session.query(Message).filter(Message.id == persisted.id).one()
+        assert msg.channel_id == 1
+        assert msg.telegram_message_id == 1001
+        assert msg.text == "삼성전자 자사주 소각 관련 공시 속보"
+
+        normalize_jobs = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.message_id == msg.id,
+                AnalysisJob.job_type == "NORMALIZE",
+            )
+            .all()
+        )
+        assert len(normalize_jobs) == 1
+        assert normalize_jobs[0].status == JobStatus.PENDING
+
+    # 3. preprocess 1회 실행
+    processed_pre = preprocess_worker.run_once()
+    assert processed_pre == 1
+
+    # 4. preprocess 이후 상태 확인
+    with db_session_factory() as session:
+        normalize_job = get_job(session, persisted.id, "NORMALIZE")
+        assert normalize_job.status == JobStatus.DONE
+        assert normalize_job.started_at is not None
+        assert normalize_job.finished_at is not None
+        assert normalize_job.started_at <= normalize_job.finished_at
+        assert normalize_job.attempt_count == 1
+        assert normalize_job.last_error in (None, "")
+
+        preprocessed = (
+            session.query(PreprocessedMessage)
+            .filter(PreprocessedMessage.message_id == persisted.id)
+            .one()
+        )
+        assert preprocessed.message_id == persisted.id
+        assert preprocessed.normalized_text is not None
+        assert preprocessed.normalized_text != ""
+        assert "삼성전자" in preprocessed.normalized_text
+
+        summary_jobs = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.message_id == persisted.id,
+                AnalysisJob.job_type == "SINGLE_MESSAGE_SUMMARY",
+            )
+            .all()
+        )
+        assert len(summary_jobs) == 1
+        assert summary_jobs[0].status == JobStatus.PENDING
+
+    # 5. inference 1회 실행
+    processed_inf = inference_worker.run_once()
+    assert processed_inf == 1
+
+    # 6. 최종 상태 확인
+    with db_session_factory() as session:
+        summary_job = get_job(session, persisted.id, "SINGLE_MESSAGE_SUMMARY")
+        assert summary_job.status == JobStatus.DONE
+        assert summary_job.started_at is not None
+        assert summary_job.finished_at is not None
+        assert summary_job.started_at <= summary_job.finished_at
+        assert summary_job.attempt_count == 1
+        assert summary_job.last_error in (None, "")
+
+        result = (
+            session.query(MessageSummary)
+            .filter(MessageSummary.message_id == persisted.id)
+            .one()
+        )
+        assert result.message_id == persisted.id
+        assert result.summary_text is not None
+        assert result.summary_text != ""
+        assert "[SUMMARY]" in result.summary_text
+
+        normalize_count = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.message_id == persisted.id,
+                AnalysisJob.job_type == "NORMALIZE",
+            )
+            .count()
+        )
+        summary_count = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.message_id == persisted.id,
+                AnalysisJob.job_type == "SINGLE_MESSAGE_SUMMARY",
+            )
+            .count()
+        )
+        preprocessed_count = (
+            session.query(PreprocessedMessage)
+            .filter(PreprocessedMessage.message_id == persisted.id)
+            .count()
+        )
+        summary_result_count = (
+            session.query(MessageSummary)
+            .filter(MessageSummary.message_id == persisted.id)
+            .count()
+        )
+
+        # 중복 생성 방지 확인
+        assert normalize_count == 1
+        assert summary_count == 1
+        assert preprocessed_count == 1
+        assert summary_result_count == 1
+
+
+def test_pipeline_inference_failure_sets_retry_pending(
+    db_session_factory,
+    message_service,
+    preprocess_worker,
+    failing_inference_worker,
+):
+    # 1. 원문 메시지 저장
+    persisted = message_service.persist_message(
+        channel_id=1,
+        telegram_message_id=1002,
+        text="현대차 대규모 투자 계획 발표",
+        sent_at=datetime(2026, 3, 22, 9, 10, 0),
+        raw_payload={
+            "id": 1002,
+            "text": "현대차 대규모 투자 계획 발표",
+        },
+    )
+
+    # 2. preprocess 는 정상 처리
+    processed_pre = preprocess_worker.run_once()
+    assert processed_pre == 1
+
+    # 3. inference 는 실패
+    processed_inf = failing_inference_worker.run_once()
+    assert processed_inf == 0
+
+    # 4. 실패 후 상태 검증
+    with db_session_factory() as session:
+        normalize_job = get_job(session, persisted.id, "NORMALIZE")
+        assert normalize_job.status == JobStatus.DONE
+
+        summary_job = get_job(session, persisted.id, "SINGLE_MESSAGE_SUMMARY")
+        assert summary_job.status == JobStatus.RETRY_PENDING
+        assert summary_job.started_at is not None
+        assert summary_job.finished_at is not None
+        assert summary_job.started_at <= summary_job.finished_at
+        assert summary_job.attempt_count == 1
+        assert summary_job.last_error is not None
+        assert "mock llm timeout" in summary_job.last_error
+
+        result_count = (
+            session.query(MessageSummary)
+            .filter(MessageSummary.message_id == persisted.id)
+            .count()
+        )
+        assert result_count == 0
+
+
+def test_persist_message_is_idempotent_for_same_channel_and_message_id(
+    db_session_factory,
+    message_service,
+):
+    # 같은 메시지를 두 번 저장해도 중복 row / 중복 NORMALIZE job 이 생기지 않아야 함
+    first = message_service.persist_message(
+        channel_id=1,
+        telegram_message_id=2001,
+        text="중복 저장 테스트 메시지",
+        sent_at=datetime(2026, 3, 22, 9, 20, 0),
+        raw_payload={"id": 2001, "text": "중복 저장 테스트 메시지"},
+    )
+
+    second = message_service.persist_message(
+        channel_id=1,
+        telegram_message_id=2001,
+        text="중복 저장 테스트 메시지",
+        sent_at=datetime(2026, 3, 22, 9, 20, 0),
+        raw_payload={"id": 2001, "text": "중복 저장 테스트 메시지"},
+    )
+
+    assert first.id == second.id
+
+    with db_session_factory() as session:
+        message_count = (
+            session.query(Message)
+            .filter(
+                Message.channel_id == 1,
+                Message.telegram_message_id == 2001,
+            )
+            .count()
+        )
+        normalize_job_count = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.message_id == first.id,
+                AnalysisJob.job_type == "NORMALIZE",
+            )
+            .count()
+        )
+
+        assert message_count == 1
+        assert normalize_job_count == 1
+
+
+def test_preprocess_run_once_returns_zero_when_no_job(preprocess_worker):
+    processed = preprocess_worker.run_once()
+    assert processed == 0
+
+
+def test_inference_run_once_returns_zero_when_no_job(inference_worker):
+    processed = inference_worker.run_once()
+    assert processed == 0
+```
+
+---
+
+# 4) 이 테스트 파일에서 가장 중요한 포인트
+
+위 파일은 단순히 “에러 없이 돈다”를 보는 게 아니라 아래를 강제로 고정합니다.
+
+## 1. `persist_message()` 책임
+
+* 메시지 저장
+* `NORMALIZE` job 생성
+* 중복 저장 방지
+
+## 2. `PreprocessWorker.run_once()` 책임
+
+* `NORMALIZE` job claim
+* `PreprocessedMessage` 저장
+* `NORMALIZE -> DONE`
+* `SINGLE_MESSAGE_SUMMARY` 생성
+
+## 3. `InferenceWorker.run_once()` 책임
+
+* summary job claim
+* `MessageSummary` 저장
+* summary job `DONE`
+* 실패 시 `RETRY_PENDING`
+
+즉, 지금 테스트는 **파이프라인 계약 자체**를 고정하는 용도입니다.
+
+---
+
+# 5) 현재 프로젝트에서 필드명이 다를 때 바꿔야 할 부분
+
+가장 흔한 치환 지점만 정리하면 이렇습니다.
+
+## `Message`
+
+지금 초안은 아래 필드를 가정했습니다.
+
+```python
+msg.channel_id
+msg.telegram_message_id
+msg.text
+```
+
+현재 프로젝트가 `external_message_id` 라면 이 부분만 바꾸면 됩니다.
+
+---
+
+## `PreprocessedMessage`
+
+지금 초안은 아래를 가정했습니다.
+
+```python
+preprocessed.message_id
+preprocessed.normalized_text
+```
+
+현재 프로젝트가 `cleaned_text`, `processed_text` 같은 이름이면 바꾸면 됩니다.
+
+---
+
+## `MessageSummary`
+
+지금 초안은 아래를 가정했습니다.
+
+```python
+result.message_id
+result.summary_text
+```
+
+현재 프로젝트가 `summary`, `output_text` 면 치환하면 됩니다.
+
+---
+
+## `AnalysisJob`
+
+지금 초안은 아래를 가정했습니다.
+
+```python
+job.message_id
+job.job_type
+job.status
+job.attempt_count
+job.last_error
+job.started_at
+job.finished_at
+```
+
+필드명이 다르면 그 부분만 바꾸면 됩니다.
+
+---
+
+# 6) 테스트 실행 후 가장 먼저 볼 실패 유형
+
+이 테스트를 처음 돌리면 보통 아래 네 가지 중 하나로 깨집니다.
+
+## 1. 테이블/컬럼 누락
+
+예:
+
+* `analysis_jobs.last_error` 없음
+* `heartbeat_at` 없음
+* `max_attempts` 없음
+
+이 경우 모델 + migration 먼저 맞춰야 합니다.
+
+---
+
+## 2. `MessageService.persist_message()` 가 job 생성 안 함
+
+이 경우 첫 테스트의 초반부에서 바로 깨집니다.
+
+```python
+assert len(normalize_jobs) == 1
+```
+
+---
+
+## 3. `PreprocessWorker.run_once()` 가 다음 job 생성 안 함
+
+이 경우 여기서 깨집니다.
+
+```python
+assert len(summary_jobs) == 1
+```
+
+---
+
+## 4. `InferenceWorker.run_once()` 실패 처리 상태가 다름
+
+현재 초안은 `RETRY_PENDING` 을 기대합니다.
+
+만약 현재 구현이 `FAILED` 를 쓰면 아래만 바꾸면 됩니다.
+
+```python
+assert summary_job.status in (JobStatus.FAILED, JobStatus.RETRY_PENDING)
+```
+
+다만 운영 구조상은 `RETRY_PENDING` 으로 곧바로 가는 편이 더 실용적입니다.
+
+---
+
+# 7) 초기에 더 안정적으로 쓰려면 넣으면 좋은 helper
+
+테스트가 늘어나면 아래 helper 하나 더 두면 편합니다.
+
+```python
+def count_jobs(session, message_id: int, job_type: str) -> int:
+    return (
+        session.query(AnalysisJob)
+        .filter(
+            AnalysisJob.message_id == message_id,
+            AnalysisJob.job_type == job_type,
+        )
+        .count()
+    )
+```
+
+이걸 두면 중복 생성 검증이 좀 더 읽기 쉬워집니다.
+
+---
+
+# 8) 바로 다음 테스트로 붙이기 좋은 것 2개
+
+이제 `test_pipeline_flow.py` 다음으로 가장 자연스러운 것은 아래 두 개입니다.
+
+## 1. retry 후 성공
+
+흐름:
+
+* 첫 inference 실패
+* scheduler 가 `RETRY_PENDING` 유지 또는 stuck 복구
+* 두 번째 inference 성공
+* 최종 `MessageSummary` 1건만 존재
+
+## 2. stuck RUNNING 복구
+
+흐름:
+
+* job 을 강제로 `RUNNING`, 오래된 `started_at` 으로 생성
+* `requeue_stuck_jobs()` 호출
+* `RETRY_PENDING` 또는 `DEAD` 전환 확인
+
+이 두 개가 붙으면 파이프라인 안정성 테스트가 거의 한 묶음으로 갖춰집니다.
+
+---
+
+# 9) 지금 단계에서 가장 자연스러운 다음 작업
+
+순서는 이렇게 가는 게 가장 좋습니다.
+
+1. 방금 드린 `test_pipeline_flow.py` 붙이기
+2. import / 필드명 치환
+3. 첫 실행에서 깨지는 모델 필드 보완
+4. happy path 통과
+5. failure path 통과
+6. 마지막으로 `scheduler_worker` 테스트 추가
+
+다음 답변에서는 이어서 바로
+**`tests/workers/test_scheduler_worker.py` 전체 초안**으로 정리해드리겠습니다.

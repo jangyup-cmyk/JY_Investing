@@ -1,0 +1,549 @@
+좋습니다. 이어서 **`tests/services/test_analysis_job_service.py` 전체 초안**을 드리겠습니다.
+
+이 파일은 `AnalysisJobService`의 핵심 책임인
+
+* idempotent enqueue
+* pending job claim
+* lease/heartbeat 갱신
+* done/fail 상태 전이
+* expired running job 재claim
+  을 검증하는 용도입니다.
+
+프로젝트에 이미 `conftest.py` 공용 DB fixture가 있으면 아래의 `engine/session_factory/async_session` fixture는 제거하고 공용 fixture로 대체하시면 됩니다.
+
+```python
+# tests/services/test_analysis_job_service.py
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import StaticPool
+
+# 실제 프로젝트 경로에 맞게 조정 필요
+from src.infra.db.base import Base
+from src.infra.db.models import (
+    AnalysisJob,
+    Channel,
+    JobStatus,
+    JobTargetType,
+    JobType,
+    Message,
+)
+from src.services.analysis_job_service import AnalysisJobService
+
+
+UTC = timezone.utc
+
+
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+
+
+# =========================
+# Test DB Fixtures
+# =========================
+
+@pytest_asyncio.fixture
+async def engine():
+    engine = create_async_engine(
+        "sqlite+aiosqlite://",
+        future=True,
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session_factory(engine):
+    return async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+        autocommit=False,
+    )
+
+
+@pytest_asyncio.fixture
+async def async_session(session_factory):
+    async with session_factory() as session:
+        yield session
+        await session.rollback()
+
+
+# =========================
+# Domain Fixtures
+# =========================
+
+@pytest_asyncio.fixture
+async def channel(async_session: AsyncSession) -> Channel:
+    item = Channel(
+        tg_channel_id=111111111,
+        title="서비스 테스트 채널",
+        username="service_test_channel",
+        is_collecting=True,
+        status="ACTIVE",
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+@pytest_asyncio.fixture
+async def message(async_session: AsyncSession, channel: Channel) -> Message:
+    item = Message(
+        channel_id=channel.id,
+        tg_message_id=777,
+        tg_date_utc=now_utc(),
+        message_text="테스트 메시지",
+        edit_date_utc=None,
+        raw_hash="dummyhash",
+        is_deleted=False,
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+# =========================
+# Helper Functions
+# =========================
+
+async def get_job(async_session: AsyncSession, job_id: int) -> AnalysisJob | None:
+    return await async_session.get(AnalysisJob, job_id)
+
+
+async def list_jobs(async_session: AsyncSession) -> list[AnalysisJob]:
+    result = await async_session.scalars(
+        select(AnalysisJob).order_by(AnalysisJob.id.asc())
+    )
+    return list(result)
+
+
+async def seed_job(
+    async_session: AsyncSession,
+    *,
+    job_type: JobType = JobType.NORMALIZE,
+    target_type: JobTargetType = JobTargetType.MESSAGE,
+    target_id: int = 1,
+    status: JobStatus = JobStatus.PENDING,
+    priority: int = 100,
+    attempt_count: int = 0,
+    max_attempts: int = 3,
+    scheduled_at: datetime | None = None,
+    lease_expires_at: datetime | None = None,
+    worker_name: str | None = None,
+    idempotency_key: str = "job-key-1",
+    payload_json: dict | None = None,
+) -> AnalysisJob:
+    job = AnalysisJob(
+        job_type=job_type,
+        target_type=target_type,
+        target_id=target_id,
+        status=status,
+        priority=priority,
+        attempt_count=attempt_count,
+        max_attempts=max_attempts,
+        scheduled_at=scheduled_at or now_utc(),
+        started_at=None,
+        finished_at=None,
+        worker_name=worker_name,
+        lease_expires_at=lease_expires_at,
+        last_heartbeat_at=None,
+        idempotency_key=idempotency_key,
+        payload_json=payload_json or {},
+    )
+    async_session.add(job)
+    await async_session.commit()
+    await async_session.refresh(job)
+    return job
+
+
+# =========================
+# Tests
+# =========================
+
+@pytest.mark.asyncio
+async def test_enqueue_job_creates_pending_job(
+    async_session: AsyncSession,
+    message: Message,
+):
+    job = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=f"normalize:message:{message.id}:version:1:cv1",
+        payload_json={"message_id": message.id, "version_id": 1},
+        priority=100,
+        max_attempts=3,
+    )
+    await async_session.commit()
+
+    stored = await get_job(async_session, job.id)
+
+    assert stored is not None
+    assert stored.status == JobStatus.PENDING
+    assert stored.job_type == JobType.NORMALIZE
+    assert stored.target_type == JobTargetType.MESSAGE
+    assert stored.target_id == message.id
+    assert stored.priority == 100
+    assert stored.attempt_count == 0
+    assert stored.max_attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_enqueue_job_is_idempotent(
+    async_session: AsyncSession,
+    message: Message,
+):
+    key = f"normalize:message:{message.id}:version:1:cv1"
+
+    job1 = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=key,
+        payload_json={"message_id": message.id, "version_id": 1},
+    )
+    await async_session.commit()
+
+    job2 = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=key,
+        payload_json={"message_id": message.id, "version_id": 1},
+    )
+    await async_session.commit()
+
+    jobs = await list_jobs(async_session)
+
+    assert len(jobs) == 1
+    assert job1.id == job2.id
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_claims_pending_job_by_priority(
+    async_session: AsyncSession,
+    message: Message,
+):
+    low_priority = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        priority=200,
+        idempotency_key="job-low",
+    )
+    high_priority = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        priority=10,
+        idempotency_key="job-high",
+    )
+
+    claimed = await AnalysisJobService.claim_next_job(
+        async_session,
+        worker_name="worker-a",
+        allowed_job_types=[JobType.NORMALIZE],
+        lease_seconds=120,
+    )
+
+    assert claimed is not None
+    assert claimed.id == high_priority.id
+
+    stored = await get_job(async_session, high_priority.id)
+    assert stored is not None
+    assert stored.status == JobStatus.RUNNING
+    assert stored.worker_name == "worker-a"
+    assert stored.attempt_count == 1
+    assert stored.started_at is not None
+    assert stored.lease_expires_at is not None
+
+    still_pending = await get_job(async_session, low_priority.id)
+    assert still_pending is not None
+    assert still_pending.status == JobStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_returns_none_when_no_eligible_job(
+    async_session: AsyncSession,
+):
+    claimed = await AnalysisJobService.claim_next_job(
+        async_session,
+        worker_name="worker-a",
+        allowed_job_types=[JobType.NORMALIZE],
+        lease_seconds=120,
+    )
+
+    assert claimed is None
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_skips_future_scheduled_job(
+    async_session: AsyncSession,
+    message: Message,
+):
+    future_job = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        scheduled_at=now_utc() + timedelta(minutes=5),
+        idempotency_key="job-future",
+    )
+
+    claimed = await AnalysisJobService.claim_next_job(
+        async_session,
+        worker_name="worker-a",
+        allowed_job_types=[JobType.NORMALIZE],
+        lease_seconds=120,
+    )
+
+    assert claimed is None
+
+    stored = await get_job(async_session, future_job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_filters_allowed_job_types(
+    async_session: AsyncSession,
+    message: Message,
+):
+    await seed_job(
+        async_session,
+        job_type=JobType.EXTRACT_FEATURES,
+        target_id=message.id,
+        priority=10,
+        idempotency_key="job-feature",
+    )
+    normalize_job = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        priority=50,
+        idempotency_key="job-normalize",
+    )
+
+    claimed = await AnalysisJobService.claim_next_job(
+        async_session,
+        worker_name="worker-a",
+        allowed_job_types=[JobType.NORMALIZE],
+        lease_seconds=120,
+    )
+
+    assert claimed is not None
+    assert claimed.id == normalize_job.id
+    assert claimed.job_type == JobType.NORMALIZE
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_reclaims_expired_running_job(
+    async_session: AsyncSession,
+    message: Message,
+):
+    job = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        status=JobStatus.RUNNING,
+        attempt_count=1,
+        lease_expires_at=now_utc() - timedelta(seconds=1),
+        worker_name="old-worker",
+        idempotency_key="job-expired-running",
+    )
+
+    claimed = await AnalysisJobService.claim_next_job(
+        async_session,
+        worker_name="new-worker",
+        allowed_job_types=[JobType.NORMALIZE],
+        lease_seconds=180,
+    )
+
+    assert claimed is not None
+    assert claimed.id == job.id
+
+    stored = await get_job(async_session, job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.RUNNING
+    assert stored.worker_name == "new-worker"
+    assert stored.attempt_count == 2
+    assert stored.lease_expires_at is not None
+    assert stored.lease_expires_at > now_utc()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_extends_lease(
+    async_session: AsyncSession,
+    message: Message,
+):
+    job = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        status=JobStatus.RUNNING,
+        attempt_count=1,
+        lease_expires_at=now_utc() + timedelta(seconds=5),
+        worker_name="worker-a",
+        idempotency_key="job-heartbeat",
+    )
+
+    before = job.lease_expires_at
+    assert before is not None
+
+    await AnalysisJobService.heartbeat(
+        async_session,
+        job_id=job.id,
+        lease_seconds=300,
+    )
+
+    stored = await get_job(async_session, job.id)
+    assert stored is not None
+    assert stored.last_heartbeat_at is not None
+    assert stored.lease_expires_at is not None
+    assert stored.lease_expires_at > before
+
+
+@pytest.mark.asyncio
+async def test_mark_done_sets_done_and_clears_error_fields(
+    async_session: AsyncSession,
+    message: Message,
+):
+    job = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        status=JobStatus.RUNNING,
+        attempt_count=1,
+        lease_expires_at=now_utc() + timedelta(seconds=60),
+        worker_name="worker-a",
+        idempotency_key="job-done",
+    )
+
+    job.error_code = "OLD_ERROR"
+    job.error_message = "old message"
+    await async_session.commit()
+
+    await AnalysisJobService.mark_done(
+        async_session,
+        job_id=job.id,
+    )
+
+    stored = await get_job(async_session, job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.DONE
+    assert stored.finished_at is not None
+    assert stored.lease_expires_at is None
+    assert stored.error_code is None
+    assert stored.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_mark_failed_requeues_when_attempts_remain(
+    async_session: AsyncSession,
+    message: Message,
+):
+    job = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        status=JobStatus.RUNNING,
+        attempt_count=1,
+        max_attempts=3,
+        lease_expires_at=now_utc() + timedelta(seconds=60),
+        worker_name="worker-a",
+        idempotency_key="job-failed-requeue",
+    )
+
+    await AnalysisJobService.mark_failed(
+        async_session,
+        job_id=job.id,
+        error_code="TEMP_ERROR",
+        error_message="temporary failure",
+        retry_delay_seconds=45,
+    )
+
+    stored = await get_job(async_session, job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.PENDING
+    assert stored.error_code == "TEMP_ERROR"
+    assert stored.error_message == "temporary failure"
+    assert stored.lease_expires_at is None
+    assert stored.finished_at is None
+    assert stored.scheduled_at > now_utc()
+
+
+@pytest.mark.asyncio
+async def test_mark_failed_dead_letters_when_attempts_exhausted(
+    async_session: AsyncSession,
+    message: Message,
+):
+    job = await seed_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_id=message.id,
+        status=JobStatus.RUNNING,
+        attempt_count=3,
+        max_attempts=3,
+        lease_expires_at=now_utc() + timedelta(seconds=60),
+        worker_name="worker-a",
+        idempotency_key="job-failed-dead-letter",
+    )
+
+    await AnalysisJobService.mark_failed(
+        async_session,
+        job_id=job.id,
+        error_code="PERM_ERROR",
+        error_message="permanent failure",
+        retry_delay_seconds=45,
+    )
+
+    stored = await get_job(async_session, job.id)
+    assert stored is not None
+    assert stored.status == JobStatus.DEAD_LETTER
+    assert stored.error_code == "PERM_ERROR"
+    assert stored.error_message == "permanent failure"
+    assert stored.lease_expires_at is None
+    assert stored.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_mark_failed_noop_when_job_missing(async_session: AsyncSession):
+    # 예외 없이 종료되는지만 확인
+    await AnalysisJobService.mark_failed(
+        async_session,
+        job_id=999999,
+        error_code="MISSING",
+        error_message="missing job",
+        retry_delay_seconds=10,
+    )
+
+    jobs = await list_jobs(async_session)
+    assert jobs == []
+```
+
+추가로 확인할 점이 하나 있습니다.
+제가 앞선 워커 초안에서 사용한 `AnalysisJobService.claim_next_job()`는 `updated_at`을 이용한 낙관적 claim 패턴이었기 때문에, 실제 모델에 `updated_at` mixin이 제대로 들어가 있어야 이 테스트와 런타임이 안정적으로 맞습니다. 모델에서 `created_at`, `updated_at`가 빠져 있거나 server default 동작이 다르면 그 부분만 맞춰주시면 됩니다.
+

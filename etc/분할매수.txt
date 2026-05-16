@@ -1,0 +1,131 @@
+이 '절반 시장가 + 절반 지정가' 분할 매수와 '10분 타임아웃' 전략은 리스크 통제와 수익 기회(물량 확보)를 동시에 잡는 매우 세련된 실전 트레이딩 기법입니다.
+
+특히, 시스템의 타당성과 안정성을 입증해야 하는 상황에서, 이러한 이원화된 주문 체계와 철저한 미체결 방어 로직은 시스템의 완성도를 증명하고 경영진을 설득하기 위한 최종 보고서의 핵심 근거 자료로 활용하기에 아주 훌륭한 포인트가 됩니다.
+
+요청하신 **[50% 시장가 진입 + 50% 포착가 지정가 진입 + 10분 뒤 미체결 자동 취소]** 프로세스를 시스템에 구현하기 위한 설계 구조와 핵심 코드를 제안합니다.
+
+---
+
+### 1. 주문 로직 설계: 분할 매수 (Split Order)
+
+하나의 계좌 예산(예: 100만 원)을 50%씩 나누어, 두 번의 독립적인 KIS API 주문을 거의 동시에 전송해야 합니다.
+
+```python
+# trader.py (분할 매수 및 예약 취소 로직)
+import math
+from datetime import datetime, timedelta
+import requests
+from scheduler import scheduler # 기존의 APScheduler 객체 호출
+
+def execute_split_buy(user, stock_code, current_price):
+    """50% 시장가 + 50% 지정가 분할 매수 주문"""
+    total_budget = user["budget"]
+    half_budget = total_budget / 2
+    
+    # 1. 50% 물량 계산
+    qty_market = math.floor(half_budget / current_price) 
+    qty_limit = math.floor(half_budget / current_price)
+    
+    if qty_market == 0 or qty_limit == 0: return None
+
+    # ---------------------------------------------------------
+    # 주문 1: 시장가 매수 (ORD_DVSN: "01", 즉시 체결 보장)
+    # ---------------------------------------------------------
+    market_payload = {
+        "CANO": user["account_no"][:8],
+        "ACNT_PRDT_CD": user["account_no"][8:],
+        "PDNO": stock_code,
+        "ORD_DVSN": "01",         # 01: 시장가
+        "ORD_QTY": str(qty_market),
+        "ORD_UNPR": "0"           # 시장가는 단가 0으로 세팅
+    }
+    # [API 호출: 시장가 매수 전송]
+    # res_market = requests.post(url, headers=headers, json=market_payload).json()
+    
+    # ---------------------------------------------------------
+    # 주문 2: 지정가 매수 (ORD_DVSN: "00", 포착 현재가 방어)
+    # ---------------------------------------------------------
+    limit_payload = {
+        "CANO": user["account_no"][:8],
+        "ACNT_PRDT_CD": user["account_no"][8:],
+        "PDNO": stock_code,
+        "ORD_DVSN": "00",         # 00: 지정가
+        "ORD_QTY": str(qty_limit),
+        "ORD_UNPR": str(current_price) # 포착 현재가
+    }
+    # [API 호출: 지정가 매수 전송]
+    # res_limit = requests.post(url, headers=headers, json=limit_payload).json()
+    
+    # KIS API 응답에서 지정가 주문의 '주문번호(ODNO)'를 반드시 추출해야 취소 가능
+    order_no = "API응답_주문번호_추출" # 예: res_limit["output"]["ODNO"]
+    
+    # ---------------------------------------------------------
+    # 10분 뒤 미체결 취소 스케줄 등록
+    # ---------------------------------------------------------
+    cancel_time = datetime.now() + timedelta(minutes=10)
+    scheduler.add_job(
+        check_and_cancel_order, 
+        trigger='date', 
+        run_date=cancel_time, 
+        args=[user, stock_code, order_no]
+    )
+
+    return {
+        "name": user["name"],
+        "account": user["account_no"],
+        "total_qty": qty_market + qty_limit,
+        "market_qty": qty_market,
+        "limit_qty": qty_limit
+    }
+
+```
+
+### 2. 미체결 대응: 10분 후 자동 취소 로직
+
+앞서 `execute_split_buy` 함수 마지막에 APScheduler를 활용하여 정확히 10분 뒤에 한 번만 실행되는(`trigger='date'`) 예약 작업을 걸어두었습니다. 10분 뒤 이 함수가 자동으로 실행되어 주문 상태를 확인하고, 덜 사졌다면 취소합니다.
+
+```python
+def check_and_cancel_order(user, stock_code, order_no):
+    """10분 뒤 미체결 내역이 있다면 주문 취소 전송"""
+    
+    # 1. KIS API '주문 체결 내역 조회'를 통해 해당 order_no의 상태 확인
+    # (미체결 수량이 0이면 전량 체결된 것이므로 무시, 남아있다면 취소 진행)
+    unfilled_qty = check_unfilled_qty(user, order_no) 
+    
+    if unfilled_qty > 0:
+        # 2. KIS API '주문 취소' 전송
+        cancel_payload = {
+            "CANO": user["account_no"][:8],
+            "ACNT_PRDT_CD": user["account_no"][8:],
+            "KRX_FWDG_ORD_ORGNO": "",    # 주문 시 반환받은 한국거래소 전송 주문 조직번호
+            "ORGN_ODNO": order_no,       # 원주문 번호
+            "ORD_DVSN": "00",
+            "RVSE_CNCL_DVSN_CD": "02",   # 02: 취소
+            "ORD_QTY": "0",              # 0을 넣으면 미체결 전량 취소
+            "ORD_UNPR": "0"
+        }
+        # [API 호출: 주문 취소 전송]
+        
+        # 3. 텔레그램 알림 발송 (관리자 또는 사용자)
+        import telegram_bot as bot
+        bot.send_message(f"⚠️ [주문취소 알림]\n{user['name']}님 계좌의 {stock_code} 지정가 매수 대기건이 10분 경과로 자동 취소되었습니다. (미체결 수량: {unfilled_qty}주)")
+
+```
+
+### 3. 변경된 텔레그램 시그널 포맷
+
+분할 매수 상황을 정확하게 알리기 위해 텔레그램 메시지 예시도 한 단계 발전시킬 필요가 있습니다.
+
+> ⭐️ **Ai 종목매수 시그널 [시장가+지정가 분할]**
+> ￣￣￣￣￣￣￣￣￣￣￣￣￣￣￣
+> 매수 종목명 : 드림시큐리티 (203650)
+> 매수 가격 : 3,940원 👉 4.93% (포착가)
+> 매수 금액 : 총 1,000,000원
+> **[체결 및 대기 상세]**
+> ✅ **1차 시장가 체결** : 500,000원 (126주)
+> ⏳ **2차 지정가 대기** : 500,000원 (126주) / *10분 후 미체결 시 취소*
+> 매수 계좌 : 전장엽님 73918950계좌, 김양선님 75045260계좌
+
+이러한 형태의 코드 베이스(비동기 멀티스레드 + APScheduler 지연 실행)가 갖춰지면, 종목 포착 순간 즉시 시장가로 물량을 확보하여 수익률 통계와 실제 체결률 간의 괴리를 막고, 나머지 절반은 포착가에 걸어두어 평균 단가를 낮추는 완벽한 시스템이 됩니다.
+
+추가로 KIS API 주문 전송 부분의 `Headers`나 `보안 해쉬(HashKey)` 생성 등 실제 증권사 API 통신에 필요한 세부 코드가 필요하시면 말씀해 주세요.

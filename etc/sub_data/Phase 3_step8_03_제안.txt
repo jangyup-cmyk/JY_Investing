@@ -1,0 +1,833 @@
+이 대화에는 아직 업로드된 코드 파일이 없습니다. 그래서 지금은 실제 판정을 넣을 근거가 없습니다.
+
+가장 바로 진행되는 방식은 아래 파일들만 붙이는 것입니다.
+
+* `src/models/message.py`
+* `src/models/message_version.py`
+* `src/models/analysis_job.py`
+* `src/services/analysis_job_service.py`
+* `persist_message()`가 들어있는 서비스 파일
+* `src/workers/preprocess_worker.py`
+* `src/workers/inference_worker.py`
+* `src/workers/scheduler_worker.py`
+* `src/run_worker.py`
+
+파일을 올리면 다음 답변에서 바로 아래 형식으로 채워드리겠습니다.
+
+| 파일                        | 항목             | 판정                 | 근거            | 패치 포인트  |
+| ------------------------- | -------------- | ------------------ | ------------- | ------- |
+| `analysis_job.py`         | lock/retry 필드  | 체크 완료 / 누락 / 수정 필요 | 실제 코드 기준 1~2줄 | 필요 시 제안 |
+| `analysis_job_service.py` | claim_next_job | 체크 완료 / 누락 / 수정 필요 | 실제 코드 기준 1~2줄 | 필요 시 제안 |
+| `preprocess_worker.py`    | run_once 구조    | 체크 완료 / 누락 / 수정 필요 | 실제 코드 기준 1~2줄 | 필요 시 제안 |
+
+한 번에 전부가 부담되면 **`analysis_job.py` → `analysis_job_service.py` → `persist_message()` 파일** 순서로 3개만 먼저 올리셔도 됩니다.
+
+
+업로드된 4개 파일 기준으로 실제 판정을 채우면, **핵심 뼈대는 들어왔지만 바로 실행하면 막힐 가능성이 높은 “수정 필요” 항목이 꽤 분명한 상태**입니다. 특히 `AnalysisJobService`와 두 워커 사이의 **실제 메서드 인터페이스 불일치**가 가장 큰 문제입니다.   
+
+## 1) analysis_job_service.py
+
+### 체크 완료
+
+* `claim_next_job()`이 있고, 반환용 `ClaimedJob`도 분리되어 있어 워커가 서비스 계층을 통해 job을 선점하는 구조는 잡혀 있습니다. 
+* `complete_job()`이 결과 저장 handler 실행 → 현재 job 성공 처리 → 후속 job 생성 순으로 묶여 있어, 의도 자체는 “원자적 완료 + 다음 단계 연결” 구조에 맞습니다. 
+* `mark_failed()` 안에 backoff 계산과 retry/dead 분기, `heartbeat()`, `recover_stuck_jobs()`가 있어 재시도/복구 책임도 서비스에 모으려는 방향은 적절합니다. 
+
+### 누락
+
+* 워커들이 호출하는 `fail_job(...)` 메서드는 이 서비스에 없습니다. 서비스에는 `mark_failed(...)`만 있는데 시그니처도 다릅니다. 현재 상태 그대로면 워커의 예외 처리 경로에서 `AttributeError` 또는 인터페이스 오류가 날 가능성이 높습니다.   
+
+### 수정 필요
+
+* `enqueue_job()`은 `async def`인데 내부에서 `self.job_repo.enqueue_job(...)`를 `await`하지 않고 그대로 반환합니다. 같은 파일의 다른 메서드들에서는 `await self.job_repo.enqueue_job(...)`를 쓰고 있어, 이 메서드만 비동기 호출 규약이 어긋나 있습니다. 
+* `create_job_if_not_exists()`는 `JobTargetType.MESSAGE.value`와 `self.default_max_attempts`를 사용하는데, 현재 파일에는 `JobTargetType` import가 없고 `default_max_attempts` 정의도 보이지 않습니다. 이 메서드는 지금 상태로는 바로 깨질 가능성이 큽니다. 
+* `complete_job()`의 후속 job 생성은 가능하지만, 여기서는 idempotency key나 명시적 중복 방지가 적용되지 않아 중복 enqueue 방어가 약합니다. 구조상 바로 치명상은 아니지만 실운영에선 수정이 필요합니다. 
+
+## 2) preprocess_worker.py
+
+### 체크 완료
+
+* `run_once()`가 분리되어 있고, 선점 트랜잭션을 짧게 끊은 뒤 실제 전처리/저장을 별도 트랜잭션에서 처리하는 방향은 좋습니다. 테스트 가능성과 커넥션 점유 측면에서 설계 의도에 맞습니다. 
+* `complete_job()`을 통해 “결과 저장 + 다음 단계 job 생성”으로 이어가려는 흐름도 맞습니다. 
+
+### 누락
+
+* 별도 `__init__`이 없어서 `self.session_factory`, `self.job_service`, `self.preprocess_service`가 어디서 주입되는지는 이 파일만으로는 확인되지 않습니다. 이건 누락이라기보다 **현재 업로드 범위상 미확인**입니다. 
+
+### 수정 필요
+
+* 실패 처리에서 `self.job_service.fail_job(...)`를 호출하는데, 서비스 쪽에는 그 메서드가 없습니다. 이 워커의 예외 경로는 현재 실제로 연결되지 않습니다.  
+* 가장 중요한 문제는 `next_payload={"preprocess_result_id": res_id}`입니다. Python에서는 함수 인자가 호출 시점에 먼저 평가되므로, 이 값은 `result_save_handler()` 실행 전의 `res_id=None`으로 들어갑니다. 주석의 설명과 달리, 현재 코드로는 다음 단계 job payload에 실제 `preprocess_result_id`가 실리지 않을 가능성이 매우 높습니다. 즉, preprocess → inference 연결이 끊길 수 있습니다.  
+
+## 3) inference_worker.py
+
+### 체크 완료
+
+* 이 워커는 원문을 다시 직접 처리하지 않고 `job.payload["preprocess_result_id"]`로 `NormalizedTelegramMessage`를 읽어 오도록 되어 있어, 전처리 산출물을 전제로 동작하는 구조는 맞습니다. 
+* LLM 호출을 트랜잭션 밖에서 수행하고, 결과 저장/완료는 다시 트랜잭션 안에서 처리해 DB 커넥션 점유를 줄이려는 흐름도 적절합니다. 
+
+### 누락
+
+* 이 파일 자체 기준으로는 큰 기능 누락보다, 앞단 payload 전달 실패 때문에 실질 입력이 비어버릴 위험이 더 큽니다. 즉, 누락보다 상위 단계 연동 문제가 더 본질적입니다.  
+
+### 수정 필요
+
+* 여기서도 실패 처리에 `self.job_service.fail_job(...)`를 호출하는데, 서비스와 인터페이스가 맞지 않습니다. 정상 경로가 아니라 실패 경로에서 즉시 문제를 일으킬 수 있습니다.  
+* `job_types`와 `_resolve_job_types()`가 정의돼 있지만 실제 `run_once()`는 항상 `JobType.SINGLE_MESSAGE_SUMMARY.value`만 claim합니다. 즉, 현재 구현은 “확장 가능한 멀티 job 워커”처럼 보이지만 실제 동작은 단일 타입 고정입니다. 구조상 정리 필요입니다. 
+
+## 4) scheduler_worker.py
+
+### 체크 완료
+
+* stuck job recovery 책임을 별도 워커로 분리한 방향은 맞습니다. `run_once()`와 `_recover_stuck_jobs()`로 역할도 단순하게 나뉘어 있습니다. 
+
+### 누락
+
+* `_recover_stuck_jobs()`가 복구 건수를 반환하지 않습니다. 이 때문에 `run_once()`의 `recovered > 0` 판단이 성립하지 않습니다. 이건 사실상 작은 누락이 아니라 실행 오류로 이어질 수 있는 구현 공백입니다. 
+
+### 수정 필요
+
+* `run_once()`는 `recovered = await self._recover_stuck_jobs()` 뒤에 `return recovered > 0`을 수행하지만, `_recover_stuck_jobs()`는 현재 `None`을 반환합니다. 그대로면 `None > 0` 비교에서 깨질 가능성이 큽니다. 
+* 생성자에서는 `session_factory`를 받는데 실제 내부에서는 `AsyncSessionLocal()`을 직접 열고 있습니다. 이렇게 되면 DI가 깨지고 테스트 대체도 어려워집니다. 스케줄러는 주입받은 `self.session_factory`를 써야 일관적입니다. 
+
+## 5) 이번 업로드 범위 기준 최종 판정
+
+정리하면 아래와 같습니다.
+
+* **체크 완료**
+
+  * `AnalysisJobService`에 claim/complete/retry/recover의 큰 뼈대 존재
+  * `PreprocessWorker.run_once()` / `InferenceWorker.run_once()` 분리
+  * inference가 preprocess 산출물 기반으로 동작하도록 설계
+  * scheduler를 별도 워커로 분리하려는 방향    
+
+* **누락**
+
+  * 워커가 호출하는 `fail_job()` 서비스 메서드
+  * scheduler 복구 건수 반환값    
+
+* **수정 필요**
+
+  * `enqueue_job()`의 `await` 누락 가능성
+  * `create_job_if_not_exists()`의 `JobTargetType` import 누락
+  * `create_job_if_not_exists()`의 `self.default_max_attempts` 미정의
+  * preprocess 후속 job payload가 `None`으로 들어갈 가능성
+  * inference의 `job_types` 확장 구조와 실제 claim 로직 불일치
+  * scheduler가 injected session_factory를 쓰지 않음    
+
+## 6) 지금 가장 먼저 고쳐야 하는 우선순위
+
+가장 급한 순서는 이렇습니다.
+
+1. **`AnalysisJobService`에 워커 호환 `fail_job(job_id, error, retryable)` 추가**
+2. **`PreprocessWorker`의 후속 job payload 전달 방식 수정**
+3. **`create_job_if_not_exists()`의 import/기본값 오류 수정**
+4. **`SchedulerWorker` 반환값과 session_factory 사용 수정**   
+
+이번 판정은 **업로드된 4개 파일 범위만 기준**입니다. `analysis_job.py`, `persist_message()`가 있는 서비스 파일, `run_worker.py`까지 오면 남은 표도 같은 방식으로 이어서 `체크 완료 / 누락 / 수정 필요`로 채워드릴 수 있습니다.
+
+좋습니다. 그러면 이전 판정은 이렇게 **수정**하는 게 맞습니다.
+
+이 3개는 **“수정 필요”가 아니라 “누락”** 입니다.
+즉, 현재 단계의 가장 자연스러운 다음 작업은 **`analysis_job.py` → `persist_message()` 서비스 파일 → `run_worker.py`를 새로 작성하는 것**입니다. 업로드된 워커/서비스 코드를 보면 이 3개가 실제로 전제되어 있습니다. `AnalysisJobService`는 `AnalysisJob`, `JobTargetType`, `JobStatus` 등을 참조하고 있고, 워커들은 `claim_next_job()/complete_job()`로 처리할 job이 이미 DB에 있어야 하며, 각 워커는 `session_factory`, `job_service`, `worker_name` 같은 의존성이 주입된 상태를 기대하고 있습니다.    
+
+## 1) 판정 업데이트
+
+| 파일                             | 판정     | 이유                                            |
+| ------------------------------ | ------ | --------------------------------------------- |
+| `analysis_job.py`              | **누락** | 서비스와 워커가 기대하는 Job 모델/Enum 계약의 기준점인데 파일 자체가 없음 |
+| `persist_message()`가 있는 서비스 파일 | **누락** | 수집 직후 메시지 저장 + `NORMALIZE` job 생성 시작점이 없음     |
+| `run_worker.py`                | **누락** | 워커 실행 진입점과 DI 조립부가 없어 실제 실행 연결이 안 됨           |
+
+---
+
+## 2) 왜 이 3개가 지금 꼭 필요한가
+
+### A. `analysis_job.py`
+
+현재 서비스/워커 코드가 기대하는 Job 계약은 꽤 분명합니다.
+
+* 서비스는 `job.id`, `job.job_type`, `job.payload_json`, `job.attempt_count`, `job.max_attempts`를 사용합니다.
+* `complete_job()`은 후속 job 생성 시 `job.target_type`, `job.target_id`, `job.telegram_message_id`, `job.message_version_id`, `job.priority`를 그대로 재사용합니다. 
+* stuck recovery는 `job.status`, `job.worker_name`, `job.lease_expires_at`를 전제로 합니다. 
+* `SchedulerWorker`도 `AnalysisJob`, `JobStatus`를 import하고 복구 서비스를 호출합니다. 
+
+즉, `analysis_job.py`는 그냥 모델 하나가 아니라 **서비스/워커 전체가 공유하는 계약 정의 파일**입니다.
+
+### B. `persist_message()` 서비스 파일
+
+현재 `PreprocessWorker`는 `JobType.NORMALIZE` 작업을 claim해서 처리하도록 되어 있습니다. 즉, 누군가 먼저 메시지를 저장하고 `NORMALIZE` job을 생성해야 파이프라인이 시작됩니다. 그런데 업로드된 범위에는 그 시작점이 없습니다. `AnalysisJobService`에는 `enqueue_job()`과 `create_job_if_not_exists()`가 있지만, 실제로 이것을 호출해서 수집 메시지 저장 뒤 normalize 작업을 만드는 서비스는 아직 없습니다. 
+
+### C. `run_worker.py`
+
+`PreprocessWorker`와 `InferenceWorker`, `SchedulerWorker`는 모두 주입형 구조를 기대하고 있습니다.
+
+* `PreprocessWorker`는 `self.session_factory`, `self.job_service`, `self.preprocess_service`, `self.worker_name`이 이미 세팅돼 있어야 동작합니다. 
+* `InferenceWorker`는 생성자에서 `session_factory`, `job_service`, `inference_service`, `worker_name`, `poll_interval`을 받습니다. 
+* `SchedulerWorker`도 `session_factory`, `scheduler_service`, `worker_name`, `poll_interval`을 받습니다. 
+
+즉, `run_worker.py`는 단순 실행 파일이 아니라 **실제 의존성 조립부(composition root)** 역할입니다.
+
+---
+
+## 3) 지금 가장 자연스러운 작성 순서
+
+순서는 아래가 가장 좋습니다.
+
+### 1순위: `analysis_job.py`
+
+이유:
+
+* 나머지 두 파일이 기대하는 모델/Enum/필드 계약이 먼저 확정돼야 합니다.
+* `AnalysisJobService` 안의 `JobTargetType.MESSAGE.value`, `JobStatus`, `attempt_count`, `max_attempts`, `lease_expires_at` 같은 필드 정의 기준을 여기서 맞춰야 합니다.
+
+### 2순위: `persist_message()` 서비스 파일
+
+이유:
+
+* 수집 → 저장 → `NORMALIZE` job 생성이라는 실제 파이프라인 시작점이 여기서 열립니다.
+* 이 파일이 있어야 `PreprocessWorker`가 실제로 먹을 작업이 생깁니다.
+
+### 3순위: `run_worker.py`
+
+이유:
+
+* 마지막에 실행 연결만 붙이면 되도록, 모델/서비스 계약을 먼저 고정하는 편이 안전합니다.
+* 워커 생성자 인자와 서비스 주입 방식을 여기서 통일할 수 있습니다.
+
+---
+
+## 4) 각 파일의 최소 필수 책임
+
+### `analysis_job.py` 최소 책임
+
+아래는 반드시 맞아야 합니다.
+
+* `AnalysisJob` ORM 모델
+* `JobStatus` enum
+* `JobType` enum
+* `JobTargetType` enum
+* 최소 필드
+
+  * `id`
+  * `job_type`
+  * `status`
+  * `target_type`
+  * `target_id`
+  * `telegram_message_id`
+  * `message_version_id`
+  * `payload_json`
+  * `priority`
+  * `attempt_count`
+  * `max_attempts`
+  * `worker_name`
+  * `lease_expires_at`
+  * `created_at`
+  * `updated_at`
+
+`mark_failed()/recover_stuck_jobs()/claim_next_job()` 흐름상 `last_error_code`, `last_error_message`, `completed_at`까지 있으면 더 좋습니다. 이는 현재 서비스가 오류 코드/메시지와 retry/dead 분기를 명시적으로 다루기 때문입니다. 
+
+### `persist_message()` 서비스 파일 최소 책임
+
+반드시 해야 할 일은 이 순서입니다.
+
+1. telegram raw message 저장 또는 기존 메시지 확인
+2. 원문/버전 저장
+3. 중복이면 조용히 종료 또는 기존 row 반환
+4. 신규면 `AnalysisJobService.create_job_if_not_exists(..., job_type=JobType.NORMALIZE.value)` 호출
+5. 커밋
+
+핵심은 **메시지 저장과 normalize job 생성을 같은 트랜잭션 경계 안에서 처리**하는 것입니다. 그래야 “메시지는 저장됐는데 job은 없음” 같은 반쪽 상태를 줄일 수 있습니다. `PreprocessWorker`는 `NORMALIZE` job을 바로 claim하기 때문입니다.
+
+### `run_worker.py` 최소 책임
+
+아래 정도면 충분합니다.
+
+* CLI 인자: `preprocess | inference | scheduler`
+* `session_factory = AsyncSessionLocal`
+* `job_service = AnalysisJobService()`
+* `preprocess_service = PreprocessService()`
+* `inference_service = InferenceService()`
+* `scheduler_service = SchedulerService()`
+* 선택한 worker 생성
+* `while True: await worker.run_once()` 또는 base worker의 `run_forever()` 호출
+
+다만 현재 업로드된 코드 기준으로는 `PreprocessWorker`에 `__init__`가 보이지 않으므로, `BaseWorker` 또는 외부 초기화 방식과 맞게 한 번 더 정렬이 필요합니다. 반면 `InferenceWorker`와 `SchedulerWorker`는 생성자 시그니처가 명확합니다. 
+
+---
+
+## 5) 지금 상태에서의 전체 판정 요약
+
+| 영역                                       | 상태        |
+| ---------------------------------------- | --------- |
+| Job 서비스 뼈대                               | **체크 완료** |
+| Preprocess / Inference / Scheduler 워커 골격 | **체크 완료** |
+| 워커-서비스 인터페이스 정합성                         | **수정 필요** |
+| `analysis_job.py`                        | **누락**    |
+| `persist_message()` 서비스                  | **누락**    |
+| `run_worker.py`                          | **누락**    |
+
+---
+
+## 6) 실전적으로 가장 좋은 다음 작업
+
+가장 좋은 다음 작업은 **이 3개 파일의 초안을 한 번에 쓰는 것**입니다.
+특히 `analysis_job.py`를 먼저 정하고, 그 계약에 맞춰 `persist_message()`와 `run_worker.py`를 붙이면 지금 올라온 워커 코드와 가장 자연스럽게 이어집니다.
+
+원하시면 다음 답변에서 바로:
+
+* `analysis_job.py` 초안
+* `persist_message()` 서비스 파일 초안
+* `run_worker.py` 초안
+
+이 3개를 **현재 업로드된 워커/서비스 코드와 맞물리도록** 한 번에 작성해드리겠습니다.
+
+좋습니다. 현재 업로드된 코드 계약에 맞춰 **3개 파일 초안**을 바로 드리겠습니다.
+
+이 초안은 현재 코드가 기대하는 흐름에 맞춰 잡았습니다.
+
+* `AnalysisJobService`는 `target_type`, `telegram_message_id`, `message_version_id`, `payload_json`, `attempt_count`, `max_attempts`, `lease_expires_at` 같은 필드를 가진 `AnalysisJob`을 전제로 하고 있습니다. 
+* `PreprocessWorker`는 `NORMALIZE` job을 처리한 뒤 `SINGLE_MESSAGE_SUMMARY` job을 생성하려고 하고, `InferenceWorker`는 그 payload 안의 `preprocess_result_id`를 읽습니다.
+* `SchedulerWorker`는 `recover_stuck_jobs()`를 호출하는 구조입니다. 
+
+아래 3개를 기준 초안으로 두고, 이후 실제 `TelegramMessage`, `MessageVersion`, `Base` 위치만 프로젝트에 맞게 미세조정하면 됩니다.
+
+---
+
+## 1) `src/infra/db/models/analysis_job.py`
+
+```python
+from __future__ import annotations
+
+from enum import Enum
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
+
+from src.infra.db.base import Base  # Base 위치가 다르면 이 줄만 조정
+
+
+UTC = timezone.utc
+
+
+class JobStatus(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    DEAD = "DEAD"
+
+
+class JobType(str, Enum):
+    NORMALIZE = "NORMALIZE"
+    SINGLE_MESSAGE_SUMMARY = "SINGLE_MESSAGE_SUMMARY"
+    WINDOW_THEME_ANALYSIS = "WINDOW_THEME_ANALYSIS"
+
+
+class JobTargetType(str, Enum):
+    MESSAGE = "MESSAGE"
+    MESSAGE_VERSION = "MESSAGE_VERSION"
+    WINDOW = "WINDOW"
+
+
+class AnalysisJob(Base):
+    __tablename__ = "analysis_jobs"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    job_type = Column(String(64), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default=JobStatus.PENDING.value, index=True)
+
+    target_type = Column(String(32), nullable=False, index=True)
+    target_id = Column(BigInteger, nullable=True, index=True)
+
+    telegram_message_id = Column(
+        BigInteger,
+        ForeignKey("telegram_messages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    message_version_id = Column(
+        BigInteger,
+        ForeignKey("message_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    priority = Column(Integer, nullable=False, default=100, index=True)
+    idempotency_key = Column(String(255), nullable=True, unique=True)
+
+    payload_json = Column(JSON, nullable=True)
+
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+
+    worker_name = Column(String(128), nullable=True, index=True)
+
+    leased_at = Column(DateTime(timezone=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    next_available_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    last_error_code = Column(String(128), nullable=True)
+    last_error_message = Column(Text, nullable=True)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_analysis_jobs_idempotency_key"),
+        Index(
+            "ix_analysis_jobs_claim",
+            "status",
+            "job_type",
+            "priority",
+            "next_available_at",
+            "lease_expires_at",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"AnalysisJob(id={self.id}, job_type={self.job_type}, "
+            f"status={self.status}, target_type={self.target_type}, "
+            f"target_id={self.target_id})"
+        )
+```
+
+---
+
+## 2) `src/services/message_ingest_service.py`
+
+`persist_message()`가 들어갈 서비스 파일 초안입니다.
+
+```python
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.infra.db.models import (
+    JobType,
+    TelegramMessage,
+    MessageVersion,
+)
+from src.services.analysis_job_service import AnalysisJobService
+
+
+@dataclass
+class PersistMessageResult:
+    telegram_message_id: int
+    message_version_id: int
+    created: bool
+    normalize_job_created: bool
+
+
+class MessageIngestService:
+    """
+    수집 직후 원문 메시지를 저장하고, 후속 NORMALIZE job 생성을 담당.
+    """
+
+    def __init__(
+        self,
+        job_service: AnalysisJobService | None = None,
+        default_max_attempts: int = 3,
+    ):
+        self.job_service = job_service or AnalysisJobService()
+        self.default_max_attempts = default_max_attempts
+
+    async def persist_message(
+        self,
+        session: AsyncSession,
+        *,
+        channel_id: int,
+        telegram_message_no: int,
+        raw_text: str | None,
+        published_at: datetime | None,
+        collected_at: datetime | None,
+        raw_payload: dict[str, Any] | None = None,
+        sender_id: int | None = None,
+        grouped_id: int | None = None,
+    ) -> PersistMessageResult:
+        """
+        내부 telegram_messages 1건 + message_versions 1건을 저장하고
+        NORMALIZE job 1건을 중복 없이 생성한다.
+
+        주의:
+        - TelegramMessage / MessageVersion의 실제 컬럼명이 다르면 아래 생성부만 맞춰주면 됨.
+        - 반드시 session.begin() 바깥/안쪽에서 호출 규칙을 프로젝트에 맞춰 사용.
+        """
+
+        text = raw_text or ""
+        text_hash = self._hash_text(text)
+
+        # 1) 기존 메시지 조회
+        existing = await session.scalar(
+            select(TelegramMessage).where(
+                TelegramMessage.channel_id == channel_id,
+                TelegramMessage.telegram_message_no == telegram_message_no,
+            )
+        )
+
+        if existing is not None:
+            version = await self._get_or_create_message_version(
+                session=session,
+                telegram_message=existing,
+                raw_text=text,
+                text_hash=text_hash,
+                raw_payload=raw_payload,
+            )
+
+            normalize_job_created = await self.job_service.create_job_if_not_exists(
+                session,
+                telegram_message_id=existing.id,
+                message_version_id=version.id,
+                job_type=JobType.NORMALIZE.value,
+                payload={"message_version_id": version.id},
+                priority=5,
+                max_attempts=self.default_max_attempts,
+            )
+
+            return PersistMessageResult(
+                telegram_message_id=existing.id,
+                message_version_id=version.id,
+                created=False,
+                normalize_job_created=normalize_job_created,
+            )
+
+        # 2) 신규 메시지 저장
+        message = TelegramMessage(
+            channel_id=channel_id,
+            telegram_message_no=telegram_message_no,
+            raw_text=text,
+            published_at=published_at,
+            collected_at=collected_at,
+            sender_id=sender_id,
+            grouped_id=grouped_id,
+        )
+        session.add(message)
+        await session.flush()  # message.id 확보
+
+        # 3) 원문 버전 저장
+        version = MessageVersion(
+            telegram_message_id=message.id,
+            version_no=1,
+            version_kind="RAW",
+            text=text,
+            text_hash=text_hash,
+            raw_payload_json=raw_payload,
+        )
+        session.add(version)
+        await session.flush()  # version.id 확보
+
+        # 4) NORMALIZE job 생성
+        normalize_job_created = await self.job_service.create_job_if_not_exists(
+            session,
+            telegram_message_id=message.id,
+            message_version_id=version.id,
+            job_type=JobType.NORMALIZE.value,
+            payload={"message_version_id": version.id},
+            priority=5,
+            max_attempts=self.default_max_attempts,
+        )
+
+        return PersistMessageResult(
+            telegram_message_id=message.id,
+            message_version_id=version.id,
+            created=True,
+            normalize_job_created=normalize_job_created,
+        )
+
+    async def _get_or_create_message_version(
+        self,
+        *,
+        session: AsyncSession,
+        telegram_message: TelegramMessage,
+        raw_text: str,
+        text_hash: str,
+        raw_payload: dict[str, Any] | None,
+    ) -> MessageVersion:
+        """
+        같은 원문 hash가 이미 있으면 재사용, 없으면 새 버전 생성.
+        """
+        existing_version = await session.scalar(
+            select(MessageVersion)
+            .where(MessageVersion.telegram_message_id == telegram_message.id)
+            .where(MessageVersion.text_hash == text_hash)
+            .order_by(MessageVersion.id.desc())
+        )
+        if existing_version is not None:
+            return existing_version
+
+        last_version_no = await session.scalar(
+            select(MessageVersion.version_no)
+            .where(MessageVersion.telegram_message_id == telegram_message.id)
+            .order_by(MessageVersion.version_no.desc())
+            .limit(1)
+        )
+        next_version_no = (last_version_no or 0) + 1
+
+        version = MessageVersion(
+            telegram_message_id=telegram_message.id,
+            version_no=next_version_no,
+            version_kind="RAW",
+            text=raw_text,
+            text_hash=text_hash,
+            raw_payload_json=raw_payload,
+        )
+        session.add(version)
+        await session.flush()
+        return version
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+```
+
+---
+
+## 3) `src/run_worker.py`
+
+```python
+from __future__ import annotations
+
+import argparse
+import asyncio
+
+from src.common.logger import logger
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+from src.services.worker_services import (
+    PreprocessService,
+    InferenceService,
+    SchedulerService,
+)
+from src.workers.preprocess_worker import PreprocessWorker
+from src.workers.inference_worker import InferenceWorker
+from src.workers.scheduler_worker import SchedulerWorker
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run background workers")
+    parser.add_argument(
+        "worker",
+        choices=["preprocess", "inference", "scheduler"],
+        help="worker type to run",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2.0,
+        help="sleep seconds when no job is processed",
+    )
+    parser.add_argument(
+        "--worker-name",
+        type=str,
+        default=None,
+        help="override worker name",
+    )
+    return parser
+
+
+def build_worker(args):
+    job_service = AnalysisJobService()
+
+    if args.worker == "preprocess":
+        worker = PreprocessWorker(
+            worker_name=args.worker_name or "preprocess-worker",
+            poll_interval=args.poll_interval,
+        )
+        # PreprocessWorker는 현재 __init__가 없으므로 속성 주입
+        worker.session_factory = AsyncSessionLocal
+        worker.job_service = job_service
+        worker.preprocess_service = PreprocessService()
+        return worker
+
+    if args.worker == "inference":
+        return InferenceWorker(
+            session_factory=AsyncSessionLocal,
+            job_service=job_service,
+            inference_service=InferenceService(),
+            worker_name=args.worker_name or "inference-worker",
+            poll_interval=args.poll_interval,
+        )
+
+    if args.worker == "scheduler":
+        return SchedulerWorker(
+            session_factory=AsyncSessionLocal,
+            scheduler_service=SchedulerService(),
+            worker_name=args.worker_name or "scheduler-worker",
+            poll_interval=args.poll_interval,
+        )
+
+    raise ValueError(f"Unsupported worker type: {args.worker}")
+
+
+async def run_loop(worker) -> None:
+    while True:
+        try:
+            handled = await worker.run_once()
+            if handled:
+                continue
+
+            await asyncio.sleep(worker.poll_interval)
+
+        except asyncio.CancelledError:
+            logger.info("[%s] cancelled", worker.worker_name)
+            raise
+        except Exception as e:
+            logger.exception("[%s] loop error: %s", worker.worker_name, e)
+            await asyncio.sleep(worker.poll_interval)
+
+
+async def async_main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    worker = build_worker(args)
+    logger.info("[%s] started", worker.worker_name)
+    await run_loop(worker)
+
+
+def main() -> None:
+    asyncio.run(async_main())
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 같이 해야 하는 필수 보정 4개
+
+이 3개 파일만 추가해도 뼈대는 맞지만, **현재 업로드된 기존 파일 4개에는 같이 고쳐야 실제로 이어지는 부분**이 있습니다.
+
+### 1) `analysis_job_service.py` import/기본값 보정
+
+현재 서비스는 `JobTargetType`를 쓰지만 import가 없고, `self.default_max_attempts`도 정의돼 있지 않습니다. 
+
+맨 위와 `__init__`를 이렇게 바꾸는 게 안전합니다.
+
+```python
+from src.infra.db.models import AnalysisJob, JobStatus, JobTargetType
+
+class AnalysisJobService:
+    def __init__(self, job_repo: AnalysisJobRepository | None = None, default_max_attempts: int = 3):
+        self.job_repo = job_repo or AnalysisJobRepository()
+        self.default_max_attempts = default_max_attempts
+```
+
+### 2) `analysis_job_service.py`에 `fail_job()` 추가
+
+워커 둘 다 `fail_job(job_id=..., error=..., retryable=...)`를 호출하는데, 실제 서비스에는 `mark_failed(job, error_code, error_message, ...)`만 있습니다. 현재 그대로면 실패 경로에서 깨집니다.
+
+추가용 초안:
+
+```python
+    async def fail_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_id: int,
+        error,
+        retryable: bool = True,
+    ) -> None:
+        job = await self.job_repo.get_by_id(session, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+
+        error_code = error.__class__.__name__ if isinstance(error, Exception) else "JOB_ERROR"
+        error_message = str(error)
+
+        await self.mark_failed(
+            session,
+            job=job,
+            error_code=error_code,
+            error_message=error_message,
+            retryable=retryable,
+        )
+```
+
+### 3) `preprocess_worker.py`의 `next_payload` 버그 수정
+
+현재 `next_payload={"preprocess_result_id": res_id}`는 호출 시점에 `res_id=None`으로 평가됩니다. 주석과 실제 동작이 다릅니다. 
+
+가장 간단한 수정은 `complete_job()`이 payload builder callable도 받게 바꾸거나, 아래처럼 워커에서 직접 다음 job을 생성하는 방식입니다.
+
+가장 적은 수정 버전:
+
+```python
+            payload_holder = {}
+
+            async with self.session_factory() as session:
+                async with session.begin():
+                    async def result_save_handler(s):
+                        res_id = await self.preprocess_service.run_normalize_job(s, job.job_id)
+                        payload_holder["preprocess_result_id"] = res_id
+
+                    await self.job_service.complete_job(
+                        session,
+                        job_id=job.job_id,
+                        result_handler=result_save_handler,
+                        next_job_type=JobType.SINGLE_MESSAGE_SUMMARY.value,
+                        next_payload=payload_holder,
+                    )
+```
+
+### 4) `scheduler_worker.py` 반환값/세션팩토리 수정
+
+현재 `_recover_stuck_jobs()`는 `None`을 반환하는데 `run_once()`는 `recovered > 0`을 비교합니다. 또 주입받은 `session_factory` 대신 `AsyncSessionLocal()`을 직접 열고 있습니다. 
+
+수정 초안:
+
+```python
+    async def _recover_stuck_jobs(self) -> int:
+        try:
+            async with self.session_factory() as session:
+                count = await self.service.recover_stuck_jobs(session)
+                if count > 0:
+                    await session.commit()
+                    print(f"[{self.worker_name}] Recovered {count} stuck jobs.")
+                return count
+        except Exception as e:
+            logger.error(f"[{self.worker_name}] Error during stuck job recovery: {e}")
+            return 0
+```
+
+---
+
+## 지금 가장 자연스러운 다음 작업
+
+다음 단계는 **이 3개 파일을 기준으로, 기존 4개 파일에 필요한 최소 보정까지 합친 “최종 붙여넣기 버전”**으로 정리하는 것입니다.
+원하시면 다음 답변에서 제가 **7개 파일 기준 최종 정리본**으로 한 번에 이어서 잡아드리겠습니다.
+
+

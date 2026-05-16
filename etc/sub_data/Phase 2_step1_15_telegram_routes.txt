@@ -1,0 +1,206 @@
+다음 작업은 **`test_repository.py`를 더 늘리는 것보다 `test_collector_worker.py`를 추가하는 것**이 맞습니다.
+
+이유는 명확합니다.
+
+현재 업로드된 `test_repository.py`는 아직
+
+* 신규 저장/중복 `unchanged`
+* 편집/삭제 반영
+* checkpoint 역행 방지
+  까지만 검증하고 있고, **“예외 raise 계약”**과 **“worker가 rollback + checkpoint 미갱신을 지키는지”**는 전혀 잠그지 못하고 있습니다. 
+
+반면 현재 `repository.py`는
+
+* 일반 예외를 `raise`
+* insert 시 `IntegrityError`만 `unchanged`로 정규화
+* 기존 메시지에 대해 `reply_to_message_id`, `sender_id`, `grouped_id`, `views`, `forwards`, `collected_at` 보강
+  구조로 바뀌어 있어서, repository 단독 계약은 예전보다 분명해졌습니다. 
+
+그리고 실제 rollback 책임은 repository가 아니라 worker 쪽에 있습니다.
+`persist_message_payload()`는 `upsert_telegram_message()` 성공 시 checkpoint를 올리고, `_handle_new_message()`는 예외가 나면 `rollback()`을 수행합니다. 
+
+즉 지금 가장 비어 있는 퍼즐은:
+
+**“repository가 예외를 raise했을 때 worker가 정말 rollback하고 checkpoint를 건드리지 않는가”**
+
+입니다.
+
+---
+
+# 지금 바로 추가할 다음 테스트 파일
+
+파일명:
+`tests/test_collector_worker.py`
+
+아래 2개 테스트를 먼저 넣는 게 가장 좋습니다.
+
+## 1) repository 예외 발생 시 checkpoint 미갱신
+
+이게 제일 중요합니다.
+
+```python
+import pytest
+import pytest_asyncio
+from datetime import datetime, timezone
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+from src.infra.db.models import Base, TelegramChannel, TelegramChannelCollectionState
+from src.infra.telegram.schemas import TelegramMessagePayload
+from src.workers.collector_worker import persist_message_payload
+
+
+@pytest_asyncio.fixture
+async def db_session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with Session() as session:
+        ch = TelegramChannel(
+            telegram_account_id=1,
+            tg_channel_id="1001",
+            title="Test Channel",
+            username="test",
+            channel_type="CHANNEL",
+            status="SYNCED",
+            is_collecting=True,
+            last_synced_at=datetime.now(timezone.utc),
+        )
+        session.add(ch)
+        await session.commit()
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_does_not_advance_checkpoint_when_upsert_raises(
+    db_session, monkeypatch
+):
+    payload = TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=999,
+        sender_id=None,
+        message_text_raw="Should Fail",
+        reply_to_message_id=None,
+        views=None,
+        forwards=None,
+        grouped_id=None,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=datetime.now(timezone.utc),
+        collected_at=datetime.now(timezone.utc),
+        raw_payload_json={"text": "Should Fail"},
+    )
+
+    async def broken_upsert(db, payload):
+        raise RuntimeError("forced failure from repository")
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        broken_upsert,
+    )
+
+    with pytest.raises(RuntimeError, match="forced failure from repository"):
+        await persist_message_payload(db_session, payload)
+
+    state_rows = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalars().all()
+
+    assert state_rows == []
+```
+
+---
+
+## 2) unchanged여도 checkpoint는 올라감
+
+현재 worker 설계가 그 정책을 따르고 있으므로, 이 규약도 명시적으로 잠그는 편이 좋습니다.
+지금 `persist_message_payload()`는 `created`, `updated`, `unchanged` 모두 checkpoint 후보가 있으면 `update_channel_checkpoint()`를 호출합니다. 
+
+```python
+import pytest
+import pytest_asyncio
+from datetime import datetime, timezone
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+from src.infra.db.models import Base, TelegramChannel, TelegramChannelCollectionState
+from src.infra.telegram.schemas import TelegramMessagePayload
+from src.workers.collector_worker import persist_message_payload
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_advances_checkpoint_on_unchanged(
+    db_session, monkeypatch
+):
+    payload = TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=123,
+        sender_id=None,
+        message_text_raw="Same Message",
+        reply_to_message_id=None,
+        views=None,
+        forwards=None,
+        grouped_id=None,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=datetime.now(timezone.utc),
+        collected_at=datetime.now(timezone.utc),
+        raw_payload_json={"text": "Same Message"},
+    )
+
+    class DummyResult:
+        action = "unchanged"
+        checkpoint_candidate = 123
+
+    async def fake_upsert(db, payload):
+        return DummyResult()
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        fake_upsert,
+    )
+
+    await persist_message_payload(db_session, payload)
+    await db_session.commit()
+
+    state = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalar_one()
+
+    assert state.last_collected_message_id == 123
+```
+
+---
+
+# 왜 이게 지금 최우선인가
+
+현재 repository 계약은 이미 꽤 정리됐습니다.
+
+* 일반 예외는 raise
+* `IntegrityError`는 unchanged 처리
+* 메타데이터 보강도 반영
+  이건 repository 코드에 이미 들어가 있습니다. 
+
+반대로 아직 자동 검증이 없는 건 worker 쪽입니다.
+
+* checkpoint를 언제 올릴지
+* 예외가 나면 어디서 rollback할지
+* repository와 worker 책임 분리가 실제로 지켜지는지
+  이건 아직 테스트로 잠겨 있지 않습니다. 그런데 실제 저장 무결성은 여기서 무너질 가능성이 큽니다. 
+
+---
+
+# 지금 순서 정리
+
+1. `tests/test_collector_worker.py` 추가
+2. 그 다음 `test_repository.py`를 새 계약에 맞게 확장
+3. 마지막으로 `test_telegram_routes.py`에서 `/sync`의 DB side effect와 404 케이스 보강
+
+지금 단계에서 가장 가치가 큰 건 **1번**입니다.
+

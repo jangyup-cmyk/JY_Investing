@@ -1,0 +1,375 @@
+test_repository.py에 추가할 구체 테스트 코드 3개
+
+두 번째 테스트와 세 번째 테스트는 **“원하는 규약을 잠그는 테스트”** 성격이 강해서, 현재 `repository.py` 구현 상태에 따라 바로 통과하지 않을 수 있습니다. 그게 오히려 좋습니다. 지금부터는 “작동 확인”보다 “깨지면 바로 알림”이 더 중요합니다.
+
+```python
+@pytest.mark.asyncio
+async def test_upsert_persists_updated_fields_in_db(db_session):
+    posted = datetime.now(timezone.utc)
+
+    payload = TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=30,
+        sender_id=111,
+        message_text_raw="Alpha",
+        reply_to_message_id=None,
+        views=10,
+        forwards=1,
+        grouped_id=None,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=posted,
+        collected_at=posted,
+        raw_payload_json='{"text":"Alpha"}',
+    )
+
+    result1 = await upsert_telegram_message(db_session, payload)
+    assert result1.action == "created"
+    await db_session.commit()
+
+    # 편집 + 메타데이터 변경 + 삭제 플래그 반영
+    payload.message_text_raw = "Beta"
+    payload.edited_at = posted + timedelta(minutes=5)
+    payload.views = 77
+    payload.forwards = 9
+    payload.is_deleted = True
+    payload.raw_payload_json = '{"text":"Beta","deleted":true}'
+
+    result2 = await upsert_telegram_message(db_session, payload)
+    assert result2.action == "updated"
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(
+            select(TelegramMessage).where(
+                TelegramMessage.telegram_channel_id == 1,
+                TelegramMessage.tg_message_id == 30,
+            )
+        )
+    ).scalar_one()
+
+    assert saved.message_text_raw == "Beta"
+    assert saved.edited_at == payload.edited_at
+    assert saved.views == 77
+    assert saved.forwards == 9
+    assert saved.is_deleted is True
+    assert saved.raw_payload_json == '{"text":"Beta","deleted":true}'
+```
+
+```python
+@pytest.mark.asyncio
+async def test_upsert_updates_missing_metadata_when_later_payload_has_values(db_session):
+    posted = datetime.now(timezone.utc)
+
+    # 최초 저장: 메타데이터가 비어 있는 메시지
+    first_payload = TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=40,
+        sender_id=None,
+        message_text_raw="Message",
+        reply_to_message_id=None,
+        views=None,
+        forwards=None,
+        grouped_id=None,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=posted,
+        collected_at=posted,
+        raw_payload_json='{"text":"Message"}',
+    )
+
+    result1 = await upsert_telegram_message(db_session, first_payload)
+    assert result1.action == "created"
+    await db_session.commit()
+
+    # 나중에 같은 메시지를 더 풍부한 메타데이터와 함께 다시 수집한 경우
+    enriched_payload = TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=40,
+        sender_id=999,
+        message_text_raw="Message",
+        reply_to_message_id=55,
+        views=321,
+        forwards=12,
+        grouped_id=777,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=posted,
+        collected_at=posted + timedelta(seconds=10),
+        raw_payload_json='{"text":"Message","sender_id":999,"reply_to":55}',
+    )
+
+    result2 = await upsert_telegram_message(db_session, enriched_payload)
+
+    # 원하는 규약:
+    # - 본문 편집이 없어도 메타데이터가 더 좋아졌다면 updated 여야 함
+    assert result2.action == "updated"
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(
+            select(TelegramMessage).where(
+                TelegramMessage.telegram_channel_id == 1,
+                TelegramMessage.tg_message_id == 40,
+            )
+        )
+    ).scalar_one()
+
+    assert saved.sender_id == 999
+    assert saved.reply_to_message_id == 55
+    assert saved.views == 321
+    assert saved.forwards == 12
+    assert saved.grouped_id == 777
+    assert saved.raw_payload_json == '{"text":"Message","sender_id":999,"reply_to":55}'
+```
+
+```python
+@pytest.mark.asyncio
+async def test_failed_upsert_does_not_advance_checkpoint(db_session, monkeypatch):
+    # 먼저 체크포인트를 100으로 고정
+    await update_channel_checkpoint(db_session, channel_id=1, message_id=100)
+    await db_session.commit()
+
+    before_state = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalar_one()
+    assert before_state.last_collected_message_id == 100
+
+    payload = TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=999,
+        sender_id=None,
+        message_text_raw="Should Fail",
+        reply_to_message_id=None,
+        views=None,
+        forwards=None,
+        grouped_id=None,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=datetime.now(timezone.utc),
+        collected_at=datetime.now(timezone.utc),
+        raw_payload_json='{"text":"Should Fail"}',
+    )
+
+    original_execute = db_session.execute
+
+    async def broken_execute(*args, **kwargs):
+        raise RuntimeError("forced db failure")
+
+    monkeypatch.setattr(db_session, "execute", broken_execute)
+
+    result = await upsert_telegram_message(db_session, payload)
+    assert result.action == "failed"
+
+    # 조회를 위해 execute 복구
+    monkeypatch.setattr(db_session, "execute", original_execute)
+
+    after_state = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalar_one()
+
+    # 실패한 upsert는 체크포인트를 절대 전진시키면 안 됨
+    assert after_state.last_collected_message_id == 100
+```
+
+추가로 같이 권장하는 작은 정리는 이것입니다.
+
+```python
+# 기존 파일 상단 import에 이것이 이미 있으면 그대로 두면 됩니다.
+from sqlalchemy import select
+from datetime import datetime, timezone, timedelta
+```
+
+핵심 의미를 다시 정리하면:
+
+* 첫 번째 테스트는 **결과값뿐 아니라 실제 DB row가 바뀌었는지** 검증
+* 두 번째 테스트는 **메타데이터 보강 규약**을 잠금
+* 세 번째 테스트는 **실패 시 checkpoint 불변**을 잠금
+
+다음에는 제가 이 3개 테스트 기준으로 **`repository.py`에서 어느 부분이 바로 실패할 가능성이 높은지**까지 함께 짚어드리겠습니다.
+
+네. 지금 추가한 3개 테스트 기준으로 보면, `repository.py`에서 **가장 먼저 실패할 가능성이 높은 건 2번 테스트**입니다. 반대로 **1번은 통과 가능성이 높고**, **3번은 단독 repository 테스트로는 통과할 가능성이 높습니다.** 근거는 아래와 같습니다.
+
+**1) `test_upsert_persists_updated_fields_in_db`**
+이 테스트는 현재 구현으로 **대체로 통과할 가능성이 높습니다.** 이유는 update 경로에서 `payload.edited_at`이 기존보다 최신이면 `message_text_raw`, `edited_at`, `raw_payload_json`를 갱신하고, 별도로 `is_deleted`, `views`, `forwards`도 차이가 있으면 갱신하도록 되어 있기 때문입니다. 그래서 본문 수정 + 삭제 플래그 + 조회수/전달수 변경을 한 번에 검증하는 형태는 현재 코드와 잘 맞습니다.
+
+다만 이 테스트가 통과하더라도, 그건 **현재 업데이트 대상 필드가 맞아떨어졌기 때문**이지 update 규약 전체가 완성됐다는 뜻은 아닙니다. 지금 코드는 `sender_id`, `grouped_id`, `reply_to_message_id` 같은 메타데이터는 기존 메시지에 대해 보강 업데이트하지 않습니다.
+
+**2) `test_upsert_updates_missing_metadata_when_later_payload_has_values`**
+이 테스트는 **지금 구현으로는 실패할 가능성이 가장 높습니다.** 현재 기존 메시지 update 로직은 사실상 `edited_at`이 더 최신일 때 본문/edited/raw_payload_json을 바꾸고, 별도로 `is_deleted`, `views`, `forwards`만 갱신합니다. 반면 `sender_id`, `reply_to_message_id`, `grouped_id`는 기존 메시지에서 later enrichment가 들어와도 업데이트하는 코드가 없습니다. 그래서 최초 저장이 `None`이고 두 번째 저장에서 값이 들어와도 `updated`가 아니라 `unchanged`가 나오거나, DB row가 기대대로 채워지지 않을 가능성이 큽니다.
+
+즉 이 테스트는 사실상 **현재 저장 규약의 빈 구멍을 정확히 찌르는 테스트**입니다. 이게 깨지면 repository를 고쳐야 하고, 그 방향은 맞습니다.
+
+**3) `test_failed_upsert_does_not_advance_checkpoint`**
+이 테스트는 **repository 단독 테스트로는 통과할 가능성이 높습니다.** 이유는 `upsert_telegram_message()`가 예외를 잡으면 `action="failed"`를 반환하고, 이 함수 자체는 체크포인트를 갱신하지 않기 때문입니다. 체크포인트 갱신은 별도 `update_channel_checkpoint()` 함수이고, worker 쪽에서도 `created / updated / unchanged`일 때만 checkpoint를 올리도록 되어 있어서 `failed`면 전진시키지 않습니다.
+
+다만 이 테스트가 통과하더라도, **설계상 약점은 남아 있습니다.** `repository.py` 안의 `except` 블록은 실패 시 `failed`를 반환하지만 `rollback`은 하지 않습니다. 현재는 worker가 바깥에서 rollback을 하도록 돼 있어서 전체 흐름에서는 어느 정도 방어되지만, repository 단독 사용 경로에서는 세션 정리가 모호할 수 있습니다. 그래서 “checkpoint는 안 올라간다”는 점은 잠기더라도, “실패 후 세션 상태가 항상 안전하다”까지 보장되는 건 아닙니다.
+
+정리하면 이렇습니다.
+
+* **1번 테스트**: 현재 코드로 통과 가능성 높음.
+* **2번 테스트**: 현재 코드로 실패 가능성 높음. 이게 가장 중요한 보완 포인트임.
+* **3번 테스트**: 단독 repository 기준으로는 통과 가능성 높음. 다만 rollback 책임은 여전히 정리 필요.
+
+다음으로는 바로 **2번 테스트를 통과시키기 위해 `repository.py`의 update 블록을 어떻게 바꿔야 하는지** 코드 형태로 드리는 게 가장 자연스럽습니다.
+
+
+좋습니다.
+`2번 테스트`를 통과시키려면 `repository.py`의 기존 메시지 update 블록을 **“본문 수정”과 “메타데이터 보강”으로 분리**해야 합니다.
+
+현재 구현은 기존 메시지일 때 `edited_at`이 더 최신인 경우에만 본문과 `raw_payload_json`을 갱신하고, 별도로 `is_deleted`, `views`, `forwards`만 갱신합니다. 그래서 `sender_id`, `reply_to_message_id`, `grouped_id` 같은 필드는 나중에 더 좋은 값이 들어와도 반영되지 않을 수 있습니다.
+
+아래처럼 바꾸면 됩니다.
+
+---
+
+## 1) 파일 상단에 넣을 헬퍼
+
+```python
+from datetime import datetime, timezone
+
+def _normalize_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+```
+
+현재 코드가 `replace(tzinfo=timezone.utc)`를 직접 쓰고 있는데, 이 방식은 aware datetime에도 그대로 덮어쓸 수 있어서 헬퍼로 정리하는 편이 더 안전합니다. 
+
+---
+
+## 2) `if msg:` 블록 전체 교체안
+
+`upsert_telegram_message()` 안의 기존 `if msg:` 블록을 아래로 교체하면 됩니다.
+
+```python
+if msg:
+    is_updated = False
+
+    msg_edited_at = _normalize_utc(msg.edited_at)
+    payload_edited_at = _normalize_utc(payload.edited_at)
+
+    # 1. 본문/편집 기반 갱신
+    if payload_edited_at and (not msg_edited_at or msg_edited_at < payload_edited_at):
+        if msg.message_text_raw != payload.message_text_raw:
+            msg.message_text_raw = payload.message_text_raw
+            is_updated = True
+
+        msg.edited_at = payload.edited_at
+
+        if msg.raw_payload_json != payload.raw_payload_json:
+            msg.raw_payload_json = payload.raw_payload_json
+            is_updated = True
+
+        # edited_at 값 자체가 바뀌었으면 update로 간주
+        if msg_edited_at != payload_edited_at:
+            is_updated = True
+
+    # 2. 메타데이터 보강(null -> 값, 값 차이 갱신)
+    if payload.sender_id is not None and msg.sender_id != payload.sender_id:
+        msg.sender_id = payload.sender_id
+        is_updated = True
+
+    if payload.reply_to_message_id is not None and msg.reply_to_message_id != payload.reply_to_message_id:
+        msg.reply_to_message_id = payload.reply_to_message_id
+        is_updated = True
+
+    if payload.grouped_id is not None and msg.grouped_id != payload.grouped_id:
+        msg.grouped_id = payload.grouped_id
+        is_updated = True
+
+    if payload.views is not None and msg.views != payload.views:
+        msg.views = payload.views
+        is_updated = True
+
+    if payload.forwards is not None and msg.forwards != payload.forwards:
+        msg.forwards = payload.forwards
+        is_updated = True
+
+    # posted_at은 원본 시각이므로 기존에 없을 때만 보강
+    if payload.posted_at is not None and msg.posted_at is None:
+        msg.posted_at = payload.posted_at
+        is_updated = True
+
+    # collected_at은 더 최신 수집 시각이면 갱신
+    if payload.collected_at is not None:
+        msg_collected_at = _normalize_utc(msg.collected_at)
+        payload_collected_at = _normalize_utc(payload.collected_at)
+        if msg_collected_at is None or (
+            payload_collected_at is not None and payload_collected_at > msg_collected_at
+        ):
+            msg.collected_at = payload.collected_at
+            is_updated = True
+
+    # raw payload는 edited message가 아니어도 더 풍부한 정보가 오면 갱신 가능
+    if payload.raw_payload_json is not None and msg.raw_payload_json != payload.raw_payload_json:
+        msg.raw_payload_json = payload.raw_payload_json
+        is_updated = True
+
+    if payload.is_deleted and not msg.is_deleted:
+        msg.is_deleted = True
+        is_updated = True
+
+    return UpsertResult(
+        action="updated" if is_updated else "unchanged",
+        telegram_channel_id=payload.telegram_channel_id,
+        tg_message_id=payload.tg_message_id,
+        checkpoint_candidate=payload.tg_message_id
+    )
+```
+
+---
+
+## 3) 이 수정으로 바로 해결되는 것
+
+이렇게 바꾸면 다음이 해결됩니다.
+
+* **본문 편집**은 기존처럼 계속 반영
+* **sender_id / reply_to_message_id / grouped_id** 같은 메타데이터도 나중에 보강 가능
+* **views / forwards**는 계속 차이값 갱신
+* **raw_payload_json**도 더 좋은 값이 오면 반영
+* 결과가 `unchanged`가 아니라 **`updated`**로 바뀌어야 할 케이스를 제대로 잡음
+
+즉, 현재 코드가 놓치고 있는 “later enrichment” 문제를 메웁니다. 지금 구현은 `sender_id`, `reply_to_message_id`, `grouped_id`를 신규 insert 때는 저장하지만, 기존 메시지 update 경로에서는 갱신하지 않습니다.
+
+---
+
+## 4) 같이 권하는 아주 작은 보강
+
+현재 `except Exception as e:`에서는 `failed`를 반환만 하고 있습니다.
+지금 구조상 트랜잭션 rollback은 worker 쪽에서 하고 있으니, repository에서 예외를 삼키는 구조를 유지할 거라면 로그를 조금 더 구체적으로 바꾸는 편이 좋습니다.
+
+```python
+except Exception as e:
+    logger.error(
+        f"upsert_message 실패 channel_id={payload.telegram_channel_id} "
+        f"tg_message_id={payload.tg_message_id} error={e}"
+    )
+    return UpsertResult(
+        action="failed",
+        telegram_channel_id=payload.telegram_channel_id,
+        tg_message_id=payload.tg_message_id,
+        error_message=str(e)
+    )
+```
+
+---
+
+## 5) 반영 후 기대 결과
+
+이 수정 후에는 방금 추가한 3개 테스트 중에서:
+
+* **1번**: 통과 가능성 높음
+* **2번**: 이 수정이 핵심
+* **3번**: 기존처럼 통과 가능성 높음
+
+이 흐름으로 갈 가능성이 큽니다. 현재 worker는 `failed`가 아닌 경우에만 checkpoint를 갱신하도록 되어 있어서, repository가 `failed`를 반환하면 checkpoint가 전진하지 않는 구조와도 잘 맞습니다.
+
+반영 후에는 아래 순서로 확인하면 됩니다.
+
+```bash
+pytest tests/test_repository.py -q
+```
+

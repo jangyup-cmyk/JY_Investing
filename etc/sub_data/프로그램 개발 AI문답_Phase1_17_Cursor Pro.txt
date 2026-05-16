@@ -1,0 +1,448 @@
+----------------------------------------------------------------------------------------------------------------------------------
+[사용자 요청사항_17]
+다음 단계로는 **Cursor에 바로 넣을 수 있게 “파일 생성 순서별 프롬프트 묶음”**을 만드는 것이 가장 실용적입니다.
+----------------------------------------------------------------------------------------------------------------------------------
+
+좋습니다.
+아래에 **Cursor에 바로 넣을 수 있는 파일 생성 순서별 프롬프트 묶음**을 정리하겠습니다.
+
+목표는 한 번에 너무 크게 시키지 않고, **실패 가능성을 낮추면서 단계별로 Phase 1을 완성**하는 것입니다.
+
+---
+
+# 1단계: 루트 + 설정 + 공통 모듈
+
+이 단계 목표는:
+
+* `requirements.txt`
+* `.env.example`
+* `config/settings.py`
+* `src/common/*`
+
+까지 먼저 만드는 것입니다.
+
+## Cursor 프롬프트 1
+
+```text
+D:\telegram_trading 프로젝트의 Phase 1 작업을 진행한다.
+
+지금은 1단계만 구현한다.
+목표는 루트 기본 파일 + 설정 파일 + 공통 모듈 생성이다.
+
+생성/수정 대상 파일:
+- requirements.txt
+- .env.example
+- config/settings.py
+- src/common/logger.py
+- src/common/exceptions.py
+- src/common/responses.py
+
+환경:
+- Windows
+- Python 3.11.9 64bit
+- .venv
+- VS Code
+
+구조 전제:
+- 웹 서버와 Collector Worker는 분리 예정
+- 하지만 지금은 공통 기반만 먼저 만든다
+- 모든 환경변수는 settings 객체를 통해 읽게 할 것
+- logger는 웹/워커가 같이 쓸 수 있어야 함
+- 응답 형식과 예외 형식은 통일할 것
+
+구현 조건:
+1. requirements.txt에는 아래 패키지를 포함
+   - fastapi
+   - uvicorn[standard]
+   - sqlalchemy
+   - alembic
+   - pydantic-settings
+   - python-dotenv
+   - psycopg[binary]
+   - telethon
+   - httpx
+   - pytest
+
+2. .env.example에는 아래 범주의 변수 포함
+   - APP
+   - DB
+   - LOG
+   - TELEGRAM
+   - COLLECTOR
+   - BROKER
+
+3. config/settings.py는 아래 구조 권장
+   - AppSettings
+   - DBSettings
+   - LogSettings
+   - TelegramSettings
+   - CollectorSettings
+   - BrokerSettings
+   - Settings
+   - get_settings() 또는 singleton settings
+
+4. src/common/logger.py
+   - 콘솔 + 파일 로그
+   - logs 디렉토리 자동 생성
+   - app.log / collector.log / error.log
+   - get_logger(name, log_type="app") 형태 제공
+
+5. src/common/exceptions.py
+   - AppException
+   - DatabaseException
+   - ExternalAPIException
+   - ValidationAppException
+   - NotFoundException
+
+6. src/common/responses.py
+   - success_response()
+   - error_response()
+
+출력 순서:
+1. 최종 파일 트리(이번 단계 범위만)
+2. 각 파일 역할 1~2줄
+3. 각 파일 전체 코드
+4. 마지막에 점검 방법 정리
+
+중요:
+- 실제 실행 가능한 최소 코드여야 함
+- placeholder만 남기지 말 것
+- 과설계 금지
+- 한국어로 답변
+```
+
+---
+
+# 2단계: DB 계층
+
+이 단계 목표는:
+
+* SQLAlchemy Base
+* DB 세션
+* 최소 모델
+
+까지 만드는 것입니다.
+
+## Cursor 프롬프트 2
+
+```text
+D:\telegram_trading 프로젝트의 Phase 1 작업을 이어서 진행한다.
+
+지금은 2단계만 구현한다.
+목표는 DB 계층 생성이다.
+
+생성/수정 대상 파일:
+- src/infra/db/base.py
+- src/infra/db/session.py
+- src/infra/db/models.py
+
+이미 존재한다고 가정해야 하는 파일:
+- config/settings.py
+- src/common/logger.py
+- src/common/exceptions.py
+
+환경:
+- Windows
+- Python 3.11.9
+- PostgreSQL 기준
+- SQLAlchemy 2.x 기준
+
+구현 조건:
+1. base.py
+   - DeclarativeBase 또는 Base 정의
+   - 공통 timestamp mixin은 선택 사항
+
+2. session.py
+   - settings 기반으로 DATABASE_URL 생성
+   - engine 생성
+   - SessionLocal 생성
+   - get_db() 함수
+   - check_db_connection() 함수
+
+3. models.py
+   - Phase 1 최소 모델만 작성
+   - SystemLog
+   - TelegramAccount
+   - TelegramRuntimeSetting
+
+모델 최소 필드:
+- SystemLog
+  - id
+  - module_name
+  - log_level
+  - message
+  - created_at
+
+- TelegramAccount
+  - id
+  - account_name
+  - session_name
+  - status
+  - created_at
+  - updated_at
+
+- TelegramRuntimeSetting
+  - id
+  - telegram_account_id
+  - auto_channel_update
+  - auto_add_new_channels_only
+  - auto_start_last_selected_channels
+  - auto_restore_last_selection
+  - created_at
+  - updated_at
+
+중요:
+- 향후 telegram_channels, telegram_messages 확장 가능하게 작성
+- 지금은 최소 모델만
+- import 경로 실제로 맞게 작성
+- settings/logger 구조와 연결되게 작성
+
+출력 순서:
+1. 파일별 역할
+2. 각 파일 전체 코드
+3. DB 연결 점검 방법
+4. 예상 오류 포인트
+
+한국어로 답변
+```
+
+---
+
+# 3단계: 웹 서버 실행 뼈대
+
+이 단계 목표는:
+
+* FastAPI 앱 생성
+* `/health`, `/ready`
+* `run_web.py`
+
+까지 완성하는 것입니다.
+
+## Cursor 프롬프트 3
+
+```text
+D:\telegram_trading 프로젝트의 Phase 1 작업을 이어서 진행한다.
+
+지금은 3단계만 구현한다.
+목표는 최소 실행 가능한 웹 서버 뼈대를 만드는 것이다.
+
+생성/수정 대상 파일:
+- src/web/app.py
+- src/web/routes/health.py
+- run_web.py
+
+이미 존재한다고 가정해야 하는 파일:
+- config/settings.py
+- src/common/logger.py
+- src/common/exceptions.py
+- src/common/responses.py
+- src/infra/db/session.py
+
+구현 조건:
+1. src/web/app.py
+   - FastAPI 앱 생성
+   - title/version 설정
+   - health 라우터 등록
+   - startup 로그 출력
+   - 공통 예외 핸들러 등록
+
+2. src/web/routes/health.py
+   - GET /health
+   - GET /ready
+   - 공통 응답 포맷 사용
+   - /ready 에서는 check_db_connection() 사용
+
+3. run_web.py
+   - settings 기반 host/port 적용
+   - debug 값에 따라 reload 적용 가능
+   - uvicorn 실행 진입점
+
+응답 형식:
+- success_response
+- error_response
+형태 사용
+
+예외 처리:
+- AppException 계열은 일관된 JSON으로 반환
+- 일반 Exception도 INTERNAL_SERVER_ERROR 형식으로 처리
+
+출력 순서:
+1. 최종 파일 트리(웹 관련만)
+2. 파일별 역할
+3. 각 파일 전체 코드
+4. Windows 기준 실행 명령어
+5. /health, /ready 점검 방법
+
+중요:
+- 실제로 python run_web.py 로 실행 가능한 최소 코드
+- 과도한 라우터 추가 금지
+- 한국어로 답변
+```
+
+---
+
+# 4단계: Collector Worker 실행 뼈대
+
+이 단계 목표는:
+
+* 워커 실행
+* startup task 구조
+* DB/설정/로그 점검
+
+까지 만드는 것입니다.
+
+## Cursor 프롬프트 4
+
+```text
+D:\telegram_trading 프로젝트의 Phase 1 작업을 이어서 진행한다.
+
+지금은 4단계만 구현한다.
+목표는 최소 실행 가능한 Collector Worker 뼈대를 만드는 것이다.
+
+생성/수정 대상 파일:
+- src/workers/startup_tasks.py
+- src/workers/collector_worker.py
+- run_collector.py
+
+이미 존재한다고 가정해야 하는 파일:
+- config/settings.py
+- src/common/logger.py
+- src/common/exceptions.py
+- src/infra/db/session.py
+- src/infra/db/models.py
+
+구현 조건:
+1. startup_tasks.py
+   - run_startup_tasks() 함수
+   - runtime settings 로드용 placeholder 함수
+   - startup summary 로그 함수
+   - future hooks:
+     - channel sync
+     - restore last selected channels
+     - auto start collection
+   - 지금 단계에서는 구조만 실행되게
+
+2. collector_worker.py
+   - CollectorWorker 클래스 또는 실행 함수
+   - settings 로드
+   - logger 로드
+   - DB 연결 점검
+   - startup tasks 호출
+   - 단순 loop 또는 graceful idle 구조
+   - 아직 Telethon 실제 수집 로직은 넣지 말 것
+
+3. run_collector.py
+   - worker 실행 진입점
+   - 시작 로그
+   - 종료 로그
+   - KeyboardInterrupt 처리
+
+중요:
+- python run_collector.py 로 실행 가능한 최소 코드
+- placeholder만 두지 말고 실제 시작/점검/로그 흐름은 동작해야 함
+- 웹 서버와 공통 settings/logger/db 구조를 공유해야 함
+
+출력 순서:
+1. 파일별 역할
+2. 각 파일 전체 코드
+3. 실행 방법
+4. 예상 점검 포인트
+
+한국어로 답변
+```
+
+---
+
+# 5단계: 전체 점검 및 정리
+
+이 단계는 코드가 다 나온 뒤, **연결 오류를 잡는 검수 단계**입니다.
+
+## Cursor 프롬프트 5
+
+```text
+지금까지 작성된 D:\telegram_trading 프로젝트의 Phase 1 코드를 전체 점검해줘.
+
+점검 범위:
+- settings import 구조
+- logger import 구조
+- SQLAlchemy Base/Session 연결
+- FastAPI app 실행 가능 여부
+- /health, /ready 동작 가능 여부
+- Collector Worker 실행 가능 여부
+- Windows + .venv + VS Code 환경에서 import 경로 문제
+- logs 폴더/로그 파일 생성 문제
+- DB 연결 실패 시 예외 또는 로그 처리 일관성
+- pydantic-settings v2 문법 적합성
+- SQLAlchemy 2.x 문법 적합성
+
+원하는 출력:
+1. 문제점 목록
+2. 수정 이유
+3. 수정된 파일 전체 코드
+4. 실제 실행 순서 재정리
+5. 최종 완료 체크리스트
+
+중요:
+- 추상 설명보다 실제 수정 중심으로 답변
+- 전체 파일을 생략하지 말 것
+- 한국어로 답변
+```
+
+---
+
+# 가장 추천하는 실제 사용 순서
+
+아래 순서대로 넣는 것이 가장 안정적입니다.
+
+### 순서
+
+1. 프롬프트 1
+2. 프롬프트 2
+3. 프롬프트 3
+4. 프롬프트 4
+5. 프롬프트 5
+
+이렇게 가면 한 번에 긴 코드가 쏟아져서 망가지는 문제를 줄일 수 있습니다.
+
+---
+
+# 한 번 더 압축한 초실전 버전
+
+정말 빠르게 작업하고 싶으면 아래처럼 3묶음으로 줄여도 됩니다.
+
+## 묶음 A
+
+* `requirements.txt`
+* `.env.example`
+* `settings.py`
+* `logger.py`
+* `exceptions.py`
+* `responses.py`
+
+## 묶음 B
+
+* `base.py`
+* `session.py`
+* `models.py`
+* `app.py`
+* `health.py`
+* `run_web.py`
+
+## 묶음 C
+
+* `startup_tasks.py`
+* `collector_worker.py`
+* `run_collector.py`
+* 전체 점검
+
+---
+
+# 최종 정리
+
+지금 가장 실용적인 방법은:
+
+* **파일을 한 번에 다 만들지 말고**
+* **공통 → DB → 웹 → 워커 → 전체점검**
+  순서로 Cursor에 나눠서 요청하는 것입니다.
+
+이 방식이 import 오류, 설정 누락, 실행 실패를 가장 잘 줄여줍니다.

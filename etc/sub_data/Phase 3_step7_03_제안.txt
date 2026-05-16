@@ -1,0 +1,849 @@
+좋습니다. 그럼 바로 **`AnalysisJobService` 초안 + worker 연결 방식**까지 실전형으로 정리하겠습니다.
+
+이번 답변의 목표는 3가지입니다.
+
+1. `claim_next_job()` 를 서비스 레이어로 고정
+2. `complete_job()` / `fail_job()` 로 상태 전이 일원화
+3. `PreprocessWorker` / `InferenceWorker` 가 같은 패턴으로 동작하게 정리
+
+아래 코드는 **현재 프로젝트에 맞춰 옮기기 쉬운 초안**입니다.
+
+---
+
+# 1. 먼저 고정할 상태값
+
+상태는 최소 이 정도가 실용적입니다.
+
+```python
+from enum import Enum
+
+
+class JobStatus(str, Enum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    DONE = "DONE"
+    FAILED = "FAILED"
+    RETRY_PENDING = "RETRY_PENDING"
+    DEAD = "DEAD"
+```
+
+권장 해석은 이렇습니다.
+
+* `PENDING`: 아직 처리 전
+* `RUNNING`: 어떤 worker 가 claim 해서 처리 중
+* `DONE`: 정상 종료
+* `FAILED`: 실패했지만 아직 재시도 정책 판단 전
+* `RETRY_PENDING`: 재시도 대상으로 다시 큐에 올릴 상태
+* `DEAD`: 더 이상 자동 재시도하지 않음
+
+실무적으로는 `FAILED` 없이 바로 `RETRY_PENDING` 또는 `DEAD` 로 가도 되지만,
+초기에는 `FAILED` 를 남겨두는 편이 디버깅이 쉽습니다.
+
+---
+
+# 2. 권장 모델 필드
+
+`AnalysisJob` 에는 아래 필드가 있으면 운영이 편합니다.
+
+```python
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text, JSON
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+
+class AnalysisJob(Base):
+    __tablename__ = "analysis_jobs"
+
+    id = Column(Integer, primary_key=True)
+    message_id = Column(Integer, ForeignKey("messages.id"), nullable=False, index=True)
+    job_type = Column(String(50), nullable=False, index=True)
+    status = Column(String(20), nullable=False, index=True)
+
+    payload = Column(JSON, nullable=True)
+
+    attempt_count = Column(Integer, nullable=False, default=0)
+    max_attempts = Column(Integer, nullable=False, default=3)
+
+    last_error = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    heartbeat_at = Column(DateTime, nullable=True)
+```
+
+추가로 강하게 권장하는 제약은 이것입니다.
+
+```python
+from sqlalchemy import UniqueConstraint
+
+__table_args__ = (
+    UniqueConstraint("message_id", "job_type", name="uq_analysis_jobs_message_job_type"),
+)
+```
+
+이 제약이 있어야 **동일 메시지에 같은 job 이 중복 생성되는 문제**를 마지막으로 막을 수 있습니다.
+
+---
+
+# 3. 서비스 레이어가 맡아야 할 책임
+
+`AnalysisJobService` 는 아래만 책임지면 됩니다.
+
+* job 생성
+* 다음 job claim
+* 성공 완료 처리
+* 실패 처리
+* stuck job 복구
+* dead 전환
+
+즉, worker 는 가능한 한 **도메인 로직**만 하고,
+job 상태 변경은 서비스가 전담하는 게 좋습니다.
+
+---
+
+# 4. 가장 중요한 설계 원칙
+
+이 부분이 핵심입니다.
+
+## 원칙 1
+
+`claim_next_job()` 은 **짧은 트랜잭션** 안에서 끝나야 합니다.
+
+## 원칙 2
+
+외부 호출(LLM, API, 파서, 무거운 처리)은 **세션 밖에서** 실행합니다.
+
+## 원칙 3
+
+결과 저장 + 현재 job 완료 + 다음 job 생성은 **한 트랜잭션**으로 묶습니다.
+
+이 세 가지만 지켜도 구조가 훨씬 안정됩니다.
+
+---
+
+# 5. AnalysisJobService 초안
+
+아래 코드는 가장 중요한 골격입니다.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Callable, Optional
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from src.models.analysis_job import AnalysisJob
+from src.models.enums import JobStatus
+
+
+@dataclass
+class ClaimedJob:
+    job_id: int
+    message_id: int
+    job_type: str
+    payload: dict | None
+    attempt_count: int
+    max_attempts: int
+
+
+class AnalysisJobService:
+    def __init__(
+        self,
+        db_session_factory,
+        now_fn: Callable[[], datetime] | None = None,
+        default_max_attempts: int = 3,
+    ):
+        self.db_session_factory = db_session_factory
+        self.now_fn = now_fn or datetime.utcnow
+        self.default_max_attempts = default_max_attempts
+
+    def create_job_if_not_exists(
+        self,
+        message_id: int,
+        job_type: str,
+        payload: dict | None = None,
+        max_attempts: int | None = None,
+    ) -> bool:
+        now = self.now_fn()
+        created = False
+
+        with self.db_session_factory() as session:
+            existing = (
+                session.query(AnalysisJob)
+                .filter(
+                    AnalysisJob.message_id == message_id,
+                    AnalysisJob.job_type == job_type,
+                )
+                .one_or_none()
+            )
+            if existing is not None:
+                return False
+
+            job = AnalysisJob(
+                message_id=message_id,
+                job_type=job_type,
+                status=JobStatus.PENDING.value,
+                payload=payload,
+                attempt_count=0,
+                max_attempts=max_attempts or self.default_max_attempts,
+                last_error=None,
+                created_at=now,
+                started_at=None,
+                finished_at=None,
+                heartbeat_at=None,
+            )
+            session.add(job)
+
+            try:
+                session.commit()
+                created = True
+            except IntegrityError:
+                session.rollback()
+                created = False
+
+        return created
+```
+
+이 메서드는 `persist_message()` 나 `complete_job()` 안에서 후속 job 생성할 때 쓰면 됩니다.
+
+---
+
+# 6. claim_next_job() 초안
+
+이 메서드가 실제 구조의 중심입니다.
+
+가장 이상적인 것은 **PostgreSQL 기준 `FOR UPDATE SKIP LOCKED`** 입니다.
+
+```python
+def claim_next_job(self, job_type: str) -> Optional[ClaimedJob]:
+    now = self.now_fn()
+
+    with self.db_session_factory() as session:
+        job = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.job_type == job_type,
+                AnalysisJob.status.in_(
+                    [JobStatus.PENDING.value, JobStatus.RETRY_PENDING.value]
+                ),
+            )
+            .order_by(AnalysisJob.created_at.asc(), AnalysisJob.id.asc())
+            .with_for_update(skip_locked=True)
+            .first()
+        )
+
+        if job is None:
+            return None
+
+        job.status = JobStatus.RUNNING.value
+        job.attempt_count += 1
+        job.started_at = now
+        job.heartbeat_at = now
+        job.finished_at = None
+        job.last_error = None
+
+        session.commit()
+
+        return ClaimedJob(
+            job_id=job.id,
+            message_id=job.message_id,
+            job_type=job.job_type,
+            payload=job.payload,
+            attempt_count=job.attempt_count,
+            max_attempts=job.max_attempts,
+        )
+```
+
+이 방식의 장점은 명확합니다.
+
+* 동시에 여러 worker 가 떠도 같은 job 중복 claim 확률을 크게 낮춤
+* claim 후 즉시 commit 하므로 긴 락을 피함
+* 이후 작업은 세션 밖에서 수행 가능
+
+---
+
+# 7. SQLite 테스트 환경에서의 주의점
+
+`sqlite:///:memory:` 테스트에서는 `with_for_update(skip_locked=True)` 가 사실상 제대로 의미를 못 가집니다.
+
+그래서 테스트 목적이면 아래처럼 **동작만 확인하는 단순 버전**도 가능합니다.
+
+```python
+def claim_next_job_sqlite_fallback(self, job_type: str) -> Optional[ClaimedJob]:
+    now = self.now_fn()
+
+    with self.db_session_factory() as session:
+        job = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.job_type == job_type,
+                AnalysisJob.status.in_(
+                    [JobStatus.PENDING.value, JobStatus.RETRY_PENDING.value]
+                ),
+            )
+            .order_by(AnalysisJob.created_at.asc(), AnalysisJob.id.asc())
+            .first()
+        )
+
+        if job is None:
+            return None
+
+        if job.status not in (JobStatus.PENDING.value, JobStatus.RETRY_PENDING.value):
+            return None
+
+        job.status = JobStatus.RUNNING.value
+        job.attempt_count += 1
+        job.started_at = now
+        job.heartbeat_at = now
+        job.finished_at = None
+        job.last_error = None
+        session.commit()
+
+        return ClaimedJob(
+            job_id=job.id,
+            message_id=job.message_id,
+            job_type=job.job_type,
+            payload=job.payload,
+            attempt_count=job.attempt_count,
+            max_attempts=job.max_attempts,
+        )
+```
+
+즉,
+
+* **운영 DB(PostgreSQL)**: `SKIP LOCKED` 기반
+* **테스트 SQLite**: 단일 프로세스 기준 동작 검증
+
+이렇게 나누는 게 현실적입니다.
+
+---
+
+# 8. complete_job() 초안
+
+이 메서드는 아래 3가지를 한 번에 처리해야 합니다.
+
+1. 현재 job 을 `DONE`
+2. 결과 row 저장
+3. 후속 job 생성
+
+즉, **한 트랜잭션**으로 끝내는 게 중요합니다.
+
+```python
+def complete_job(
+    self,
+    job_id: int,
+    result_handler,
+    next_job_type: str | None = None,
+    next_payload: dict | None = None,
+) -> None:
+    now = self.now_fn()
+
+    with self.db_session_factory() as session:
+        job = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == job_id)
+            .one()
+        )
+
+        if job.status != JobStatus.RUNNING.value:
+            raise ValueError(f"job {job_id} is not RUNNING")
+
+        # 1) 결과 저장
+        # result_handler(session)은 이 안에서
+        # preprocess 결과 row 저장 / summary 결과 row 저장 등을 수행
+        result_handler(session)
+
+        # 2) 현재 job DONE
+        job.status = JobStatus.DONE.value
+        job.finished_at = now
+        job.heartbeat_at = now
+        job.last_error = None
+
+        # 3) 다음 job 생성
+        if next_job_type is not None:
+            existing = (
+                session.query(AnalysisJob)
+                .filter(
+                    AnalysisJob.message_id == job.message_id,
+                    AnalysisJob.job_type == next_job_type,
+                )
+                .one_or_none()
+            )
+            if existing is None:
+                next_job = AnalysisJob(
+                    message_id=job.message_id,
+                    job_type=next_job_type,
+                    status=JobStatus.PENDING.value,
+                    payload=next_payload,
+                    attempt_count=0,
+                    max_attempts=self.default_max_attempts,
+                    last_error=None,
+                    created_at=now,
+                    started_at=None,
+                    finished_at=None,
+                    heartbeat_at=None,
+                )
+                session.add(next_job)
+
+        session.commit()
+```
+
+이 패턴의 장점은 큽니다.
+
+예를 들어 `NORMALIZE` 완료 시:
+
+* `PreprocessedMessage` 저장
+* `NORMALIZE` → `DONE`
+* `SINGLE_MESSAGE_SUMMARY` 생성
+
+이 세 개가 **같은 commit** 으로 묶이므로 상태 꼬임이 줄어듭니다.
+
+---
+
+# 9. fail_job() 초안
+
+실패 시에는 다음이 필요합니다.
+
+* `last_error`
+* `attempt_count` 는 claim 시 이미 증가
+* `max_attempts` 초과 여부 판단
+* `FAILED` / `RETRY_PENDING` / `DEAD` 구분
+
+```python
+def fail_job(
+    self,
+    job_id: int,
+    error: Exception | str,
+    retryable: bool = True,
+) -> None:
+    now = self.now_fn()
+    error_text = str(error)
+
+    with self.db_session_factory() as session:
+        job = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == job_id)
+            .one()
+        )
+
+        if job.status != JobStatus.RUNNING.value:
+            raise ValueError(f"job {job_id} is not RUNNING")
+
+        job.finished_at = now
+        job.heartbeat_at = now
+        job.last_error = error_text
+
+        if retryable and job.attempt_count < job.max_attempts:
+            job.status = JobStatus.RETRY_PENDING.value
+        elif retryable and job.attempt_count >= job.max_attempts:
+            job.status = JobStatus.DEAD.value
+        else:
+            job.status = JobStatus.FAILED.value
+
+        session.commit()
+```
+
+권장 정책은 이렇습니다.
+
+* 일시적 외부 오류: `retryable=True`
+* 데이터 자체가 깨진 경우: `retryable=False`
+* 재시도 횟수 초과: 자동 `DEAD`
+
+---
+
+# 10. heartbeat 갱신 메서드
+
+장시간 작업이 생길 수도 있으므로 있으면 좋습니다.
+
+```python
+def touch_heartbeat(self, job_id: int) -> None:
+    now = self.now_fn()
+
+    with self.db_session_factory() as session:
+        job = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == job_id)
+            .one_or_none()
+        )
+        if job is None:
+            return
+        if job.status != JobStatus.RUNNING.value:
+            return
+
+        job.heartbeat_at = now
+        session.commit()
+```
+
+초기엔 없어도 되지만, inference 가 길어질 가능성이 있으면 넣는 편이 안전합니다.
+
+---
+
+# 11. Scheduler 용 메서드 초안
+
+## 11-1. stuck job 재큐잉
+
+```python
+def requeue_stuck_jobs(
+    self,
+    job_type: str | None = None,
+    timeout_seconds: int = 600,
+) -> int:
+    now = self.now_fn()
+    threshold = now - timedelta(seconds=timeout_seconds)
+
+    with self.db_session_factory() as session:
+        query = session.query(AnalysisJob).filter(
+            AnalysisJob.status == JobStatus.RUNNING.value,
+            AnalysisJob.started_at.isnot(None),
+            AnalysisJob.started_at < threshold,
+        )
+
+        if job_type is not None:
+            query = query.filter(AnalysisJob.job_type == job_type)
+
+        jobs = query.all()
+
+        count = 0
+        for job in jobs:
+            if job.attempt_count >= job.max_attempts:
+                job.status = JobStatus.DEAD.value
+            else:
+                job.status = JobStatus.RETRY_PENDING.value
+            job.finished_at = now
+            job.last_error = job.last_error or "stuck job recovered by scheduler"
+            count += 1
+
+        session.commit()
+        return count
+```
+
+## 11-2. FAILED → DEAD 정리
+
+```python
+def mark_dead_jobs(self) -> int:
+    with self.db_session_factory() as session:
+        jobs = (
+            session.query(AnalysisJob)
+            .filter(
+                AnalysisJob.status.in_(
+                    [JobStatus.FAILED.value, JobStatus.RETRY_PENDING.value]
+                ),
+                AnalysisJob.attempt_count >= AnalysisJob.max_attempts,
+            )
+            .all()
+        )
+
+        count = 0
+        for job in jobs:
+            job.status = JobStatus.DEAD.value
+            count += 1
+
+        session.commit()
+        return count
+```
+
+---
+
+# 12. PreprocessWorker.run_once() 권장 형태
+
+이제 worker 는 아주 얇아져야 합니다.
+
+핵심은:
+
+1. claim
+2. 세션 밖에서 실제 처리
+3. complete/fail 호출
+
+```python
+class PreprocessWorker:
+    JOB_TYPE = "NORMALIZE"
+
+    def __init__(self, db_session_factory, job_service, preprocess_service):
+        self.db_session_factory = db_session_factory
+        self.job_service = job_service
+        self.preprocess_service = preprocess_service
+
+    def run_once(self) -> int:
+        claimed = self.job_service.claim_next_job(self.JOB_TYPE)
+        if claimed is None:
+            return 0
+
+        try:
+            # 세션 밖에서 필요한 원문 조회
+            with self.db_session_factory() as session:
+                message = self.preprocess_service.get_message(session, claimed.message_id)
+
+            normalized = self.preprocess_service.normalize_text(message.text)
+
+            def result_handler(session):
+                self.preprocess_service.upsert_preprocessed_message(
+                    session=session,
+                    message_id=claimed.message_id,
+                    normalized_text=normalized,
+                )
+
+            self.job_service.complete_job(
+                job_id=claimed.job_id,
+                result_handler=result_handler,
+                next_job_type="SINGLE_MESSAGE_SUMMARY",
+            )
+            return 1
+
+        except Exception as e:
+            self.job_service.fail_job(
+                job_id=claimed.job_id,
+                error=e,
+                retryable=True,
+            )
+            return 0
+```
+
+여기서 포인트는 `result_handler(session)` 입니다.
+
+이 패턴을 쓰면 결과 저장을 `complete_job()` 트랜잭션 안으로 넣을 수 있습니다.
+
+---
+
+# 13. InferenceWorker.run_once() 권장 형태
+
+구조는 동일합니다.
+
+```python
+class InferenceWorker:
+    JOB_TYPE = "SINGLE_MESSAGE_SUMMARY"
+
+    def __init__(self, db_session_factory, job_service, summary_service, summary_client):
+        self.db_session_factory = db_session_factory
+        self.job_service = job_service
+        self.summary_service = summary_service
+        self.summary_client = summary_client
+
+    def run_once(self) -> int:
+        claimed = self.job_service.claim_next_job(self.JOB_TYPE)
+        if claimed is None:
+            return 0
+
+        try:
+            with self.db_session_factory() as session:
+                preprocessed = self.summary_service.get_preprocessed_message(
+                    session=session,
+                    message_id=claimed.message_id,
+                )
+
+            summary_text = self.summary_client.summarize(preprocessed.normalized_text)
+
+            def result_handler(session):
+                self.summary_service.upsert_summary(
+                    session=session,
+                    message_id=claimed.message_id,
+                    summary_text=summary_text,
+                )
+
+            self.job_service.complete_job(
+                job_id=claimed.job_id,
+                result_handler=result_handler,
+                next_job_type=None,
+            )
+            return 1
+
+        except Exception as e:
+            self.job_service.fail_job(
+                job_id=claimed.job_id,
+                error=e,
+                retryable=True,
+            )
+            return 0
+```
+
+이렇게 맞추면 `PreprocessWorker` 와 `InferenceWorker` 의 구조가 거의 동일해집니다.
+
+---
+
+# 14. persist_message() 와의 연결
+
+`persist_message()` 에서는 메시지 저장과 초기 job 생성이 한 트랜잭션이면 가장 좋습니다.
+
+```python
+def persist_message(
+    self,
+    channel_id: int,
+    telegram_message_id: int,
+    text: str,
+    sent_at,
+    raw_payload: dict | None = None,
+):
+    now = datetime.utcnow()
+
+    with self.db_session_factory() as session:
+        existing = (
+            session.query(Message)
+            .filter(
+                Message.channel_id == channel_id,
+                Message.telegram_message_id == telegram_message_id,
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            return existing
+
+        msg = Message(
+            channel_id=channel_id,
+            telegram_message_id=telegram_message_id,
+            text=text,
+            sent_at=sent_at,
+            created_at=now,
+        )
+        session.add(msg)
+        session.flush()
+
+        job = AnalysisJob(
+            message_id=msg.id,
+            job_type="NORMALIZE",
+            status=JobStatus.PENDING.value,
+            payload=raw_payload,
+            attempt_count=0,
+            max_attempts=3,
+            created_at=now,
+        )
+        session.add(job)
+
+        session.commit()
+        return msg
+```
+
+여기서도 핵심은 같습니다.
+
+* message insert
+* initial NORMALIZE job insert
+
+이 둘은 같은 commit 으로 묶는 게 좋습니다.
+
+---
+
+# 15. 지금 구조에서 가장 중요한 방어 포인트
+
+## 15-1. 서비스 밖에서 상태 바꾸지 않기
+
+worker 가 직접 `job.status = DONE` 같은 걸 만지기 시작하면 금방 중복 로직이 생깁니다.
+
+즉, 아래는 피하는 편이 좋습니다.
+
+```python
+job.status = "DONE"
+session.commit()
+```
+
+이런 코드는 worker 안에서 직접 나오지 않게 하는 게 좋습니다.
+
+---
+
+## 15-2. upsert 패턴 권장
+
+`PreprocessedMessage`, `MessageSummary` 저장은 가능하면 `upsert_*()` 로 통일하는 게 좋습니다.
+
+이유는 재시도 시 중복 insert 방지입니다.
+
+예:
+
+```python
+def upsert_summary(self, session, message_id: int, summary_text: str):
+    row = (
+        session.query(MessageSummary)
+        .filter(MessageSummary.message_id == message_id)
+        .one_or_none()
+    )
+    if row is None:
+        row = MessageSummary(
+            message_id=message_id,
+            summary_text=summary_text,
+        )
+        session.add(row)
+    else:
+        row.summary_text = summary_text
+```
+
+---
+
+## 15-3. run_once() 반환 규약 유지
+
+앞서 정리한 대로 이게 가장 단순합니다.
+
+* 성공적으로 DONE 처리: `1`
+* 할 일 없음: `0`
+* 실패: `0`
+
+이 규약이면 run loop 도 단순해집니다.
+
+---
+
+# 16. 이 초안으로 통합 테스트가 어떻게 연결되는가
+
+앞에서 정리했던 테스트와 정확히 맞물립니다.
+
+## happy path
+
+* `persist_message()` → `NORMALIZE PENDING`
+* `preprocess_worker.run_once()` → `NORMALIZE DONE`, `SINGLE_MESSAGE_SUMMARY PENDING`
+* `inference_worker.run_once()` → `SINGLE_MESSAGE_SUMMARY DONE`
+
+## 실패 path
+
+* `persist_message()` → `NORMALIZE PENDING`
+* `preprocess_worker.run_once()` → 성공
+* `inference_worker.run_once()` → 예외
+* `fail_job()` → `RETRY_PENDING` 또는 `DEAD`
+
+즉, 테스트가 서비스 계층 계약을 강제로 고정해주는 구조가 됩니다.
+
+---
+
+# 17. 가장 자연스러운 다음 코드 작업 순서
+
+지금 가장 실전적인 순서는 이렇습니다.
+
+### 1단계
+
+`src/services/analysis_job_service.py` 생성
+
+먼저 아래 메서드부터 넣으면 됩니다.
+
+* `create_job_if_not_exists()`
+* `claim_next_job()`
+* `complete_job()`
+* `fail_job()`
+
+### 2단계
+
+`PreprocessWorker.run_once()` 를 위 서비스 기준으로 리팩토링
+
+### 3단계
+
+`InferenceWorker.run_once()` 를 같은 패턴으로 리팩토링
+
+### 4단계
+
+앞서 정리한 `test_pipeline_run_once_happy_path` 와 `test_pipeline_inference_failure_sets_retryable_state` 작성
+
+### 5단계
+
+마지막으로 `SchedulerWorker` 에
+
+* `requeue_stuck_jobs()`
+* `mark_dead_jobs()`
+  를 연결
+
+---
+
+# 18. 한 줄 요약
+
+지금 구조에서 가장 중요한 것은
+**worker 가 job 상태를 직접 만지지 말고, `AnalysisJobService` 가 claim/complete/fail 을 전담하도록 바꾸는 것**입니다.
+
+원하시면 다음 답변에서는 이어서 바로
+**`analysis_job_service.py` 실제 파일 형태 전체 코드 초안**과
+**`PreprocessWorker` / `InferenceWorker` 리팩토링 패치 형태**로 더 구체적으로 적어드리겠습니다.

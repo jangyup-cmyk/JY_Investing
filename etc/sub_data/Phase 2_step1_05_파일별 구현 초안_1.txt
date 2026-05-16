@@ -1,0 +1,181 @@
+네, **지금 바로 4순위와 5순위를 진행하는 게 맞습니다.**
+오히려 STEP 2로 넘어가기 전에 그 둘을 닫아야 STEP 1이 진짜 끝납니다.
+
+그리고 먼저 말씀하신 `schemas.py` 위치 문제부터 답하면,
+
+## `src/infra/telegram/schemas.py` 위치
+
+**그대로 유지하는 쪽이 더 낫습니다.**
+
+이유는 명확합니다.
+
+* 이번 `Payload`, `DTO`, `UpsertResult`는 범용 DB 스키마가 아니라
+  **텔레그램 수집 파이프라인 전용 계약**에 가깝습니다.
+* `message_to_payload()`, Telethon 이벤트 래핑, worker 래퍼 함수와 함께 움직일 가능성이 높습니다.
+* 따라서 `infra/db`보다 `infra/telegram` 아래에 두는 편이 응집도가 더 좋습니다.
+
+즉 지금은 옮길 필요 없습니다.
+굳이 옮겨야 하는 경우는 나중에 이 타입들이 텔레그램 전용이 아니라 **여러 입력원 공통 수집 DTO**로 커질 때입니다. 지금은 아닙니다.
+
+---
+
+# 제 판단: 지금 해야 할 일
+
+## 1. 구조 변경은 멈추고
+
+## 2. Worker 연결 껍데기와 Pytest를 바로 완성
+
+이 순서가 맞습니다.
+
+현재 상태에서 더 중요한 건 폴더 미세조정보다 아래 두 가지입니다.
+
+* **코어 저장 규약이 worker 쪽에서 어떻게 호출되는지 고정**
+* **그 규약이 pytest로 자동 검증되도록 고정**
+
+이 둘이 있어야 STEP 2에서 백필과 실시간 리스너를 붙일 때 흔들리지 않습니다.
+
+---
+
+# 4순위: Worker 래퍼 함수 준비
+
+이건 반드시 지금 해두는 게 좋습니다.
+
+핵심은 “실시간 이벤트”와 “백필 메시지”가 **동일한 저장 진입점**을 쓰게 만드는 것입니다.
+
+## 추천 최소 구성
+
+### `collector_worker.py`
+
+지금 단계에서는 아래 3개만 있어도 충분합니다.
+
+* `persist_message_from_event(...)`
+* `persist_message_from_history(...)`
+* `safe_process_message(...)`
+
+여기서 중요한 점은
+`persist_message_from_event()`와 `persist_message_from_history()`가 내부적으로 결국 같은 저장 경로를 타야 한다는 것입니다.
+
+예를 들면 구조는 이런 식이면 됩니다.
+
+```python
+async def persist_message_payload(db, payload):
+    result = await upsert_message(db, payload)
+    if result.action in {CREATED, UPDATED, UNCHANGED}:
+        await update_channel_checkpoint(...)
+    return result
+```
+
+그 위에
+
+* 이벤트용: Telethon event/message → payload 변환 후 호출
+* 백필용: history message → payload 변환 후 호출
+
+이렇게 얹는 방식입니다.
+
+즉 **진짜 공통 함수는 payload 기반 저장 래퍼**여야 합니다.
+
+---
+
+### `startup_tasks.py`
+
+여기서는 지금 당장 백필 본문까지 짤 필요 없습니다.
+대신 아래 시그니처는 잡아두는 게 좋습니다.
+
+* `find_channels_pending_backfill()`
+* `run_startup_recovery()`
+* `mark_backfill_completed()`
+* `mark_backfill_failed()`
+
+이렇게 해두면 STEP 2에서 실제 루프만 채우면 됩니다.
+
+---
+
+### `client.py`
+
+여기도 지금은 선언 위주로 충분합니다.
+
+* `register_new_message_handler(handler)`
+* `register_edited_message_handler(handler)`
+
+핵심은 나중에 worker가 이 핸들러에 무엇을 넘겨받는지 인터페이스가 고정되는 것입니다.
+
+---
+
+# 5순위: Pytest 작성
+
+이건 **지금 바로 해야 합니다.**
+
+통합 스크립트로 눈으로 확인한 것과 pytest는 다릅니다.
+pytest가 있어야 이후 리팩토링이나 STEP 2 구현 중에 규약이 깨지는 순간 바로 잡을 수 있습니다.
+
+## 우선순위
+
+### 최우선: `tests/test_repository.py`
+
+이게 제일 중요합니다.
+
+반드시 들어가야 할 테스트:
+
+* 신규 메시지 insert
+* 동일 메시지 재입력 시 중복 없음
+* 편집 메시지 update 반영
+* 삭제 플래그 반영
+* 체크포인트 증가
+* 작은 message_id로 체크포인트 역행 금지
+* upsert 실패 시 checkpoint 미갱신
+
+이 파일이 사실상 STEP 1의 핵심 안전장치입니다.
+
+---
+
+### 다음: `tests/test_telegram_routes.py`
+
+여기서는 최소한 아래만 잡아도 충분합니다.
+
+* `/channels/{id}/toggle` ON → `PENDING_BACKFILL`
+* `/channels/{id}/toggle` OFF → `PAUSED`
+* `/channels/sync` 응답 구조 정상
+
+라우터 테스트는 repository 테스트보다 우선순위가 낮지만, 상태 전이 계약을 API 레벨에서 확인하는 의미가 큽니다.
+
+---
+
+# 제가 추천하는 실제 마감 기준
+
+STEP 1을 “100% 종결”로 보려면 아래가 충족돼야 합니다.
+
+## 필수
+
+* `infra/telegram/schemas.py` 존재
+* `infra/telegram/translators.py` 존재
+* `repository.py`에 upsert/checkpoint 규약 고정
+* `collector_worker.py`에 공통 persistence 래퍼 존재
+* `startup_tasks.py`에 backfill 진입 함수 시그니처 존재
+* `client.py`에 이벤트 등록 메서드 시그니처 존재
+* `pytest`로 repository 핵심 규약 자동 검증
+
+## 있으면 좋음
+
+* route 테스트
+* 에러 케이스 테스트
+* 로그 호출 mock 검증
+
+---
+
+# 결론
+
+제 답은 명확합니다.
+
+* `schemas.py`는 **지금 위치(`src/infra/telegram/schemas.py`) 유지**
+* 지금은 **구조 변경보다 4순위/5순위를 바로 진행**
+* 특히 **repository pytest**와 **worker 공통 래퍼**를 먼저 완성
+
+즉, 지금 질문에 대한 제 선택은:
+
+**“네, 바로 진행해서 STEP 1을 100% 종결짓는 것이 맞습니다.”**
+
+우선순위를 한 줄로 압축하면 이렇습니다.
+
+**1) `persist_message_*` 공통 래퍼 정리 → 2) `test_repository.py` 작성 → 3) `test_telegram_routes.py` 작성**
+
+그 순서가 가장 좋습니다.

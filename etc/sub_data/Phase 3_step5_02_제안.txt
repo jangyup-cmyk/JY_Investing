@@ -1,0 +1,328 @@
+좋습니다. 실제 파일 기준으로 바로 반영할 수 있게 **`models.py` 수정 diff**, **`analysis_job_service.py` 최종본**, 그리고 **`collector_worker.py` 1줄 수정**까지 한 번에 드리겠습니다.
+
+현재 코드에서 바로 손봐야 할 핵심은 세 가지입니다. `models.py`는 `session.py`와 다른 `Base`를 자체 선언하고 있고, `TelegramMessage.normalized`는 one-to-one인데 실제 스키마는 `(telegram_message_id, message_version_id, cleaning_version)` 유니크라 one-to-many가 맞습니다. 또 `NormalizedTelegramMessage.features`는 `back_populates="normalized_message"`를 쓰는데 `TelegramMessageFeature` 쪽 대응 relationship이 빠져 있습니다. `collector_worker.py`는 이미 공통 persist 지점에서 version 생성과 normalize job enqueue를 하고 있지만, 백필 우선순위를 더 높게 주는 숫자 방향이 반대로 들어가 있습니다. `session.py`는 `AsyncSessionLocal()` alias와 `session_scope()`를 이미 제공하고 있으므로, 워커/서비스는 그 구조를 그대로 쓰면 됩니다.    
+
+## 1) `models.py` 수정 diff
+
+아래 diff만 먼저 반영하시면 됩니다.
+
+```diff
+--- a/src/infra/db/models.py
++++ b/src/infra/db/models.py
+@@
+-import enum
+-from datetime import date, datetime, timezone
+-from typing import Annotated, Literal
++import enum
++from datetime import date, datetime, timezone
++from typing import Annotated, Literal
+@@
+-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
++from sqlalchemy.orm import Mapped, mapped_column, relationship
++from src.infra.db.base import Base
+@@
+-class Base(DeclarativeBase):
+-    pass
+-
+-
+ # ── 1. telegram_accounts ─────────────────────────────────────
+@@
+-    normalized: Mapped["NormalizedTelegramMessage | None"] = relationship(
+-        "NormalizedTelegramMessage", back_populates="source_message", uselist=False, cascade="all, delete-orphan"
+-    )
++    normalized_messages: Mapped[list["NormalizedTelegramMessage"]] = relationship(
++        "NormalizedTelegramMessage",
++        back_populates="source_message",
++        cascade="all, delete-orphan",
++    )
+@@
+-    source_message: Mapped["TelegramMessage"] = relationship("TelegramMessage", back_populates="normalized")
++    source_message: Mapped["TelegramMessage"] = relationship(
++        "TelegramMessage",
++        back_populates="normalized_messages",
++    )
+@@
+ class TelegramMessageFeature(Base):
+@@
+     source_message: Mapped["TelegramMessage"] = relationship(
+         "TelegramMessage", back_populates="features"
+     )
++    normalized_message: Mapped["NormalizedTelegramMessage | None"] = relationship(
++        "NormalizedTelegramMessage",
++        back_populates="features",
++    )
++    message_version: Mapped["MessageVersion | None"] = relationship("MessageVersion")
+```
+
+이 수정이 필요한 이유는 분명합니다. `session.py`는 `src.infra.db.base.Base`를 기준으로 `create_all()`을 수행하는데, 현재 `models.py`는 내부에서 다시 `Base(DeclarativeBase)`를 선언하고 있습니다. 이 둘이 다르면 metadata 등록이 어긋날 수 있습니다. 또한 `TelegramMessage`는 현재 `normalized`를 `uselist=False`로 두고 있지만, `NormalizedTelegramMessage`는 `telegram_message_id`, `message_version_id`, `cleaning_version` 조합으로 여러 행을 허용하는 구조라 one-to-many가 맞습니다. 마지막으로 `NormalizedTelegramMessage.features`는 `back_populates="normalized_message"`를 기대하는데 반대편 정의가 없어 mapper 충돌 가능성이 있습니다.  
+
+`normalized` 관계명을 바꾸면 기존 코드에서 이 이름을 쓰는 곳도 같이 바꿔야 합니다. 지금 업로드한 파일 기준으로는 워커 쪽이 `normalized_message_id`로 직접 접근하고 있어서 영향이 제한적이지만, 혹시 API나 조회 코드에서 `message.normalized`를 쓰고 있으면 `message.normalized_messages`로 바꿔야 합니다. 
+
+## 2) `analysis_job_service.py` 최종본
+
+이 파일은 새로 만들거나, 기존 파일이 있다면 아래 내용으로 덮어써도 됩니다. 핵심은 실제 `AnalysisJob` 스키마에 맞춰 `telegram_message_id`, `message_version_id`를 받고, enum은 `.value` 기준 문자열로 저장/비교하는 것입니다. 실제 모델의 `job_type`, `target_type`, `status` 컬럼이 `String(...)`이기 때문에 이 방식이 가장 안전합니다. 
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.infra.db.models import AnalysisJob, JobStatus, JobTargetType, JobType
+
+UTC = timezone.utc
+
+
+def _enum_value(value):
+    return value.value if hasattr(value, "value") else value
+
+
+class AnalysisJobService:
+    @staticmethod
+    async def enqueue_job(
+        session: AsyncSession,
+        *,
+        job_type: JobType | str,
+        target_type: JobTargetType | str,
+        target_id: int,
+        idempotency_key: str,
+        telegram_message_id: int | None = None,
+        message_version_id: int | None = None,
+        payload_json: dict | None = None,
+        priority: int = 100,
+        max_attempts: int = 3,
+    ) -> AnalysisJob:
+        job_type_value = _enum_value(job_type)
+        target_type_value = _enum_value(target_type)
+
+        existing = await session.scalar(
+            select(AnalysisJob).where(
+                AnalysisJob.job_type == job_type_value,
+                AnalysisJob.idempotency_key == idempotency_key,
+            )
+        )
+        if existing:
+            return existing
+
+        job = AnalysisJob(
+            telegram_message_id=telegram_message_id,
+            message_version_id=message_version_id,
+            job_type=job_type_value,
+            target_type=target_type_value,
+            target_id=target_id,
+            status=JobStatus.PENDING.value,
+            priority=priority,
+            attempt_count=0,
+            max_attempts=max_attempts,
+            scheduled_at=datetime.now(UTC),
+            started_at=None,
+            finished_at=None,
+            worker_name=None,
+            lease_expires_at=None,
+            last_heartbeat_at=None,
+            idempotency_key=idempotency_key,
+            payload_json=payload_json or {},
+            error_code=None,
+            error_message=None,
+        )
+        session.add(job)
+
+        try:
+            await session.flush()
+            return job
+        except IntegrityError:
+            await session.rollback()
+            existing = await session.scalar(
+                select(AnalysisJob).where(
+                    AnalysisJob.job_type == job_type_value,
+                    AnalysisJob.idempotency_key == idempotency_key,
+                )
+            )
+            if existing is None:
+                raise
+            return existing
+
+    @staticmethod
+    async def claim_next_job(
+        session: AsyncSession,
+        *,
+        worker_name: str,
+        allowed_job_types: list[JobType | str],
+        lease_seconds: int = 300,
+    ) -> Optional[AnalysisJob]:
+        now = datetime.now(UTC)
+        allowed_values = [_enum_value(v) for v in allowed_job_types]
+
+        stmt = (
+            select(AnalysisJob)
+            .where(AnalysisJob.job_type.in_(allowed_values))
+            .where(AnalysisJob.scheduled_at <= now)
+            .order_by(
+                AnalysisJob.priority.asc(),
+                AnalysisJob.scheduled_at.asc(),
+                AnalysisJob.id.asc(),
+            )
+        )
+
+        candidates = list(await session.scalars(stmt))
+        for candidate in candidates:
+            if candidate.status == JobStatus.PENDING.value:
+                result = await session.execute(
+                    update(AnalysisJob)
+                    .where(
+                        AnalysisJob.id == candidate.id,
+                        AnalysisJob.status == JobStatus.PENDING.value,
+                    )
+                    .values(
+                        status=JobStatus.RUNNING.value,
+                        worker_name=worker_name,
+                        started_at=candidate.started_at or now,
+                        last_heartbeat_at=now,
+                        lease_expires_at=now + timedelta(seconds=lease_seconds),
+                        attempt_count=candidate.attempt_count + 1,
+                    )
+                )
+            elif (
+                candidate.status == JobStatus.RUNNING.value
+                and candidate.lease_expires_at is not None
+                and candidate.lease_expires_at <= now
+            ):
+                result = await session.execute(
+                    update(AnalysisJob)
+                    .where(
+                        AnalysisJob.id == candidate.id,
+                        AnalysisJob.status == JobStatus.RUNNING.value,
+                        AnalysisJob.lease_expires_at == candidate.lease_expires_at,
+                    )
+                    .values(
+                        status=JobStatus.RUNNING.value,
+                        worker_name=worker_name,
+                        started_at=candidate.started_at or now,
+                        last_heartbeat_at=now,
+                        lease_expires_at=now + timedelta(seconds=lease_seconds),
+                        attempt_count=candidate.attempt_count + 1,
+                    )
+                )
+            else:
+                continue
+
+            if result.rowcount == 1:
+                await session.commit()
+                return await session.get(AnalysisJob, candidate.id)
+
+            await session.rollback()
+
+        return None
+
+    @staticmethod
+    async def heartbeat(
+        session: AsyncSession,
+        *,
+        job_id: int,
+        lease_seconds: int = 300,
+    ) -> None:
+        now = datetime.now(UTC)
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                last_heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+        )
+        await session.commit()
+
+    @staticmethod
+    async def mark_done(
+        session: AsyncSession,
+        *,
+        job_id: int,
+    ) -> None:
+        now = datetime.now(UTC)
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                status=JobStatus.DONE.value,
+                finished_at=now,
+                lease_expires_at=None,
+                last_heartbeat_at=now,
+                error_code=None,
+                error_message=None,
+            )
+        )
+        await session.commit()
+
+    @staticmethod
+    async def mark_failed(
+        session: AsyncSession,
+        *,
+        job_id: int,
+        error_code: str,
+        error_message: str,
+        retry_delay_seconds: int = 30,
+    ) -> None:
+        now = datetime.now(UTC)
+        job = await session.get(AnalysisJob, job_id)
+        if job is None:
+            return
+
+        terminal = job.attempt_count >= job.max_attempts
+        next_status = JobStatus.DEAD_LETTER.value if terminal else JobStatus.PENDING.value
+
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                status=next_status,
+                error_code=error_code,
+                error_message=(error_message or "")[:4000],
+                finished_at=now if terminal else None,
+                scheduled_at=job.scheduled_at if terminal else now + timedelta(seconds=retry_delay_seconds),
+                lease_expires_at=None,
+                last_heartbeat_at=now,
+            )
+        )
+        await session.commit()
+```
+
+이 서비스 구현은 현재 `collector_worker.py`가 이미 `telegram_message_id=message.id`와 `message_version_id=version.id`를 넘기고 있다는 점에 맞춘 것입니다. 또 `claim_next_job()`은 `priority ASC, scheduled_at ASC`로 가져오므로 숫자가 작을수록 먼저 처리됩니다. 이건 아래 priority 수정과 직접 연결됩니다. 
+
+## 3) `collector_worker.py` 우선순위 1줄 수정
+
+여기만 바꾸면 됩니다.
+
+```diff
+--- a/src/workers/collector_worker.py
++++ b/src/workers/collector_worker.py
+@@
+-            priority=1 if is_backfill else 100,
++            priority=100 if is_backfill else 1,
+```
+
+지금 코드에서는 백필이 `1`, 실시간이 `100`인데, 서비스는 priority 오름차순으로 job을 가져오므로 백필이 실시간보다 먼저 처리됩니다. 실시간을 우선하려면 이 숫자를 뒤집는 것이 맞습니다. 현재 `collector_worker.py`가 `is_backfill` 플래그로 이미 분기하고 있으니 수정은 이 1줄이면 충분합니다. 
+
+## 4) 같이 확인할 점
+
+`session.py`는 이미 `AsyncSessionLocal()` alias와 `session_scope()`를 제공하고 있어서, 워커/서비스 코드는 지금 구조를 그대로 써도 됩니다. 별도 세션 팩토리 이름을 다시 만들 필요는 없습니다. 
+
+`startup_tasks.py`는 `persist_func`를 받아 배치 버퍼를 `session_scope()` 안에서 저장하는 구조라서 수정하지 않는 편이 맞습니다. 지금 `collector_worker.py`가 `persist_message(..., is_backfill=True)`를 주입하고 있으므로, 백필도 실시간과 같은 공통 persist 경로를 타게 됩니다. 이 구조는 유지하는 게 좋습니다.
+
+## 5) 적용 순서
+
+먼저 `models.py`를 고친 뒤, `analysis_job_service.py`를 넣고, 마지막으로 `collector_worker.py` priority 1줄을 바꾸는 순서가 안전합니다. 그 다음 테스트는 아래 순서로 돌리면 됩니다.
+
+```bash
+python -m pytest tests/services/test_analysis_job_service.py -vv
+python -m pytest tests/workers/test_collector_persist.py -vv
+python -m pytest tests/workers/test_preprocess_worker.py -vv
+python -m pytest tests/workers/test_inference_worker.py -vv
+```
+
+이 순서가 좋은 이유는 수집 공통 persist와 job 상태 전이가 먼저 맞아야 preprocess/inference 테스트가 의미를 가지기 때문입니다. 현재 구조도 그 흐름에 맞게 설계돼 있습니다.
+
+원하시면 다음으로 **`preprocess_worker.py`와 `inference_worker.py`를 지금 실제 모델명(`TelegramMessage`, `NormalizedTelegramMessage`, `TelegramMessageFeature`) 기준으로 완전히 치환한 최종본**까지 이어서 드리겠습니다.

@@ -1,0 +1,156 @@
+두 테스트 파일 모두 **STEP 1 안전망으로는 의미가 있습니다.**
+특히 repository 쪽은 `created / unchanged / updated / is_deleted / checkpoint 역행 방지`를 이미 자동 검증하고 있고, routes 쪽도 토글 상태 전이와 sync 응답의 기본 성공 경로를 잡아둔 점이 좋습니다.  
+
+다만 **“통과한다”와 “규약을 강하게 잠갔다”는 다릅니다.**
+현재 테스트는 골격은 좋지만, 몇 군데는 더 보강해야 Phase 2 들어가도 안 흔들립니다.
+
+## 1. `test_repository.py` 평가
+
+### 좋은 점
+
+* 신규 메시지 저장과 동일 메시지 재입력 시 `unchanged`를 검증합니다. 
+* 편집 메시지와 삭제 플래그 반영을 검증합니다. 
+* 체크포인트가 증가하고, 더 작은 메시지 ID로 역행하지 않는 것을 검증합니다. 
+
+이건 STEP 1 핵심 중 꽤 중요한 부분입니다.
+
+### 아쉬운 점
+
+가장 큰 건 **결과값만 보고 실제 DB 내용을 충분히 확인하지 않는다는 점**입니다.
+
+예를 들어 지금 테스트는:
+
+* `result.action == "updated"`는 보지만
+* 실제 DB에 저장된 `message_text_raw`, `edited_at`, `is_deleted`, `views`, `forwards`가 기대값으로 바뀌었는지는 확인하지 않습니다. 
+
+그래서 repository 내부에서 결과 문자열만 맞게 반환하고, 실제 저장이 덜 반영돼도 테스트가 통과할 수 있습니다.
+
+### 꼭 추가하면 좋은 것
+
+다음 4개는 바로 넣는 걸 권합니다.
+
+1. **실제 DB row 검증**
+
+   * `select(TelegramMessage)`로 읽어서
+   * `message_text_raw == "Beta"`
+   * `edited_at` 반영
+   * `is_deleted is True`
+   * `views`, `forwards`, `reply_to_message_id`, `sender_id`, `grouped_id`까지 검증
+
+2. **checkpoint 미갱신 테스트**
+
+   * upsert가 실패했을 때 checkpoint가 바뀌지 않는지
+     이건 지금 파일에는 없습니다. 
+
+3. **메타데이터 보강 테스트**
+
+   * 최초 저장은 `reply_to_message_id=None`
+   * 두 번째 저장에서 `reply_to_message_id=55`
+   * 결과가 `updated`이고 DB에 55가 박히는지
+     이런 케이스가 있어야 제가 앞서 지적한 “본문 수정은 되는데 메타데이터 보강이 안 되는 문제”를 잡을 수 있습니다.
+
+4. **`raw_payload_json` 타입 일관성 테스트**
+
+   * 지금 테스트는 `{"test": 1}` 같은 dict와 `None`을 넣고 있습니다. 
+   * 그런데 필드명이 `raw_payload_json`이면 문자열 JSON인지, dict 허용인지 계약이 모호해집니다.
+   * translator를 JSON 문자열로 고칠 생각이면 테스트도 문자열 기준으로 맞추는 편이 낫습니다.
+
+### 한 줄 평
+
+`test_repository.py`는 **좋은 출발점**이지만, 아직은 “반환 액션 테스트” 비중이 크고 “실제 영속 상태 테스트”는 약합니다.
+
+---
+
+## 2. `test_telegram_routes.py` 평가
+
+### 좋은 점
+
+* `/toggle` 호출 후 `PENDING_BACKFILL`, `PAUSED` 상태가 DB에 반영되는지 검증합니다. 
+* 테스트용 DB override를 써서 앱 라우터를 실제로 태우는 방식도 좋습니다. 
+* `/sync`는 collector를 patch해서 외부 의존성을 끊은 점이 좋습니다. 
+
+### 가장 큰 아쉬운 점
+
+현재 route 테스트는 **현행 구현을 따라가는 테스트**라서, 오히려 앞으로의 개선을 막을 수 있습니다.
+
+왜냐하면 지금 `/toggle` 테스트가 **body 없는 “반전(toggle)” 방식**을 전제로 하고 있기 때문입니다. 
+그런데 제가 권한 방향은 `enabled: true/false`를 받는 **idempotent API**입니다.
+
+즉 지금 테스트는
+
+* 현재 구현 검증에는 맞지만
+* 더 안전한 API로 리팩토링할 때는 같이 깨질 가능성이 큽니다
+
+### 꼭 추가하면 좋은 것
+
+1. **404 테스트**
+
+   * 존재하지 않는 채널 ID toggle 시 404
+
+2. **state row 자동 생성 테스트**
+
+   * toggle 시 `TelegramChannelCollectionState`가 없으면 생성되는지
+     지금은 결과적으로 state를 읽고 있지만, “없던 상태 레코드가 생성됐는지”를 명시적으로 보지는 않습니다. 
+
+3. **`/sync`의 DB side effect 검증**
+   현재는 응답 문자열에 `"신규 채널 추가"`가 포함되는지만 봅니다. 
+   하지만 진짜 중요한 건:
+
+   * 새 채널 row가 생겼는지
+   * state row도 같이 생겼는지
+   * `status == SYNCED`인지
+     이런 DB 결과입니다.
+
+4. **실패 경로 테스트**
+
+   * collector 예외 발생 시 적절한 실패 응답/로그 상태가 남는지
+
+5. **idempotent 방향으로 바꿀 준비**
+   `/toggle`을 유지하더라도 나중에는:
+
+   ```json
+   {"enabled": true}
+   ```
+
+   기준 테스트로 바꾸는 게 더 좋습니다.
+
+### 한 줄 평
+
+`test_telegram_routes.py`는 **기본 성공 경로 smoke test**로는 좋지만, 아직은 “API 규약 잠금” 수준까지는 아닙니다.
+
+---
+
+## 3. 지금 당장 우선순위로 보강할 테스트
+
+제가 하나만 골라서 우선순위를 주면 이렇습니다.
+
+### 최우선
+
+`test_repository.py`에 아래 3개 추가
+
+* 실제 DB row 값 검증
+* 메타데이터 보강 update 검증
+* failed 시 checkpoint 미갱신 검증
+
+### 다음
+
+`test_telegram_routes.py`에 아래 2개 추가
+
+* `/sync` 후 실제 DB row 생성 검증
+* 없는 채널 toggle 404 검증
+
+이 다섯 개만 더 들어가도 테스트 신뢰도가 많이 올라갑니다.
+
+---
+
+## 4. 총평
+
+현재 테스트 상태는 이렇게 보시면 됩니다.
+
+* **장점**: 핵심 골격은 이미 잘 잠갔음
+* **한계**: 결과 문자열/상태값 위주라서, 실제 DB 영속 결과와 실패 경로 검증이 약함
+* **판정**: STEP 1 테스트로는 충분히 의미 있지만, **Phase 2 안정망으로는 20~30% 정도 더 보강 필요**
+
+가장 중요한 건 이겁니다.
+지금 테스트는 “작동한다”를 보여주고 있고, 다음 보강은 “안 깨진다”를 보장하는 단계입니다.
+

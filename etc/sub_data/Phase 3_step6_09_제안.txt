@@ -1,0 +1,837 @@
+좋습니다.
+그럼 이번에는 바로 **현재 worker 루프 구조에 끼워 넣는 실제 연결 패치안**으로 이어가겠습니다.
+
+핵심은 세 가지입니다.
+
+1. **collector가 `persist_message()`만 호출하도록 바꾸는 법**
+2. **`claim_next_job()`를 실제 DB 세션 루프에 안전하게 붙이는 법**
+3. **현재 프로젝트 실행 구조에서 preprocess / inference / scheduler를 어떻게 연결할지**
+
+이 단계는 설계가 아니라 거의 **리팩터링 체크리스트 + 코드 연결 가이드**에 가깝습니다.
+
+---
+
+# 1. 지금 구조에서 먼저 끊어야 할 것
+
+현재 코드베이스에 아래 같은 흐름이 남아 있으면, 이번 구조에서는 분리해야 합니다.
+
+```python
+for message in telegram_messages:
+    save_message(...)
+    preprocess_message(...)
+    summarize_message(...)
+    save_result(...)
+```
+
+이 구조는 한 번에 보기엔 단순하지만 실제로는 문제가 많습니다.
+
+* 수집이 느려짐
+* AI 호출 실패가 수집까지 막음
+* 메시지 수정본 재처리가 꼬임
+* 중간 실패 시 어디까지 처리됐는지 추적이 어려움
+
+그래서 바뀐 구조는 아래처럼 고정하는 것이 맞습니다.
+
+```python
+for message in telegram_messages:
+    persist_message(...)
+```
+
+즉, collector는 **“저장 + 후속 job 예약”**까지만 담당합니다.
+
+---
+
+# 2. collector_worker 실제 연결 패턴
+
+이제 collector를 실제로 어떻게 바꿔 넣을지 보겠습니다.
+
+보통 collector 쪽에는 아래 요소가 있을 가능성이 높습니다.
+
+* 채널 목록 조회
+* Telegram client 연결
+* `iter_channel_messages(...)`
+* DB session 생성
+* 메시지 저장 호출
+
+이 안에서 **직접 전처리/추론 호출을 제거**하고, `MessagePersistenceService.persist_message()` 하나로 모으는 방식이 가장 자연스럽습니다.
+
+예시 패치 형태는 아래입니다.
+
+```python
+# src/workers/collector_worker.py
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class CollectorWorker:
+    def __init__(
+        self,
+        session_factory,
+        telegram_client,
+        channel_repository,
+        message_persistence_service,
+    ):
+        self.session_factory = session_factory
+        self.telegram_client = telegram_client
+        self.channel_repository = channel_repository
+        self.message_persistence_service = message_persistence_service
+
+    def collect_all_enabled_channels(self) -> None:
+        with self.session_factory() as session:
+            channels = self.channel_repository.get_collecting_channels(session)
+
+        for channel in channels:
+            self.collect_channel(channel)
+
+    def collect_channel(self, channel) -> None:
+        logger.info("start collecting channel_id=%s tg_channel_id=%s", channel.id, channel.tg_channel_id)
+
+        for telegram_message in self.telegram_client.iter_channel_messages(channel.tg_channel_id):
+            with self.session_factory() as session:
+                try:
+                    result = self.message_persistence_service.persist_message(
+                        session,
+                        channel_id=channel.id,
+                        telegram_message=telegram_message,
+                    )
+                    session.commit()
+
+                    logger.info(
+                        "persisted channel_id=%s tg_message_id=%s message_id=%s version_id=%s created=%s updated=%s skipped=%s",
+                        channel.id,
+                        telegram_message.id,
+                        result.message_id,
+                        result.message_version_id,
+                        result.created,
+                        result.updated,
+                        result.skipped_as_unchanged,
+                    )
+                except Exception:
+                    session.rollback()
+                    logger.exception(
+                        "failed to persist channel_id=%s tg_message_id=%s",
+                        channel.id,
+                        telegram_message.id,
+                    )
+```
+
+---
+
+# 3. collector에서 세션 범위를 왜 “메시지 1건당” 두는가
+
+이건 꽤 중요합니다.
+
+채널 하나를 통째로 한 세션으로 열어두는 방식도 가능하지만, 지금 구조에서는 **메시지 1건당 트랜잭션**이 더 안전합니다.
+
+이유는 간단합니다.
+
+### 장점
+
+* 한 메시지 실패가 다음 메시지까지 막지 않음
+* rollback 범위가 작음
+* DB lock 유지 시간이 짧음
+* 중간 장애 시 재시작이 쉬움
+
+즉, 아래 단위가 가장 안정적입니다.
+
+* Telegram에서 메시지 1건 읽음
+* `persist_message()` 수행
+* commit
+* 다음 메시지
+
+이렇게 가면 운영 중 장애가 나도 손실 범위가 작습니다.
+
+---
+
+# 4. `persist_message()` 내부 트랜잭션 경계
+
+앞서 초안을 드렸지만, 실제 적용 시 더 중요하게 봐야 할 것은
+**어디까지가 하나의 원자적 작업인가**입니다.
+
+`persist_message()` 안에서는 아래 3개가 한 묶음이어야 합니다.
+
+1. `messages` insert/update
+2. `message_versions` insert
+3. `NORMALIZE` job enqueue
+
+즉, 이 셋은 **같이 commit 되거나 같이 rollback** 되어야 합니다.
+
+그래서 collector에서 `persist_message()` 호출 뒤 바로 `session.commit()`을 하는 구조가 자연스럽습니다.
+
+절대 아래처럼 중간 commit을 쪼개면 안 됩니다.
+
+```python
+save_message()
+commit()
+
+save_version()
+commit()
+
+enqueue_job()
+commit()
+```
+
+이렇게 하면 중간 상태가 남아 파이프라인이 쉽게 깨집니다.
+
+---
+
+# 5. claim_next_job를 현재 worker 루프에 붙이는 방식
+
+이제 preprocess / inference worker 쪽입니다.
+
+여기서 핵심은 기존에 많이 쓰는 “미처리 메시지 목록 조회” 방식을 버리고,
+**job claim 방식**으로 완전히 바꾸는 것입니다.
+
+기존 형태가 아마 이런 느낌일 수 있습니다.
+
+```python
+messages = repo.get_unprocessed_messages(limit=100)
+for message in messages:
+    process(message)
+```
+
+이걸 아래로 바꿔야 합니다.
+
+```python
+job = job_service.claim_next_job(...)
+
+if job:
+    process(job)
+```
+
+이 변화가 중요한 이유는:
+
+* 중복 처리 방지
+* retry 관리 가능
+* stuck 복구 가능
+* 단계별 큐 적체 확인 가능
+
+때문입니다.
+
+---
+
+# 6. preprocess_worker 실제 연결 패턴
+
+preprocess worker는 아래 순서만 지키면 됩니다.
+
+1. `NORMALIZE` job claim
+2. 없으면 sleep
+3. 있으면 `PreprocessService.run_normalize_job(job)` 호출
+4. 성공 시 `SUCCEEDED`
+5. 실패 시 `RETRY_WAIT` 또는 `FAILED`
+
+아래 구조면 충분합니다.
+
+```python
+# src/workers/preprocess_worker.py
+from __future__ import annotations
+
+import logging
+import socket
+import time
+
+from src.domain.constants import JobType
+
+logger = logging.getLogger(__name__)
+
+
+class PreprocessWorker:
+    def __init__(
+        self,
+        session_factory,
+        job_service,
+        preprocess_service,
+        poll_interval: float = 1.0,
+    ):
+        self.session_factory = session_factory
+        self.job_service = job_service
+        self.preprocess_service = preprocess_service
+        self.poll_interval = poll_interval
+        self.worker_id = f"preprocess:{socket.gethostname()}"
+
+    def run_forever(self) -> None:
+        while True:
+            processed = self.run_once()
+            if not processed:
+                time.sleep(self.poll_interval)
+
+    def run_once(self) -> bool:
+        with self.session_factory() as session:
+            job = self.job_service.claim_next_job(
+                session,
+                job_type=JobType.NORMALIZE.value,
+                worker_id=self.worker_id,
+            )
+
+            if job is None:
+                session.commit()
+                return False
+
+            try:
+                preprocess_result_id = self.preprocess_service.run_normalize_job(
+                    session,
+                    job=job,
+                )
+                self.job_service.mark_job_succeeded(session, job=job)
+                session.commit()
+
+                logger.info(
+                    "normalize succeeded job_id=%s preprocess_result_id=%s",
+                    job.id,
+                    preprocess_result_id,
+                )
+                return True
+
+            except Exception as exc:
+                session.rollback()
+
+        with self.session_factory() as session:
+            job = self.job_service.job_repository.get_by_id(session, job.id)
+            if job is None:
+                logger.exception("normalize failed and job vanished job_id=%s", job.id)
+                return True
+
+            self.job_service.mark_job_failed(
+                session,
+                job=job,
+                error_code="NORMALIZE_ERROR",
+                error_message=str(exc),
+                retryable=True,
+            )
+            session.commit()
+
+            logger.exception("normalize failed job_id=%s", job.id)
+            return True
+```
+
+---
+
+# 7. worker 실패 처리에서 rollback 후 재조회가 필요한 이유
+
+이 부분은 실무적으로 꽤 중요합니다.
+
+단순히 예외가 났다고 같은 세션에서 계속 `mark_job_failed()`를 하면,
+이미 세션이 invalid state가 된 경우가 있습니다.
+
+그래서 더 안전한 패턴은:
+
+1. 예외 발생
+2. 기존 세션 rollback
+3. 새 세션 열기
+4. job 재조회
+5. 실패 상태 기록
+6. commit
+
+입니다.
+
+특히 DB 예외나 flush 예외가 섞이면 이 방식이 더 튼튼합니다.
+
+초기엔 단순 구현으로 가도 되지만, 운영 안정성 기준으로는 이 방식이 더 낫습니다.
+
+---
+
+# 8. inference_worker도 같은 패턴으로 맞추기
+
+InferenceWorker도 구조는 동일합니다.
+
+차이는 job type만 다릅니다.
+
+* preprocess worker → `NORMALIZE`
+* inference worker → `SINGLE_MESSAGE_SUMMARY`
+
+예시:
+
+```python
+# src/workers/inference_worker.py
+from __future__ import annotations
+
+import logging
+import socket
+import time
+
+from src.domain.constants import JobType
+
+logger = logging.getLogger(__name__)
+
+
+class InferenceWorker:
+    def __init__(
+        self,
+        session_factory,
+        job_service,
+        inference_service,
+        poll_interval: float = 1.0,
+    ):
+        self.session_factory = session_factory
+        self.job_service = job_service
+        self.inference_service = inference_service
+        self.poll_interval = poll_interval
+        self.worker_id = f"inference:{socket.gethostname()}"
+
+    def run_forever(self) -> None:
+        while True:
+            processed = self.run_once()
+            if not processed:
+                time.sleep(self.poll_interval)
+
+    def run_once(self) -> bool:
+        with self.session_factory() as session:
+            job = self.job_service.claim_next_job(
+                session,
+                job_type=JobType.SINGLE_MESSAGE_SUMMARY.value,
+                worker_id=self.worker_id,
+            )
+
+            if job is None:
+                session.commit()
+                return False
+
+            try:
+                inference_result_id = self.inference_service.run_single_message_summary_job(
+                    session,
+                    job=job,
+                )
+                self.job_service.mark_job_succeeded(session, job=job)
+                session.commit()
+
+                logger.info(
+                    "inference succeeded job_id=%s inference_result_id=%s",
+                    job.id,
+                    inference_result_id,
+                )
+                return True
+
+            except Exception as exc:
+                session.rollback()
+
+        with self.session_factory() as session:
+            job = self.job_service.job_repository.get_by_id(session, job.id)
+            if job is None:
+                logger.exception("inference failed and job vanished job_id=%s", job.id)
+                return True
+
+            self.job_service.mark_job_failed(
+                session,
+                job=job,
+                error_code="INFERENCE_ERROR",
+                error_message=str(exc),
+                retryable=True,
+            )
+            session.commit()
+
+            logger.exception("inference failed job_id=%s", job.id)
+            return True
+```
+
+---
+
+# 9. SchedulerWorker는 완전히 별도 성격이다
+
+SchedulerWorker는 다른 워커와 달리 큐를 소비하는 게 아니라,
+**멈춘 job을 다시 살리는 역할**입니다.
+
+그래서 이 워커는 아래 주기로 도는 것이 맞습니다.
+
+* preprocess / inference: 자주 polling
+* scheduler: 상대적으로 느리게 polling
+
+예:
+
+* preprocess / inference: 1초
+* scheduler: 30초 ~ 60초
+
+예시:
+
+```python
+# src/workers/scheduler_worker.py
+from __future__ import annotations
+
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class SchedulerWorker:
+    def __init__(
+        self,
+        session_factory,
+        scheduler_service,
+        poll_interval: float = 30.0,
+    ):
+        self.session_factory = session_factory
+        self.scheduler_service = scheduler_service
+        self.poll_interval = poll_interval
+
+    def run_forever(self) -> None:
+        while True:
+            self.run_once()
+            time.sleep(self.poll_interval)
+
+    def run_once(self):
+        with self.session_factory() as session:
+            stats = self.scheduler_service.recover_stuck_jobs(
+                session,
+                timeout_minutes=10,
+            )
+            session.commit()
+
+            logger.info(
+                "scheduler recovered=%s failed=%s",
+                stats.recovered_count,
+                stats.failed_count,
+            )
+            return stats
+```
+
+---
+
+# 10. `claim_next_job()` 실제 DB별 주의사항
+
+이제 중요한 기술 포인트입니다.
+
+`claim_next_job()`는 DB 엔진에 따라 세부 구현 차이가 있습니다.
+
+## PostgreSQL / MySQL 8+
+
+가장 좋은 방식은:
+
+* `SELECT ... FOR UPDATE SKIP LOCKED`
+
+입니다.
+
+이 방식이면 여러 워커가 동시에 돌아도 같은 row를 중복 claim할 가능성이 크게 줄어듭니다.
+
+예시 개념:
+
+```python
+stmt = (
+    select(AnalysisJob)
+    .where(
+        AnalysisJob.job_type == job_type,
+        AnalysisJob.status.in_(["PENDING", "RETRY_WAIT"]),
+        AnalysisJob.available_at <= now,
+    )
+    .order_by(AnalysisJob.priority.asc(), AnalysisJob.id.asc())
+    .with_for_update(skip_locked=True)
+    .limit(1)
+)
+```
+
+## SQLite
+
+SQLite는 `FOR UPDATE SKIP LOCKED`를 제대로 지원하지 않습니다.
+그래서 SQLite를 테스트용으로만 쓰는 경우에는 아래를 감안해야 합니다.
+
+* 멀티워커 실환경 검증은 부적합
+* 단일 워커 테스트 정도에만 사용
+* 운영 DB는 PostgreSQL/MySQL 계열 권장
+
+즉, 로컬 테스트가 SQLite라도, 운영 환경이 멀티워커면
+**실제 claim 충돌 방지는 운영 DB에서 검증**해야 합니다.
+
+---
+
+# 11. `AnalysisJobRepository.claim_next_job()` 실전 보강안
+
+앞서 드린 초안에 실제 운영 관점에서 보강하면 아래 정도가 좋습니다.
+
+```python
+def claim_next_job(self, session, *, job_type: str, worker_id: str, now: datetime):
+    stmt = (
+        select(AnalysisJob)
+        .where(
+            AnalysisJob.job_type == job_type,
+            AnalysisJob.status.in_(
+                [JobStatus.PENDING.value, JobStatus.RETRY_WAIT.value]
+            ),
+            AnalysisJob.available_at <= now,
+        )
+        .order_by(AnalysisJob.priority.asc(), AnalysisJob.id.asc())
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+
+    job = session.execute(stmt).scalars().first()
+    if job is None:
+        return None
+
+    job.status = JobStatus.IN_PROGRESS.value
+    job.claimed_at = now
+    job.heartbeat_at = now
+    job.worker_id = worker_id
+    job.error_code = None
+    job.error_message = None
+    job.updated_at = now
+    session.flush()
+    return job
+```
+
+여기서 `error_code`, `error_message`를 claim 시점에 초기화해 두는 것이 좋습니다.
+이전 retry 정보가 남아 있어도 현재 시도 기준 상태를 명확히 볼 수 있기 때문입니다.
+
+---
+
+# 12. heartbeat는 당장 꼭 필요하지는 않지만 구조는 열어둬야 함
+
+현재 단계에서는 preprocess / inference job이 비교적 짧게 끝날 가능성이 크므로,
+heartbeat 갱신을 당장 자주 넣지 않아도 될 수 있습니다.
+
+그래도 구조상 아래는 열어두는 것이 좋습니다.
+
+* `claimed_at`
+* `heartbeat_at`
+* `touch_heartbeat(job_id)`
+
+나중에 job이 길어지면, 예를 들어 AI 호출이 길거나 배치 작업이 커지면:
+
+* job 시작 시 `claimed_at`
+* 처리 중간중간 `heartbeat_at` 갱신
+
+으로 바꿀 수 있습니다.
+
+즉, 지금은 없어도 되지만 **컬럼과 메서드는 미리 있어야 확장하기 쉽습니다.**
+
+---
+
+# 13. bootstrap / container 실제 연결 포인트
+
+이제 이 구조를 실제 실행 구조에 어떻게 묶을지 보겠습니다.
+
+`build_container()`에서 최소한 아래 객체를 조립해야 합니다.
+
+* `session_factory`
+* `message_repository`
+* `message_version_repository`
+* `analysis_job_repository`
+* `preprocess_result_repository`
+* `inference_result_repository`
+* `analysis_job_service`
+* `message_persistence_service`
+* `preprocess_service`
+* `inference_service`
+* `scheduler_service`
+* `collector_worker`
+* `preprocess_worker`
+* `inference_worker`
+* `scheduler_worker`
+
+예시:
+
+```python
+# src/bootstrap.py
+from src.repositories.message_repository import MessageRepository
+from src.repositories.message_version_repository import MessageVersionRepository
+from src.repositories.analysis_job_repository import AnalysisJobRepository
+from src.repositories.preprocess_result_repository import PreprocessResultRepository
+from src.repositories.inference_result_repository import InferenceResultRepository
+
+from src.services.analysis_job_service import AnalysisJobService
+from src.services.message_persistence_service import MessagePersistenceService
+from src.services.preprocess_service import PreprocessService
+from src.services.inference_service import InferenceService
+from src.services.scheduler_service import SchedulerService
+
+from src.workers.collector_worker import CollectorWorker
+from src.workers.preprocess_worker import PreprocessWorker
+from src.workers.inference_worker import InferenceWorker
+from src.workers.scheduler_worker import SchedulerWorker
+
+
+class Container:
+    def __init__(self, session_factory, telegram_client, channel_repository, model_client):
+        self.session_factory = session_factory
+        self.telegram_client = telegram_client
+        self.channel_repository = channel_repository
+        self.model_client = model_client
+
+        self.message_repository = MessageRepository()
+        self.message_version_repository = MessageVersionRepository()
+        self.analysis_job_repository = AnalysisJobRepository()
+        self.preprocess_result_repository = PreprocessResultRepository()
+        self.inference_result_repository = InferenceResultRepository()
+
+        self.analysis_job_service = AnalysisJobService(self.analysis_job_repository)
+
+        self.message_persistence_service = MessagePersistenceService(
+            message_repository=self.message_repository,
+            message_version_repository=self.message_version_repository,
+            analysis_job_service=self.analysis_job_service,
+        )
+
+        self.preprocess_service = PreprocessService(
+            message_version_repository=self.message_version_repository,
+            preprocess_result_repository=self.preprocess_result_repository,
+            job_service=self.analysis_job_service,
+        )
+
+        self.inference_service = InferenceService(
+            preprocess_result_repository=self.preprocess_result_repository,
+            inference_result_repository=self.inference_result_repository,
+            model_client=self.model_client,
+        )
+
+        self.scheduler_service = SchedulerService(
+            job_repository=self.analysis_job_repository,
+        )
+
+    def collector_worker(self):
+        return CollectorWorker(
+            session_factory=self.session_factory,
+            telegram_client=self.telegram_client,
+            channel_repository=self.channel_repository,
+            message_persistence_service=self.message_persistence_service,
+        )
+
+    def preprocess_worker(self):
+        return PreprocessWorker(
+            session_factory=self.session_factory,
+            job_service=self.analysis_job_service,
+            preprocess_service=self.preprocess_service,
+        )
+
+    def inference_worker(self):
+        return InferenceWorker(
+            session_factory=self.session_factory,
+            job_service=self.analysis_job_service,
+            inference_service=self.inference_service,
+        )
+
+    def scheduler_worker(self):
+        return SchedulerWorker(
+            session_factory=self.session_factory,
+            scheduler_service=self.scheduler_service,
+        )
+```
+
+---
+
+# 14. `run_worker.py` 실제 운영 패턴
+
+이제 실행 진입점은 이렇게 정리하는 것이 좋습니다.
+
+```python
+# src/run_worker.py
+from __future__ import annotations
+
+import argparse
+
+from src.bootstrap import build_container
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--worker",
+        required=True,
+        choices=["collector", "preprocess", "inference", "scheduler"],
+    )
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args()
+
+    container = build_container()
+
+    if args.worker == "collector":
+        worker = container.collector_worker()
+    elif args.worker == "preprocess":
+        worker = container.preprocess_worker()
+    elif args.worker == "inference":
+        worker = container.inference_worker()
+    else:
+        worker = container.scheduler_worker()
+
+    if args.once:
+        worker.run_once()
+    else:
+        worker.run_forever()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+주의할 점은 collector는 `run_once()` 의미를 따로 정해야 할 수 있다는 점입니다.
+예를 들면:
+
+* `run_once()` = 현재 수집 대상 채널 1회 순회
+* `run_forever()` = 주기적으로 반복 순회
+
+이 정의만 정해두면 됩니다.
+
+---
+
+# 15. 현재 코드에 적용할 때 가장 먼저 보는 diff 포인트
+
+실제 패치 순서로 보면 아래가 맞습니다.
+
+## 1단계
+
+`collector_worker.py`에서 직접 전처리/추론 호출 제거
+
+## 2단계
+
+`MessagePersistenceService.persist_message()` 연결
+
+## 3단계
+
+`analysis_jobs` 기반 `PreprocessWorker` 연결
+
+## 4단계
+
+`InferenceWorker` 연결
+
+## 5단계
+
+`SchedulerWorker` 연결
+
+## 6단계
+
+`run_worker.py` 통합 진입점 정리
+
+이 순서가 좋은 이유는 파이프라인을 **입구부터 출구까지** 순서대로 안정화할 수 있기 때문입니다.
+
+---
+
+# 16. 지금 단계에서 바로 확인할 통합 체크
+
+이제 실제로 돌리면 아래 흐름을 확인해야 합니다.
+
+### collector 실행 후
+
+* `messages` 증가
+* `message_versions` 증가
+* `analysis_jobs`에 `NORMALIZE` 생김
+
+### preprocess worker 실행 후
+
+* `NORMALIZE` → `SUCCEEDED`
+* `message_preprocess_results` 생성
+* `SINGLE_MESSAGE_SUMMARY` job 생성
+
+### inference worker 실행 후
+
+* summary job → `SUCCEEDED`
+* `message_inference_results` 생성
+
+### scheduler worker 실행 후
+
+* 오래된 `IN_PROGRESS` job이 `RETRY_WAIT` 또는 `FAILED`로 전환
+
+이 네 단계가 확인되면 구조는 거의 닫힌 것입니다.
+
+---
+
+# 17. 지금 가장 자연스러운 다음 작업
+
+이제 다음으로 가장 실전적인 단계는 두 가지 중 하나입니다.
+
+첫째, **`run_once()` 기준의 실제 통합 테스트 초안**을 쓰는 것입니다.
+즉, `persist_message → preprocess_worker.run_once() → inference_worker.run_once()`까지 한 번에 검증하는 흐름입니다.
+
+둘째, **Alembic migration 초안을 실제 SQLAlchemy 모델 정의와 1:1로 맞춰 정리**하는 것입니다.
+
+지금 흐름상은 다음 답변에서
+**“통합 테스트 시나리오 1~2개 + worker/run loop 연결 시 발생할 수 있는 오류와 방어 포인트”**를 이어서 정리하는 것이 가장 좋습니다.

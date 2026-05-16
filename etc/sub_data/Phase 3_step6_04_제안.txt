@@ -1,0 +1,920 @@
+좋습니다.
+그럼 바로 이어서 **Alembic migration 초안**, **worker별 적용 포인트**, **서비스 계층 책임 분리**, **테스트 연결 순서**까지 한 번에 정리하겠습니다.
+
+이 단계의 목적은 단순합니다.
+
+**설계 문서를 더 예쁘게 만드는 것**이 아니라,
+현재 코드베이스에 **어디를 어떻게 바꿔 넣어야 최종 흐름이 실제로 동작하는지**를 명확하게 만드는 것입니다.
+
+---
+
+# 1. 적용 목표를 다시 고정하면
+
+최종 목표 흐름은 아래입니다.
+
+**Telegram 수집 → persist_message() → 원문/버전 저장 → NORMALIZE job 생성 → PreprocessWorker → SINGLE_MESSAGE_SUMMARY job 생성 → InferenceWorker → 결과 저장 → SchedulerWorker가 stuck job 복구**
+
+즉, 코드 적용은 결국 아래 4개를 완성하는 작업입니다.
+
+1. **DB 구조 추가/변경**
+2. **`persist_message()` 기준 수집부 개편**
+3. **Preprocess / Inference / Scheduler 워커 연결**
+4. **최소 통합 테스트 확보**
+
+---
+
+# 2. Alembic migration 적용 순서
+
+실전에서는 migration을 한 번에 몰아넣기보다, **단계별 검증 가능한 단위**로 나누는 것이 좋습니다.
+
+권장 순서는 아래와 같습니다.
+
+---
+
+## 2-1. Migration 1: `message_versions`, `analysis_jobs`, `messages` 확장
+
+이 단계가 핵심입니다.
+파이프라인 구조의 뼈대를 세웁니다.
+
+### 이 migration에서 할 일
+
+### A. `messages` 테이블 컬럼 추가
+
+추가 추천 컬럼:
+
+* `latest_version_no`
+* `latest_version_id`
+* `status`
+* `edited_at`
+* `updated_at`
+
+이미 일부 비슷한 컬럼이 있으면 중복 없이 조정하면 됩니다.
+
+### B. `message_versions` 테이블 생성
+
+목적:
+
+* 원문 이력 저장
+* 수정 메시지 추적
+* 버전별 분석 기준 고정
+
+### C. `analysis_jobs` 테이블 생성
+
+목적:
+
+* NORMALIZE / SINGLE_MESSAGE_SUMMARY 작업 큐 관리
+* 상태 추적
+* retry / stuck 복구 지원
+
+### D. 유니크/인덱스 생성
+
+특히 중요:
+
+* `messages(channel_id, telegram_message_id)` 유니크
+* `message_versions(message_id, version_no)` 유니크
+* `analysis_jobs(job_type, message_version_id)` 유니크
+
+---
+
+## 2-2. Migration 2: `message_preprocess_results`
+
+이 단계부터 전처리 워커가 의미를 가집니다.
+
+### 생성 이유
+
+전처리 결과를 `messages`에 직접 덮어쓰지 않고 별도 보관해야:
+
+* 버전별 전처리 결과 추적 가능
+* 전처리 로직 변경 시 비교 가능
+* InferenceWorker 입력 기준 명확화
+
+---
+
+## 2-3. Migration 3: `message_inference_results`
+
+이 단계에서 추론 결과 저장 구조를 고정합니다.
+
+### 생성 이유
+
+AI 추론은 모델/프롬프트가 바뀔 수 있기 때문에,
+단순히 `messages.summary_text` 한 컬럼으로 끝내면 안 됩니다.
+
+남겨야 하는 기준:
+
+* 어느 message version 기준인지
+* 어느 preprocess 결과 기준인지
+* 어느 모델 / 프롬프트 기준인지
+
+---
+
+## 2-4. Migration 4: 성능용 인덱스, nullable 정리, default 보정
+
+운영하다 보면 뒤늦게 필요한 항목입니다.
+
+예:
+
+* stuck recovery 조회 인덱스
+* pending job 조회 인덱스
+* `available_at` 기본값
+* `retry_count` / `max_retries` 기본값
+
+즉, 1~3차로 동작을 만든 뒤 4차에서 성능과 운영성을 다듬는 방식입니다.
+
+---
+
+# 3. Alembic migration 초안 개념
+
+아래는 “코드 그대로 복붙”보다는 **무엇이 들어가야 하는지**를 보는 초안입니다.
+
+---
+
+## 3-1. `messages` 확장 개념
+
+```python
+op.add_column("messages", sa.Column("latest_version_no", sa.Integer(), nullable=False, server_default="1"))
+op.add_column("messages", sa.Column("latest_version_id", sa.BigInteger(), nullable=True))
+op.add_column("messages", sa.Column("status", sa.String(length=30), nullable=False, server_default="ACTIVE"))
+op.add_column("messages", sa.Column("edited_at", sa.DateTime(), nullable=True))
+op.add_column("messages", sa.Column("updated_at", sa.DateTime(), nullable=False, server_default=sa.func.now()))
+```
+
+그리고 필요하면:
+
+```python
+op.create_unique_constraint(
+    "uq_messages_channel_tg_msg",
+    "messages",
+    ["channel_id", "telegram_message_id"],
+)
+```
+
+이미 유사 유니크가 있으면 그 구조를 유지하면서 이름만 정리하면 됩니다.
+
+---
+
+## 3-2. `message_versions` 생성 개념
+
+```python
+op.create_table(
+    "message_versions",
+    sa.Column("id", sa.BigInteger(), primary_key=True),
+    sa.Column("message_id", sa.BigInteger(), sa.ForeignKey("messages.id"), nullable=False),
+    sa.Column("version_no", sa.Integer(), nullable=False),
+    sa.Column("raw_text", sa.Text(), nullable=True),
+    sa.Column("edited_at", sa.DateTime(), nullable=True),
+    sa.Column("text_hash", sa.String(length=64), nullable=False),
+    sa.Column("change_type", sa.String(length=30), nullable=False, server_default="INITIAL"),
+    sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+)
+```
+
+제약조건:
+
+```python
+op.create_unique_constraint(
+    "uq_message_versions_message_version_no",
+    "message_versions",
+    ["message_id", "version_no"],
+)
+
+op.create_unique_constraint(
+    "uq_message_versions_message_text_hash",
+    "message_versions",
+    ["message_id", "text_hash"],
+)
+```
+
+---
+
+## 3-3. `analysis_jobs` 생성 개념
+
+```python
+op.create_table(
+    "analysis_jobs",
+    sa.Column("id", sa.BigInteger(), primary_key=True),
+    sa.Column("job_type", sa.String(length=50), nullable=False),
+    sa.Column("message_id", sa.BigInteger(), sa.ForeignKey("messages.id"), nullable=False),
+    sa.Column("message_version_id", sa.BigInteger(), sa.ForeignKey("message_versions.id"), nullable=True),
+    sa.Column("status", sa.String(length=30), nullable=False, server_default="PENDING"),
+    sa.Column("priority", sa.Integer(), nullable=False, server_default="100"),
+    sa.Column("payload_json", sa.JSON(), nullable=True),
+    sa.Column("retry_count", sa.Integer(), nullable=False, server_default="0"),
+    sa.Column("max_retries", sa.Integer(), nullable=False, server_default="3"),
+    sa.Column("available_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+    sa.Column("claimed_at", sa.DateTime(), nullable=True),
+    sa.Column("heartbeat_at", sa.DateTime(), nullable=True),
+    sa.Column("finished_at", sa.DateTime(), nullable=True),
+    sa.Column("worker_id", sa.String(length=100), nullable=True),
+    sa.Column("error_code", sa.String(length=100), nullable=True),
+    sa.Column("error_message", sa.Text(), nullable=True),
+    sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+    sa.Column("updated_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+)
+```
+
+핵심 제약:
+
+```python
+op.create_unique_constraint(
+    "uq_analysis_jobs_job_type_message_version_id",
+    "analysis_jobs",
+    ["job_type", "message_version_id"],
+)
+```
+
+핵심 인덱스:
+
+```python
+op.create_index(
+    "ix_analysis_jobs_claim",
+    "analysis_jobs",
+    ["job_type", "status", "available_at", "priority", "id"],
+)
+
+op.create_index(
+    "ix_analysis_jobs_stuck",
+    "analysis_jobs",
+    ["status", "claimed_at", "heartbeat_at"],
+)
+```
+
+---
+
+## 3-4. `message_preprocess_results` 생성 개념
+
+```python
+op.create_table(
+    "message_preprocess_results",
+    sa.Column("id", sa.BigInteger(), primary_key=True),
+    sa.Column("message_id", sa.BigInteger(), sa.ForeignKey("messages.id"), nullable=False),
+    sa.Column("message_version_id", sa.BigInteger(), sa.ForeignKey("message_versions.id"), nullable=False),
+    sa.Column("normalize_job_id", sa.BigInteger(), sa.ForeignKey("analysis_jobs.id"), nullable=False),
+    sa.Column("normalized_text", sa.Text(), nullable=False),
+    sa.Column("cleaned_text", sa.Text(), nullable=True),
+    sa.Column("language_code", sa.String(length=20), nullable=True),
+    sa.Column("token_count", sa.Integer(), nullable=True),
+    sa.Column("line_count", sa.Integer(), nullable=True),
+    sa.Column("char_count", sa.Integer(), nullable=True),
+    sa.Column("has_url", sa.Boolean(), nullable=False, server_default=sa.false()),
+    sa.Column("has_ticker_hint", sa.Boolean(), nullable=False, server_default=sa.false()),
+    sa.Column("preprocess_version", sa.String(length=50), nullable=False),
+    sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+)
+```
+
+유니크:
+
+```python
+op.create_unique_constraint(
+    "uq_preprocess_message_version_preprocess_version",
+    "message_preprocess_results",
+    ["message_version_id", "preprocess_version"],
+)
+
+op.create_unique_constraint(
+    "uq_preprocess_normalize_job_id",
+    "message_preprocess_results",
+    ["normalize_job_id"],
+)
+```
+
+---
+
+## 3-5. `message_inference_results` 생성 개념
+
+```python
+op.create_table(
+    "message_inference_results",
+    sa.Column("id", sa.BigInteger(), primary_key=True),
+    sa.Column("message_id", sa.BigInteger(), sa.ForeignKey("messages.id"), nullable=False),
+    sa.Column("message_version_id", sa.BigInteger(), sa.ForeignKey("message_versions.id"), nullable=False),
+    sa.Column("preprocess_result_id", sa.BigInteger(), sa.ForeignKey("message_preprocess_results.id"), nullable=False),
+    sa.Column("inference_job_id", sa.BigInteger(), sa.ForeignKey("analysis_jobs.id"), nullable=False),
+    sa.Column("task_type", sa.String(length=50), nullable=False),
+    sa.Column("model_name", sa.String(length=100), nullable=False),
+    sa.Column("prompt_version", sa.String(length=50), nullable=False),
+    sa.Column("summary_text", sa.Text(), nullable=True),
+    sa.Column("keywords_json", sa.JSON(), nullable=True),
+    sa.Column("entities_json", sa.JSON(), nullable=True),
+    sa.Column("sentiment_label", sa.String(length=30), nullable=True),
+    sa.Column("confidence_score", sa.Numeric(5, 4), nullable=True),
+    sa.Column("raw_response_json", sa.JSON(), nullable=True),
+    sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
+)
+```
+
+유니크:
+
+```python
+op.create_unique_constraint(
+    "uq_inference_task_message_version_model_prompt",
+    "message_inference_results",
+    ["task_type", "message_version_id", "model_name", "prompt_version"],
+)
+
+op.create_unique_constraint(
+    "uq_inference_job_id",
+    "message_inference_results",
+    ["inference_job_id"],
+)
+```
+
+---
+
+# 4. SQLAlchemy 모델 레벨에서 같이 바뀌어야 할 것
+
+migration만 끝나면 끝이 아닙니다.
+실제 코드 적용은 ORM 모델이 따라와야 합니다.
+
+최소 필요 모델:
+
+* `Message`
+* `MessageVersion`
+* `AnalysisJob`
+* `MessagePreprocessResult`
+* `MessageInferenceResult`
+
+핵심 관계는 이렇게 잡는 것이 자연스럽습니다.
+
+### `Message`
+
+* `versions`
+* `jobs`
+* `latest_version`
+
+### `MessageVersion`
+
+* `message`
+* `jobs`
+* `preprocess_results`
+* `inference_results`
+
+### `AnalysisJob`
+
+* `message`
+* `message_version`
+
+이 관계가 있으면 service 레이어 코드가 훨씬 단순해집니다.
+
+---
+
+# 5. 서비스 계층 책임 분리
+
+이 부분이 매우 중요합니다.
+
+지금 구조를 제대로 적용하려면, 단순히 worker 파일 안에 로직을 우겨 넣는 방식으로는 오래 못 갑니다.
+
+권장 분리는 아래와 같습니다.
+
+---
+
+## 5-1. `MessagePersistenceService`
+
+이 서비스의 책임:
+
+* 신규 메시지 / 수정 메시지 판별
+* `messages` upsert
+* `message_versions` insert
+* `NORMALIZE` job 생성
+* 트랜잭션 보장
+
+즉, `persist_message()`는 이 서비스의 핵심 public method가 됩니다.
+
+예상 메서드:
+
+* `persist_message(channel, telegram_message) -> PersistResult`
+
+반환값 예:
+
+* `message_id`
+* `message_version_id`
+* `created`
+* `updated`
+* `normalize_job_created`
+
+---
+
+## 5-2. `AnalysisJobService`
+
+이 서비스는 상태 머신 담당입니다.
+
+핵심 메서드 예:
+
+* `enqueue_job(job_type, message_id, message_version_id, payload=None)`
+* `claim_next_job(job_type, worker_id)`
+* `mark_job_succeeded(job_id)`
+* `mark_job_failed(job_id, error_code, error_message, retryable=True)`
+* `touch_heartbeat(job_id, worker_id)`
+* `recover_stuck_jobs(...)`
+
+즉, 워커는 job 상태 전이 로직을 직접 다루지 않고, 이 서비스에 위임하는 것이 좋습니다.
+
+---
+
+## 5-3. `PreprocessService`
+
+책임:
+
+* message version 기준 원문 읽기
+* normalize 수행
+* 결과 저장
+* summary job enqueue
+
+핵심 메서드:
+
+* `run_normalize_job(job: AnalysisJob) -> preprocess_result_id`
+
+---
+
+## 5-4. `InferenceService`
+
+책임:
+
+* preprocess 결과 조회
+* 프롬프트 구성
+* 모델 호출
+* 결과 저장
+* job 완료 처리
+
+핵심 메서드:
+
+* `run_single_message_summary_job(job: AnalysisJob) -> inference_result_id`
+
+---
+
+## 5-5. `SchedulerService`
+
+책임:
+
+* timeout 기준 stuck job 탐색
+* retry 가능한 job 복구
+* max retry 초과 job 실패 확정
+
+핵심 메서드:
+
+* `recover_stuck_jobs(now=None) -> RecoveryStats`
+
+---
+
+# 6. Worker별 적용 포인트
+
+이제 가장 실전적인 부분입니다.
+“어느 파일에서 무엇을 바꿔야 하는가”를 worker 기준으로 정리하면 아래와 같습니다.
+
+---
+
+## 6-1. `collector_worker.py` 또는 Telegram 수집부
+
+여기서 가장 중요한 변화는 **수집부에서 분석하지 않는 것**입니다.
+
+### 기존에 흔한 문제
+
+수집부 안에서:
+
+* 메시지 저장
+* 전처리
+* 추론
+* 결과 저장
+
+이걸 한 번에 하면 장애가 전파됩니다.
+
+### 바뀐 구조
+
+수집부는 아래만 해야 합니다.
+
+1. 텔레그램 메시지 읽기
+2. `MessagePersistenceService.persist_message()` 호출
+3. 끝
+
+즉, collector는 이제 “job producer”입니다.
+
+### patch 포인트
+
+기존 코드가 예를 들어 이런 흐름이라면:
+
+```python
+for tg_msg in client.iter_channel_messages(...):
+    message = save_message(...)
+    analyze_message(message)
+```
+
+이걸 아래처럼 바꾸는 쪽이 맞습니다.
+
+```python
+for tg_msg in client.iter_channel_messages(...):
+    message_persistence_service.persist_message(channel, tg_msg)
+```
+
+`analyze_message()` 같은 직접 호출은 제거하거나 deprecated 처리하는 것이 좋습니다.
+
+---
+
+## 6-2. `persist_message()` 내부 patch 포인트
+
+이 함수는 사실상 제일 중요합니다.
+
+### 해야 할 일
+
+1. `messages` 기존 row 조회
+2. text hash 계산
+3. 신규/수정/변화없음 판별
+4. `message_versions` insert
+5. `messages.latest_version_*` 갱신
+6. `NORMALIZE` job enqueue
+7. commit
+
+### 주의점
+
+* 메시지는 저장됐는데 job 생성 실패
+* job은 생성됐는데 버전 저장 실패
+
+이 둘이 발생하면 안 되므로 **한 트랜잭션**으로 묶는 것이 중요합니다.
+
+---
+
+## 6-3. `preprocess_worker.py`
+
+이 워커는 `NORMALIZE`만 소비해야 합니다.
+
+### 루프 구조 예시
+
+1. `claim_next_job("NORMALIZE", worker_id)`
+2. job 없으면 sleep
+3. 있으면 `PreprocessService.run_normalize_job(job)`
+4. 성공 시 job done
+5. 실패 시 retry/fail 처리
+
+### patch 핵심
+
+기존에 전처리 함수가 특정 메시지 리스트를 직접 읽어 처리하는 방식이었다면,
+이제는 **job 단위 처리**로 바뀌어야 합니다.
+
+즉, 이런 방식에서:
+
+```python
+messages = repo.get_unprocessed_messages(limit=100)
+for message in messages:
+    preprocess(message)
+```
+
+이런 방식으로 바뀌어야 합니다:
+
+```python
+job = job_service.claim_next_job("NORMALIZE", worker_id)
+if job:
+    preprocess_service.run_normalize_job(job)
+```
+
+핵심은 “메시지 기준 pull”이 아니라 **job 기준 claim**입니다.
+
+---
+
+## 6-4. `inference_worker.py`
+
+이 워커는 `SINGLE_MESSAGE_SUMMARY`만 소비합니다.
+
+### 루프 구조
+
+1. `claim_next_job("SINGLE_MESSAGE_SUMMARY", worker_id)`
+2. preprocess 결과 조회
+3. 모델 호출
+4. 결과 저장
+5. job done
+
+### patch 핵심
+
+기존에 `messages`에서 직접 raw_text를 읽고 추론했다면, 이제는 그러면 안 됩니다.
+
+반드시:
+
+* `message_version_id`
+* `preprocess_result`
+
+기준으로 가야 합니다.
+
+즉, InferenceWorker는 원칙적으로 원문을 직접 읽지 말고, **전처리 결과를 입력으로 사용**하도록 고정하는 편이 좋습니다.
+
+---
+
+## 6-5. `scheduler_worker.py`
+
+이 워커는 큐 복구 전용입니다.
+
+### 해야 할 일
+
+* 오래된 `IN_PROGRESS` job 조회
+* retry 가능 여부 판단
+* `PENDING` 또는 `RETRY_WAIT` 복귀
+* max retries 초과 시 `FAILED`
+
+### patch 핵심
+
+지금 scheduler가 단순 예약 실행만 담당하고 있다면, 역할을 확장해서
+**job recovery 루틴**을 넣어야 합니다.
+
+즉, 이 worker의 역할은 “새 job을 만들기”보다 **멈춘 job을 살리는 것**에 더 가깝습니다.
+
+---
+
+# 7. `run_worker.py` 통합 실행 구조
+
+이건 운영 편의성이 매우 큽니다.
+
+여러 worker 실행 진입점을 하나로 모으면 테스트와 운영이 쉬워집니다.
+
+예시 인자 구조:
+
+```bash
+python -m src.run_worker --worker preprocess
+python -m src.run_worker --worker inference
+python -m src.run_worker --worker scheduler
+```
+
+구조상 권장 방식:
+
+* `--worker preprocess`
+* `--worker inference`
+* `--worker scheduler`
+
+필요하면 추후:
+
+* `--worker collector`
+* `--once`
+* `--poll-interval`
+* `--max-jobs`
+
+도 붙일 수 있습니다.
+
+### 장점
+
+* smoke test 작성 쉬움
+* 배포 스크립트 단순화
+* 운영자 실수 감소
+
+---
+
+# 8. 상태 전이 규칙을 코드에 고정해야 하는 이유
+
+이 구조에서 가장 중요한 것은 **job 상태 전이의 일관성**입니다.
+
+권장 상태 전이는 아래입니다.
+
+### 정상
+
+* `PENDING` → `IN_PROGRESS` → `SUCCEEDED`
+
+### 일시적 실패
+
+* `PENDING` → `IN_PROGRESS` → `RETRY_WAIT` → `PENDING` → ...
+
+### 최종 실패
+
+* `PENDING` → `IN_PROGRESS` → `FAILED`
+
+### 운영 취소
+
+* `PENDING` → `CANCELLED`
+
+이 규칙이 worker마다 제각각이면 안 됩니다.
+그래서 `AnalysisJobService` 한 곳에서 처리해야 합니다.
+
+---
+
+# 9. 예외 처리 기준도 미리 나눠야 함
+
+운영 중 매우 중요합니다.
+
+## retryable 예외
+
+예:
+
+* DB deadlock
+* 일시적 네트워크 오류
+* 외부 모델 API timeout
+* 텔레그램 일시 오류
+
+이 경우:
+
+* `retry_count += 1`
+* `available_at` 뒤로 미룸
+* `RETRY_WAIT`
+
+## non-retryable 예외
+
+예:
+
+* 참조 데이터 없음
+* payload 구조 오류
+* 파싱 불가능한 영구 오류
+* 코드 버그로 인한 명백한 invalid state
+
+이 경우:
+
+* 즉시 `FAILED`
+
+이 구분이 없으면 쓸데없는 무한 재시도 루프가 생깁니다.
+
+---
+
+# 10. 테스트 적용 순서
+
+지금 단계에서는 테스트도 **순서대로** 들어가야 합니다.
+
+---
+
+## 10-1. 1순위: `persist_message()` 테스트
+
+이건 파이프라인 입구라서 제일 먼저 잡아야 합니다.
+
+### 최소 3개
+
+1. 신규 메시지 저장
+2. 동일 메시지 재수집
+3. 수정 메시지 저장
+
+### 검증 포인트
+
+* `messages` row 수
+* `message_versions` row 수
+* `NORMALIZE` job 생성 여부
+* 중복 job 방지 여부
+
+---
+
+## 10-2. 2순위: `preprocess_worker.py` 테스트
+
+### 최소 2개
+
+1. NORMALIZE job 성공 처리
+2. 예외 시 retry/fail 처리
+
+### 검증 포인트
+
+* preprocess result 저장
+* summary job 생성
+* 기존 job 상태 변경
+
+---
+
+## 10-3. 3순위: `inference_worker.py` 테스트
+
+### 최소 2개
+
+1. summary job 성공 처리
+2. 모델 호출 실패 처리
+
+### 검증 포인트
+
+* inference result 저장
+* job 완료 처리
+* retry 로직 동작
+
+---
+
+## 10-4. 4순위: `scheduler_worker.py` 테스트
+
+이건 앞서 말씀드린 대로 최소 2~3개면 됩니다.
+
+추천 세트:
+
+1. 오래된 `IN_PROGRESS` job 복구
+2. 최근 claimed job은 건드리지 않음
+3. retry 한도 초과 job은 `FAILED`
+
+---
+
+## 10-5. 5순위: `run_worker.py` smoke test
+
+최소 확인:
+
+* `--worker preprocess` 정상 라우팅
+* `--worker scheduler` 정상 라우팅
+* 잘못된 worker type 에러 처리
+
+이 테스트는 작아 보여도 운영 품질에 꽤 중요합니다.
+
+---
+
+# 11. 적용 시 가장 흔한 실수
+
+이건 미리 막는 것이 좋습니다.
+
+---
+
+## 실수 1. `messages`만 보고 처리함
+
+버전 테이블을 만들었는데도 worker가 계속 `messages.raw_text`만 보면,
+수정 메시지 버전 고정이 무너집니다.
+
+**worker는 가능하면 `message_version_id` 기준으로 읽어야 합니다.**
+
+---
+
+## 실수 2. job 생성과 메시지 저장이 트랜잭션으로 묶이지 않음
+
+가장 위험합니다.
+
+* 저장만 되고 job 없음
+* job만 있고 원문 없음
+
+둘 다 장애 원인입니다.
+
+---
+
+## 실수 3. 워커가 직접 상태값 문자열을 여기저기서 바꿈
+
+예:
+
+* 어떤 파일은 `DONE`
+* 어떤 파일은 `SUCCEEDED`
+* 어떤 파일은 `SUCCESS`
+
+이런 식이면 금방 깨집니다.
+
+**enum 또는 상수화**가 필요합니다.
+
+---
+
+## 실수 4. `RETRY_WAIT` 상태인데 worker가 다시 집어감
+
+job claim 조건에 `status='PENDING'` 및 `available_at <= now()`가 빠지면 생깁니다.
+
+---
+
+## 실수 5. stuck 판단 기준이 너무 짧음
+
+예를 들어 모델 호출이 원래 90초 걸릴 수 있는데 timeout 기준을 30초로 두면,
+정상 job까지 스케줄러가 재배치해 중복 처리가 발생할 수 있습니다.
+
+---
+
+# 12. 지금 가장 자연스러운 실제 적용 순서
+
+코드에 반영할 때는 아래 순서가 제일 자연스럽습니다.
+
+### 1단계
+
+`message_versions`, `analysis_jobs` migration 추가
+
+### 2단계
+
+`MessagePersistenceService.persist_message()` 구현
+
+### 3단계
+
+collector에서 직접 분석 호출 제거, `persist_message()`만 호출하도록 변경
+
+### 4단계
+
+`PreprocessWorker`를 job 기반으로 리팩터링
+
+### 5단계
+
+전처리 성공 시 `SINGLE_MESSAGE_SUMMARY` enqueue 연결
+
+### 6단계
+
+`InferenceWorker`를 job 기반으로 리팩터링
+
+### 7단계
+
+`SchedulerWorker` stuck recovery 구현
+
+### 8단계
+
+`run_worker.py` 통합 진입점 정리
+
+### 9단계
+
+smoke test + scheduler test 2~3개 추가
+
+이 순서가 좋은 이유는, **입구부터 출구까지 순방향으로 안정화**되기 때문입니다.
+
+---
+
+# 13. 지금 시점에서의 핵심 판단
+
+이제 이 프로젝트는 더 이상
+“전처리를 어디에 넣을까?”
+“요약 로직을 어디서 부를까?”
+같은 설계 단계가 아닙니다.
+
+핵심은 아래 3개입니다.
+
+1. **DB 일관성**
+2. **job 상태 전이 일관성**
+3. **워커 장애 시 복구 가능성**
+
+즉, 지금부터 품질을 가르는 건 알고리즘보다 **파이프라인 운영 안정성**입니다.
+
+---
+
+# 14. 한 줄로 압축하면
+
+지금 해야 할 일은
+**메시지 저장을 버전화하고, 후속 처리를 analysis_jobs로 큐잉하며, 각 워커를 job 소비자 구조로 바꾸고, scheduler로 멈춘 작업을 되살리는 것**입니다.
+
+---
+
+다음으로 이어서 가장 실용적인 건
+**“이 구조를 기준으로 파일별 수정안(예: collector_worker.py / preprocess_worker.py / inference_worker.py / scheduler_worker.py / run_worker.py 에 어떤 함수가 추가·변경되는지)”**를 구체적인 코드 수준으로 정리하는 것입니다.

@@ -1,0 +1,853 @@
+좋습니다.
+이번 단계는 실제로 **파이프라인 입구를 닫는 작업**입니다.
+
+즉, 이제부터 핵심은:
+
+* `persist_message()`에서
+
+  * `messages` 저장
+  * `message_versions` 저장
+  * `NORMALIZE` job 생성
+* `collector_worker.py`는
+
+  * 메시지를 읽고
+  * `persist_message()`만 호출
+* 테스트는
+
+  * 신규 메시지
+  * 동일 메시지 재수집
+  * 수정 메시지
+
+이 3가지를 먼저 고정하는 것입니다.
+
+---
+
+# 1. `message_repository.py` 초안
+
+최신 메시지 상태를 다루는 repository입니다.
+
+```python
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from src.db.models.message import Message
+from src.domain.constants import MessageStatus
+
+
+class MessageRepository:
+    def get_by_channel_and_tg_message_id(
+        self,
+        session: Session,
+        *,
+        channel_id: int,
+        telegram_message_id: int,
+    ) -> Message | None:
+        stmt = select(Message).where(
+            Message.channel_id == channel_id,
+            Message.telegram_message_id == telegram_message_id,
+        )
+        return session.execute(stmt).scalars().first()
+
+    def create_message(
+        self,
+        session: Session,
+        *,
+        channel_id: int,
+        telegram_message_id: int,
+        posted_at: datetime,
+        edited_at: datetime | None,
+        raw_text: str | None,
+        has_media: bool,
+        now: datetime,
+    ) -> Message:
+        message = Message(
+            channel_id=channel_id,
+            telegram_message_id=telegram_message_id,
+            posted_at=posted_at,
+            edited_at=edited_at,
+            raw_text=raw_text,
+            has_media=has_media,
+            latest_version_no=1,
+            latest_version_id=None,
+            status=MessageStatus.ACTIVE.value,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(message)
+        session.flush()
+        return message
+
+    def update_latest_version(
+        self,
+        session: Session,
+        *,
+        message: Message,
+        version_id: int,
+        version_no: int,
+        raw_text: str | None,
+        edited_at: datetime | None,
+        now: datetime,
+    ) -> None:
+        message.latest_version_id = version_id
+        message.latest_version_no = version_no
+        message.raw_text = raw_text
+        message.edited_at = edited_at
+        message.updated_at = now
+        session.flush()
+```
+
+---
+
+# 2. `message_version_repository.py` 초안
+
+버전 이력을 저장하는 repository입니다.
+
+```python
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import desc, select
+from sqlalchemy.orm import Session
+
+from src.db.models.message_version import MessageVersion
+
+
+class MessageVersionRepository:
+    def get_latest_version(
+        self,
+        session: Session,
+        *,
+        message_id: int,
+    ) -> MessageVersion | None:
+        stmt = (
+            select(MessageVersion)
+            .where(MessageVersion.message_id == message_id)
+            .order_by(desc(MessageVersion.version_no))
+            .limit(1)
+        )
+        return session.execute(stmt).scalars().first()
+
+    def get_by_id(self, session: Session, message_version_id: int) -> MessageVersion | None:
+        return session.get(MessageVersion, message_version_id)
+
+    def create_version(
+        self,
+        session: Session,
+        *,
+        message_id: int,
+        version_no: int,
+        raw_text: str | None,
+        edited_at: datetime | None,
+        text_hash: str,
+        change_type: str,
+        now: datetime,
+    ) -> MessageVersion:
+        version = MessageVersion(
+            message_id=message_id,
+            version_no=version_no,
+            raw_text=raw_text,
+            edited_at=edited_at,
+            text_hash=text_hash,
+            change_type=change_type,
+            created_at=now,
+        )
+        session.add(version)
+        session.flush()
+        return version
+```
+
+---
+
+# 3. `message_persistence_service.py` 실제 패치 초안
+
+이게 이번 단계의 핵심입니다.
+
+이 서비스는 반드시 **한 트랜잭션 안에서** 아래를 처리해야 합니다.
+
+1. 메시지 조회
+2. 신규/수정/동일 판별
+3. `message_versions` 저장
+4. `messages.latest_version_*` 갱신
+5. `NORMALIZE` job 생성
+
+```python
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass
+class PersistMessageResult:
+    message_id: int
+    message_version_id: int | None
+    created: bool
+    updated: bool
+    normalize_job_created: bool
+    skipped_as_unchanged: bool
+
+
+class MessagePersistenceService:
+    def __init__(
+        self,
+        message_repository,
+        message_version_repository,
+        analysis_job_service,
+        normalize_job_type: str = "NORMALIZE",
+    ):
+        self.message_repository = message_repository
+        self.message_version_repository = message_version_repository
+        self.analysis_job_service = analysis_job_service
+        self.normalize_job_type = normalize_job_type
+
+    def persist_message(self, session, *, channel_id: int, telegram_message) -> PersistMessageResult:
+        now = datetime.utcnow()
+
+        raw_text = self._extract_raw_text(telegram_message)
+        text_hash = self._hash_text(raw_text)
+        edited_at = getattr(telegram_message, "edit_date", None)
+        posted_at = getattr(telegram_message, "date", None)
+        telegram_message_id = getattr(telegram_message, "id")
+        has_media = bool(getattr(telegram_message, "media", None))
+
+        existing_message = self.message_repository.get_by_channel_and_tg_message_id(
+            session,
+            channel_id=channel_id,
+            telegram_message_id=telegram_message_id,
+        )
+
+        if existing_message is None:
+            message = self.message_repository.create_message(
+                session,
+                channel_id=channel_id,
+                telegram_message_id=telegram_message_id,
+                posted_at=posted_at,
+                edited_at=edited_at,
+                raw_text=raw_text,
+                has_media=has_media,
+                now=now,
+            )
+
+            version = self.message_version_repository.create_version(
+                session,
+                message_id=message.id,
+                version_no=1,
+                raw_text=raw_text,
+                edited_at=edited_at,
+                text_hash=text_hash,
+                change_type="INITIAL",
+                now=now,
+            )
+
+            self.message_repository.update_latest_version(
+                session,
+                message=message,
+                version_id=version.id,
+                version_no=1,
+                raw_text=raw_text,
+                edited_at=edited_at,
+                now=now,
+            )
+
+            self.analysis_job_service.enqueue_job(
+                session,
+                job_type=self.normalize_job_type,
+                message_id=message.id,
+                message_version_id=version.id,
+                payload_json=None,
+            )
+
+            return PersistMessageResult(
+                message_id=message.id,
+                message_version_id=version.id,
+                created=True,
+                updated=False,
+                normalize_job_created=True,
+                skipped_as_unchanged=False,
+            )
+
+        latest_version = self.message_version_repository.get_latest_version(
+            session,
+            message_id=existing_message.id,
+        )
+
+        if latest_version is not None and latest_version.text_hash == text_hash:
+            return PersistMessageResult(
+                message_id=existing_message.id,
+                message_version_id=None,
+                created=False,
+                updated=False,
+                normalize_job_created=False,
+                skipped_as_unchanged=True,
+            )
+
+        next_version_no = (existing_message.latest_version_no or 0) + 1
+
+        version = self.message_version_repository.create_version(
+            session,
+            message_id=existing_message.id,
+            version_no=next_version_no,
+            raw_text=raw_text,
+            edited_at=edited_at,
+            text_hash=text_hash,
+            change_type="EDIT",
+            now=now,
+        )
+
+        self.message_repository.update_latest_version(
+            session,
+            message=existing_message,
+            version_id=version.id,
+            version_no=next_version_no,
+            raw_text=raw_text,
+            edited_at=edited_at,
+            now=now,
+        )
+
+        self.analysis_job_service.enqueue_job(
+            session,
+            job_type=self.normalize_job_type,
+            message_id=existing_message.id,
+            message_version_id=version.id,
+            payload_json=None,
+        )
+
+        return PersistMessageResult(
+            message_id=existing_message.id,
+            message_version_id=version.id,
+            created=False,
+            updated=True,
+            normalize_job_created=True,
+            skipped_as_unchanged=False,
+        )
+
+    @staticmethod
+    def _extract_raw_text(telegram_message) -> str:
+        # 환경에 따라 text / message / caption 중 어디에 텍스트가 있는지 다를 수 있어 보수적으로 처리
+        return (
+            getattr(telegram_message, "text", None)
+            or getattr(telegram_message, "message", None)
+            or getattr(telegram_message, "caption", None)
+            or ""
+        )
+
+    @staticmethod
+    def _hash_text(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+```
+
+---
+
+# 4. 이 서비스에서 중요한 판단 포인트
+
+이 코드에서 중요한 건 3개입니다.
+
+## 4-1. 동일 메시지 재수집이면 skip
+
+같은 `channel_id + telegram_message_id`이고, 최신 버전의 `text_hash`도 같으면:
+
+* 버전 추가 안 함
+* job 추가 안 함
+
+이게 없으면 재수집 시 job이 계속 중복 생성됩니다.
+
+## 4-2. 수정 메시지면 새 버전 생성
+
+메시지 ID는 같아도 text hash가 다르면:
+
+* `message_versions` 새 row 생성
+* `messages.latest_version_*` 갱신
+* 새 버전에 대한 `NORMALIZE` job 생성
+
+## 4-3. collector는 여기까지만
+
+이 단계에서는 절대:
+
+* 직접 normalize 호출
+* 직접 inference 호출
+
+하면 안 됩니다.
+
+---
+
+# 5. `collector_worker.py` 수정안
+
+이제 collector의 책임은 아주 단순합니다.
+
+기존에 흔히 이런 구조가 있었을 수 있습니다.
+
+```python
+for tg_message in client.iter_channel_messages(channel_id):
+    saved = save_message(...)
+    preprocess(saved)
+    summarize(saved)
+```
+
+이걸 아래처럼 바꾸는 것이 핵심입니다.
+
+```python
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class CollectorWorker:
+    def __init__(
+        self,
+        session_factory,
+        telegram_client,
+        message_persistence_service,
+    ):
+        self.session_factory = session_factory
+        self.telegram_client = telegram_client
+        self.message_persistence_service = message_persistence_service
+
+    def collect_channel(self, channel) -> None:
+        for telegram_message in self.telegram_client.iter_channel_messages(channel.tg_channel_id):
+            with self.session_factory() as session:
+                try:
+                    result = self.message_persistence_service.persist_message(
+                        session,
+                        channel_id=channel.id,
+                        telegram_message=telegram_message,
+                    )
+                    session.commit()
+
+                    logger.info(
+                        "message persisted channel_id=%s tg_message_id=%s message_id=%s version_id=%s created=%s updated=%s skipped=%s",
+                        channel.id,
+                        telegram_message.id,
+                        result.message_id,
+                        result.message_version_id,
+                        result.created,
+                        result.updated,
+                        result.skipped_as_unchanged,
+                    )
+                except Exception:
+                    session.rollback()
+                    logger.exception(
+                        "failed to persist telegram message channel_id=%s tg_message_id=%s",
+                        channel.id,
+                        telegram_message.id,
+                    )
+```
+
+---
+
+# 6. collector 수정 시 반드시 제거해야 할 코드
+
+지금 코드베이스에 아래 계열 코드가 남아 있으면 제거 대상입니다.
+
+```python
+analyze_message(...)
+run_summary(...)
+run_inference(...)
+save_ai_result(...)
+```
+
+collector 안에서는 이런 후속 처리 직접 호출을 없애고,
+오직 `persist_message()`까지만 가야 합니다.
+
+즉, collector는 이제 **job producer**입니다.
+
+---
+
+# 7. `persist_message()` 테스트 초안
+
+이제 가장 중요한 테스트 3개를 붙이겠습니다.
+이 단계에서는 DB를 직접 붙이기보다 **fake repository + fake job service**로 빠르게 검증하는 게 좋습니다.
+
+---
+
+## 7-1. 테스트용 fake 객체
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+
+
+@dataclass
+class FakeMessage:
+    id: int
+    channel_id: int
+    telegram_message_id: int
+    posted_at: datetime
+    edited_at: datetime | None
+    raw_text: str | None
+    has_media: bool
+    latest_version_no: int
+    latest_version_id: int | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass
+class FakeMessageVersion:
+    id: int
+    message_id: int
+    version_no: int
+    raw_text: str | None
+    edited_at: datetime | None
+    text_hash: str
+    change_type: str
+    created_at: datetime
+
+
+class FakeMessageRepository:
+    def __init__(self):
+        self.messages = {}
+        self.next_id = 1
+
+    def get_by_channel_and_tg_message_id(self, session, *, channel_id: int, telegram_message_id: int):
+        return self.messages.get((channel_id, telegram_message_id))
+
+    def create_message(
+        self,
+        session,
+        *,
+        channel_id: int,
+        telegram_message_id: int,
+        posted_at,
+        edited_at,
+        raw_text,
+        has_media: bool,
+        now,
+    ):
+        message = FakeMessage(
+            id=self.next_id,
+            channel_id=channel_id,
+            telegram_message_id=telegram_message_id,
+            posted_at=posted_at,
+            edited_at=edited_at,
+            raw_text=raw_text,
+            has_media=has_media,
+            latest_version_no=1,
+            latest_version_id=None,
+            status="ACTIVE",
+            created_at=now,
+            updated_at=now,
+        )
+        self.next_id += 1
+        self.messages[(channel_id, telegram_message_id)] = message
+        return message
+
+    def update_latest_version(
+        self,
+        session,
+        *,
+        message,
+        version_id: int,
+        version_no: int,
+        raw_text: str | None,
+        edited_at,
+        now,
+    ):
+        message.latest_version_id = version_id
+        message.latest_version_no = version_no
+        message.raw_text = raw_text
+        message.edited_at = edited_at
+        message.updated_at = now
+
+
+class FakeMessageVersionRepository:
+    def __init__(self):
+        self.versions_by_message_id = {}
+        self.next_id = 1
+
+    def get_latest_version(self, session, *, message_id: int):
+        versions = self.versions_by_message_id.get(message_id, [])
+        if not versions:
+            return None
+        return versions[-1]
+
+    def create_version(
+        self,
+        session,
+        *,
+        message_id: int,
+        version_no: int,
+        raw_text,
+        edited_at,
+        text_hash: str,
+        change_type: str,
+        now,
+    ):
+        version = FakeMessageVersion(
+            id=self.next_id,
+            message_id=message_id,
+            version_no=version_no,
+            raw_text=raw_text,
+            edited_at=edited_at,
+            text_hash=text_hash,
+            change_type=change_type,
+            created_at=now,
+        )
+        self.next_id += 1
+        self.versions_by_message_id.setdefault(message_id, []).append(version)
+        return version
+
+
+class FakeAnalysisJobService:
+    def __init__(self):
+        self.enqueued_jobs = []
+
+    def enqueue_job(
+        self,
+        session,
+        *,
+        job_type: str,
+        message_id: int,
+        message_version_id: int,
+        payload_json=None,
+        priority: int = 100,
+        max_retries: int = 3,
+    ):
+        self.enqueued_jobs.append(
+            {
+                "job_type": job_type,
+                "message_id": message_id,
+                "message_version_id": message_version_id,
+                "payload_json": payload_json,
+                "priority": priority,
+                "max_retries": max_retries,
+            }
+        )
+        return self.enqueued_jobs[-1]
+
+
+class DummyTelegramMessage:
+    def __init__(self, *, message_id: int, text: str, date: datetime, edit_date=None, media=None):
+        self.id = message_id
+        self.text = text
+        self.date = date
+        self.edit_date = edit_date
+        self.media = media
+```
+
+---
+
+## 7-2. 신규 메시지 테스트
+
+```python
+from datetime import datetime
+
+from src.services.message_persistence_service import MessagePersistenceService
+
+
+def test_persist_message_creates_message_version_and_normalize_job():
+    message_repo = FakeMessageRepository()
+    version_repo = FakeMessageVersionRepository()
+    job_service = FakeAnalysisJobService()
+
+    service = MessagePersistenceService(
+        message_repository=message_repo,
+        message_version_repository=version_repo,
+        analysis_job_service=job_service,
+    )
+
+    telegram_message = DummyTelegramMessage(
+        message_id=100,
+        text="첫 번째 메시지",
+        date=datetime(2026, 3, 22, 10, 0, 0),
+    )
+
+    result = service.persist_message(
+        session=None,
+        channel_id=1,
+        telegram_message=telegram_message,
+    )
+
+    assert result.created is True
+    assert result.updated is False
+    assert result.skipped_as_unchanged is False
+    assert result.normalize_job_created is True
+    assert result.message_id == 1
+    assert result.message_version_id == 1
+
+    latest_version = version_repo.get_latest_version(None, message_id=1)
+    assert latest_version is not None
+    assert latest_version.version_no == 1
+    assert latest_version.raw_text == "첫 번째 메시지"
+
+    assert len(job_service.enqueued_jobs) == 1
+    assert job_service.enqueued_jobs[0]["job_type"] == "NORMALIZE"
+    assert job_service.enqueued_jobs[0]["message_id"] == 1
+    assert job_service.enqueued_jobs[0]["message_version_id"] == 1
+```
+
+---
+
+## 7-3. 동일 메시지 재수집 테스트
+
+```python
+from datetime import datetime
+
+from src.services.message_persistence_service import MessagePersistenceService
+
+
+def test_persist_message_skips_when_message_is_unchanged():
+    message_repo = FakeMessageRepository()
+    version_repo = FakeMessageVersionRepository()
+    job_service = FakeAnalysisJobService()
+
+    service = MessagePersistenceService(
+        message_repository=message_repo,
+        message_version_repository=version_repo,
+        analysis_job_service=job_service,
+    )
+
+    telegram_message = DummyTelegramMessage(
+        message_id=100,
+        text="같은 메시지",
+        date=datetime(2026, 3, 22, 10, 0, 0),
+    )
+
+    first_result = service.persist_message(
+        session=None,
+        channel_id=1,
+        telegram_message=telegram_message,
+    )
+    second_result = service.persist_message(
+        session=None,
+        channel_id=1,
+        telegram_message=telegram_message,
+    )
+
+    assert first_result.created is True
+    assert second_result.created is False
+    assert second_result.updated is False
+    assert second_result.skipped_as_unchanged is True
+    assert second_result.normalize_job_created is False
+    assert second_result.message_version_id is None
+
+    versions = version_repo.versions_by_message_id[1]
+    assert len(versions) == 1
+    assert len(job_service.enqueued_jobs) == 1
+```
+
+---
+
+## 7-4. 수정 메시지 테스트
+
+```python
+from datetime import datetime
+
+from src.services.message_persistence_service import MessagePersistenceService
+
+
+def test_persist_message_creates_new_version_and_job_when_message_is_edited():
+    message_repo = FakeMessageRepository()
+    version_repo = FakeMessageVersionRepository()
+    job_service = FakeAnalysisJobService()
+
+    service = MessagePersistenceService(
+        message_repository=message_repo,
+        message_version_repository=version_repo,
+        analysis_job_service=job_service,
+    )
+
+    original = DummyTelegramMessage(
+        message_id=100,
+        text="원본 메시지",
+        date=datetime(2026, 3, 22, 10, 0, 0),
+    )
+    edited = DummyTelegramMessage(
+        message_id=100,
+        text="원본 메시지 수정본",
+        date=datetime(2026, 3, 22, 10, 0, 0),
+        edit_date=datetime(2026, 3, 22, 10, 5, 0),
+    )
+
+    first_result = service.persist_message(
+        session=None,
+        channel_id=1,
+        telegram_message=original,
+    )
+    second_result = service.persist_message(
+        session=None,
+        channel_id=1,
+        telegram_message=edited,
+    )
+
+    assert first_result.created is True
+    assert second_result.created is False
+    assert second_result.updated is True
+    assert second_result.skipped_as_unchanged is False
+    assert second_result.normalize_job_created is True
+    assert second_result.message_id == 1
+    assert second_result.message_version_id == 2
+
+    versions = version_repo.versions_by_message_id[1]
+    assert len(versions) == 2
+    assert versions[0].version_no == 1
+    assert versions[1].version_no == 2
+    assert versions[1].raw_text == "원본 메시지 수정본"
+
+    message = message_repo.get_by_channel_and_tg_message_id(
+        None,
+        channel_id=1,
+        telegram_message_id=100,
+    )
+    assert message.latest_version_no == 2
+    assert message.latest_version_id == 2
+    assert message.raw_text == "원본 메시지 수정본"
+
+    assert len(job_service.enqueued_jobs) == 2
+    assert job_service.enqueued_jobs[0]["message_version_id"] == 1
+    assert job_service.enqueued_jobs[1]["message_version_id"] == 2
+```
+
+---
+
+# 8. 지금 단계에서 바로 확인할 체크포인트
+
+이 코드가 들어가면 최소한 아래를 바로 확인해야 합니다.
+
+## 8-1. 신규 메시지
+
+* `messages` 생성
+* `message_versions` 1건 생성
+* `NORMALIZE` job 생성
+
+## 8-2. 동일 메시지 재수집
+
+* 버전 추가 없음
+* job 추가 없음
+
+## 8-3. 수정 메시지
+
+* 같은 message row 유지
+* 새 version row 생성
+* 새 version 기준 `NORMALIZE` job 생성
+
+---
+
+# 9. 현재 단계에서 가장 중요한 한 줄
+
+지금부터 collector는
+**“메시지를 저장하고 후속 job을 예약하는 역할”까지만** 해야 합니다.
+
+즉, collector에서 직접 전처리나 요약을 부르면 안 됩니다.
+
+---
+
+# 10. 다음으로 가장 자연스러운 작업
+
+이제 가장 자연스럽게 이어질 작업은 두 가지입니다.
+
+1. `collector_worker.py`와 현재 Telegram client 흐름에 이 `persist_message()`를 실제로 끼워 넣는 패치안
+2. `analysis_job_repository.claim_next_job()`를 현재 프로젝트 DB 설정에 맞게 더 구체화하는 작업
+
+지금 흐름상 다음 답변에서는
+**“현재 worker 루프 구조에 맞춘 실제 연결 패치안”**을 이어서 정리하는 것이 가장 좋습니다.

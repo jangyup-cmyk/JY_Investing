@@ -1,0 +1,816 @@
+좋습니다. 아래는 **한 세트로 바로 붙이기 쉬운 최종 정리본**입니다.
+
+전제는 두 가지입니다.
+
+* `run_collector.py`는 그대로 유지하고, 수집 완료 후 `collector_worker.py`의 공통 persist 지점에서 `normalize` job을 enqueue한다
+* `src.infra.db.models`에는 이미 `AnalysisJob`, `AnalysisResult`, `MessageVersion`, `NormalizedMessage`, `MessageFeature`, `JobType`, `JobStatus`, `JobTargetType`, `ResultType`가 정의돼 있다
+
+---
+
+## 1) `src/workers/base_worker.py`
+
+```python
+from __future__ import annotations
+
+import asyncio
+from abc import ABC, abstractmethod
+
+from src.common.logger import logger
+
+
+class BaseWorker(ABC):
+    def __init__(self, worker_name: str, poll_interval: float = 2.0) -> None:
+        self.worker_name = worker_name
+        self.poll_interval = poll_interval
+        self._running = True
+
+    async def run_forever(self) -> None:
+        logger.info(f"[{self.worker_name}] started")
+
+        while self._running:
+            try:
+                handled = await self.run_once()
+                if not handled:
+                    await asyncio.sleep(self.poll_interval)
+            except asyncio.CancelledError:
+                logger.warning(f"[{self.worker_name}] cancelled")
+                raise
+            except Exception as e:
+                logger.exception(f"[{self.worker_name}] loop error: {e}")
+                await asyncio.sleep(self.poll_interval)
+
+        logger.info(f"[{self.worker_name}] stopped")
+
+    def stop(self) -> None:
+        self._running = False
+
+    @abstractmethod
+    async def run_once(self) -> bool:
+        """
+        작업을 1건 이상 처리했으면 True,
+        처리할 작업이 없으면 False.
+        """
+        raise NotImplementedError
+```
+
+---
+
+## 2) `src/services/analysis_job_service.py`
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.infra.db.models import AnalysisJob, JobStatus, JobTargetType, JobType
+
+UTC = timezone.utc
+
+
+class AnalysisJobService:
+    @staticmethod
+    async def enqueue_job(
+        session: AsyncSession,
+        *,
+        job_type: JobType,
+        target_type: JobTargetType,
+        target_id: int,
+        idempotency_key: str,
+        payload_json: dict | None = None,
+        priority: int = 100,
+        max_attempts: int = 3,
+    ) -> AnalysisJob:
+        """
+        중요:
+        - 내부에서 commit 하지 않음
+        - collector/backfill의 기존 트랜잭션 정책을 깨지 않기 위함
+        """
+        existing = await session.scalar(
+            select(AnalysisJob).where(
+                AnalysisJob.job_type == job_type,
+                AnalysisJob.idempotency_key == idempotency_key,
+            )
+        )
+        if existing:
+            return existing
+
+        job = AnalysisJob(
+            job_type=job_type,
+            target_type=target_type,
+            target_id=target_id,
+            status=JobStatus.PENDING,
+            priority=priority,
+            attempt_count=0,
+            max_attempts=max_attempts,
+            scheduled_at=datetime.now(UTC),
+            idempotency_key=idempotency_key,
+            payload_json=payload_json or {},
+        )
+        session.add(job)
+
+        try:
+            await session.flush()
+            return job
+        except IntegrityError:
+            await session.rollback()
+            existing = await session.scalar(
+                select(AnalysisJob).where(
+                    AnalysisJob.job_type == job_type,
+                    AnalysisJob.idempotency_key == idempotency_key,
+                )
+            )
+            if existing is None:
+                raise
+            return existing
+
+    @staticmethod
+    async def claim_next_job(
+        session: AsyncSession,
+        *,
+        worker_name: str,
+        allowed_job_types: list[JobType],
+        lease_seconds: int = 300,
+    ) -> Optional[AnalysisJob]:
+        """
+        SQLite 친화적인 claim 방식.
+        FOR UPDATE SKIP LOCKED 대신 조건부 UPDATE 사용.
+        """
+        now = datetime.now(UTC)
+
+        stmt = (
+            select(AnalysisJob)
+            .where(AnalysisJob.job_type.in_(allowed_job_types))
+            .where(AnalysisJob.scheduled_at <= now)
+            .order_by(
+                AnalysisJob.priority.asc(),
+                AnalysisJob.scheduled_at.asc(),
+                AnalysisJob.id.asc(),
+            )
+        )
+
+        candidates = list(await session.scalars(stmt))
+        for candidate in candidates:
+            if candidate.status == JobStatus.PENDING:
+                result = await session.execute(
+                    update(AnalysisJob)
+                    .where(
+                        AnalysisJob.id == candidate.id,
+                        AnalysisJob.status == JobStatus.PENDING,
+                    )
+                    .values(
+                        status=JobStatus.RUNNING,
+                        worker_name=worker_name,
+                        started_at=candidate.started_at or now,
+                        last_heartbeat_at=now,
+                        lease_expires_at=now + timedelta(seconds=lease_seconds),
+                        attempt_count=candidate.attempt_count + 1,
+                    )
+                )
+            elif (
+                candidate.status == JobStatus.RUNNING
+                and candidate.lease_expires_at is not None
+                and candidate.lease_expires_at <= now
+            ):
+                result = await session.execute(
+                    update(AnalysisJob)
+                    .where(
+                        AnalysisJob.id == candidate.id,
+                        AnalysisJob.status == JobStatus.RUNNING,
+                        AnalysisJob.lease_expires_at == candidate.lease_expires_at,
+                    )
+                    .values(
+                        status=JobStatus.RUNNING,
+                        worker_name=worker_name,
+                        started_at=candidate.started_at or now,
+                        last_heartbeat_at=now,
+                        lease_expires_at=now + timedelta(seconds=lease_seconds),
+                        attempt_count=candidate.attempt_count + 1,
+                    )
+                )
+            else:
+                continue
+
+            if result.rowcount == 1:
+                await session.commit()
+                return await session.get(AnalysisJob, candidate.id)
+
+            await session.rollback()
+
+        return None
+
+    @staticmethod
+    async def heartbeat(
+        session: AsyncSession,
+        *,
+        job_id: int,
+        lease_seconds: int = 300,
+    ) -> None:
+        now = datetime.now(UTC)
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                last_heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+        )
+        await session.commit()
+
+    @staticmethod
+    async def mark_done(
+        session: AsyncSession,
+        *,
+        job_id: int,
+    ) -> None:
+        now = datetime.now(UTC)
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                status=JobStatus.DONE,
+                finished_at=now,
+                lease_expires_at=None,
+                last_heartbeat_at=now,
+                error_code=None,
+                error_message=None,
+            )
+        )
+        await session.commit()
+
+    @staticmethod
+    async def mark_failed(
+        session: AsyncSession,
+        *,
+        job_id: int,
+        error_code: str,
+        error_message: str,
+        retry_delay_seconds: int = 30,
+    ) -> None:
+        now = datetime.now(UTC)
+        job = await session.get(AnalysisJob, job_id)
+        if job is None:
+            return
+
+        terminal = job.attempt_count >= job.max_attempts
+        next_status = JobStatus.DEAD_LETTER if terminal else JobStatus.PENDING
+
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                status=next_status,
+                error_code=error_code,
+                error_message=error_message[:4000],
+                finished_at=now if terminal else None,
+                scheduled_at=job.scheduled_at if terminal else now + timedelta(seconds=retry_delay_seconds),
+                lease_expires_at=None,
+                last_heartbeat_at=now,
+            )
+        )
+        await session.commit()
+```
+
+---
+
+## 3) `src/workers/preprocess_worker.py`
+
+```python
+from __future__ import annotations
+
+import hashlib
+import re
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.db.models import (
+    AnalysisJob,
+    JobTargetType,
+    JobType,
+    Message,
+    MessageFeature,
+    MessageVersion,
+    NormalizedMessage,
+)
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+from src.workers.base_worker import BaseWorker
+
+
+class PreprocessWorker(BaseWorker):
+    async def run_once(self) -> bool:
+        async with AsyncSessionLocal() as session:
+            job = await AnalysisJobService.claim_next_job(
+                session,
+                worker_name=self.worker_name,
+                allowed_job_types=[JobType.NORMALIZE, JobType.EXTRACT_FEATURES],
+            )
+
+        if not job:
+            return False
+
+        if job.job_type == JobType.NORMALIZE:
+            await self._handle_normalize(job.id)
+            return True
+
+        if job.job_type == JobType.EXTRACT_FEATURES:
+            await self._handle_extract_features(job.id)
+            return True
+
+        return False
+
+    async def _handle_normalize(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                payload = job.payload_json or {}
+                message = await session.get(Message, job.target_id)
+                if message is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="MESSAGE_NOT_FOUND",
+                        error_message=f"message_id={job.target_id}",
+                    )
+                    return
+
+                version_id = payload.get("version_id")
+                if version_id:
+                    version = await session.get(MessageVersion, int(version_id))
+                else:
+                    version = await self._get_or_create_current_version(session, message)
+
+                if version is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="VERSION_NOT_FOUND",
+                        error_message=f"message_id={message.id}",
+                    )
+                    return
+
+                cleaning_version = payload.get("cleaning_version", "v1")
+
+                existing = await session.scalar(
+                    select(NormalizedMessage).where(
+                        NormalizedMessage.message_id == message.id,
+                        NormalizedMessage.version_id == version.id,
+                        NormalizedMessage.cleaning_version == cleaning_version,
+                    )
+                )
+
+                normalized_text = self._normalize_text(version.message_text or message.message_text or "")
+                duplicate_key = self._hash(normalized_text[:200]) if normalized_text else None
+                is_spam = self._is_spam(normalized_text)
+
+                if existing is None:
+                    normalized = NormalizedMessage(
+                        message_id=message.id,
+                        version_id=version.id,
+                        cleaning_version=cleaning_version,
+                        normalized_text=normalized_text,
+                        language_code="ko",
+                        token_estimate=max(1, len(normalized_text) // 4) if normalized_text else 0,
+                        is_spam=is_spam,
+                        spam_reason="spam_keyword" if is_spam else None,
+                        is_duplicate_near=False,
+                        duplicate_group_key=duplicate_key,
+                        quality_score=0.1 if is_spam else 0.8,
+                    )
+                    session.add(normalized)
+                    await session.flush()
+                else:
+                    normalized = existing
+
+                await AnalysisJobService.enqueue_job(
+                    session,
+                    job_type=JobType.EXTRACT_FEATURES,
+                    target_type=JobTargetType.MESSAGE,
+                    target_id=message.id,
+                    idempotency_key=f"extract_features:message:{message.id}:version:{version.id}:fv1",
+                    payload_json={
+                        "message_id": message.id,
+                        "version_id": version.id,
+                        "normalized_message_id": normalized.id,
+                    },
+                    priority=100,
+                )
+
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="NORMALIZE_ERROR",
+                    error_message=str(e),
+                )
+            logger.exception(f"[{self.worker_name}] normalize failed: {e}")
+
+    async def _handle_extract_features(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                payload = job.payload_json or {}
+                message_id = int(payload["message_id"])
+                version_id = int(payload["version_id"])
+                normalized_message_id = int(payload["normalized_message_id"])
+
+                normalized = await session.get(NormalizedMessage, normalized_message_id)
+                if normalized is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="NORMALIZED_MESSAGE_NOT_FOUND",
+                        error_message=f"normalized_message_id={normalized_message_id}",
+                    )
+                    return
+
+                existing = await session.scalar(
+                    select(MessageFeature).where(
+                        MessageFeature.message_id == message_id,
+                        MessageFeature.version_id == version_id,
+                        MessageFeature.feature_version == "v1",
+                    )
+                )
+
+                text = normalized.normalized_text or ""
+                ticker_candidates = self._extract_tickers(text)
+                keyword_hits = self._extract_keywords(text)
+                theme_candidates = self._map_themes(keyword_hits)
+
+                if existing is None:
+                    feature = MessageFeature(
+                        message_id=message_id,
+                        version_id=version_id,
+                        normalized_message_id=normalized_message_id,
+                        feature_version="v1",
+                        ticker_candidates_json=ticker_candidates,
+                        company_alias_hits_json=None,
+                        theme_candidates_json=theme_candidates,
+                        keyword_hits_json=keyword_hits,
+                        entity_spans_json=None,
+                        sentiment_rule_score=self._score_sentiment(text),
+                        urgency_score=self._score_urgency(text),
+                        novelty_score=0.5,
+                        source_reliability_score=0.5,
+                    )
+                    session.add(feature)
+                    await session.flush()
+                else:
+                    feature = existing
+
+                await AnalysisJobService.enqueue_job(
+                    session,
+                    job_type=JobType.SINGLE_MESSAGE_SUMMARY,
+                    target_type=JobTargetType.MESSAGE,
+                    target_id=message_id,
+                    idempotency_key=f"single_message_summary:message:{message_id}:version:{version_id}:sv1",
+                    payload_json={
+                        "message_id": message_id,
+                        "version_id": version_id,
+                        "normalized_message_id": normalized_message_id,
+                        "feature_id": feature.id,
+                    },
+                    priority=200,
+                )
+
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="EXTRACT_FEATURES_ERROR",
+                    error_message=str(e),
+                )
+            logger.exception(f"[{self.worker_name}] extract_features failed: {e}")
+
+    async def _get_or_create_current_version(self, session, message: Message) -> MessageVersion:
+        current = await session.scalar(
+            select(MessageVersion).where(
+                MessageVersion.message_id == message.id,
+                MessageVersion.is_current.is_(True),
+            )
+        )
+        if current:
+            return current
+
+        version = MessageVersion(
+            message_id=message.id,
+            version_no=1,
+            message_text=message.message_text,
+            raw_hash=self._hash(message.message_text or ""),
+            edit_date_utc=getattr(message, "edit_date_utc", None),
+            is_current=True,
+        )
+        session.add(version)
+        await session.flush()
+        return version
+
+    def _normalize_text(self, text: str) -> str:
+        text = re.sub(r"https?://\S+", " ", text)
+        text = re.sub(r"t\.me/\S+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _is_spam(self, text: str) -> bool:
+        spam_keywords = ["무료입장", "오픈채팅", "문의주세요", "수익인증", "입장코드"]
+        return any(k in text for k in spam_keywords)
+
+    def _extract_tickers(self, text: str) -> dict:
+        codes = re.findall(r"\b\d{6}\b", text)
+        uniq = list(dict.fromkeys(codes))
+        return {"tickers": [{"symbol": c, "confidence": 0.75} for c in uniq]}
+
+    def _extract_keywords(self, text: str) -> dict:
+        keywords = ["수주", "실적", "상한가", "급등", "승인", "계약", "반도체", "2차전지", "로봇", "바이오", "정책"]
+        hits = [kw for kw in keywords if kw in text]
+        return {"keywords": hits}
+
+    def _map_themes(self, keyword_hits: dict) -> dict:
+        mapping = {
+            "반도체": "반도체",
+            "2차전지": "2차전지",
+            "로봇": "로봇",
+            "바이오": "바이오",
+            "정책": "정책수혜",
+        }
+        themes = []
+        for kw in keyword_hits.get("keywords", []):
+            if kw in mapping:
+                themes.append({"theme": mapping[kw], "confidence": 0.7})
+        return {"themes": themes}
+
+    def _score_sentiment(self, text: str) -> float:
+        score = 0.0
+        for kw in ["수주", "실적", "승인", "계약", "확대", "급등"]:
+            if kw in text:
+                score += 0.2
+        for kw in ["악재", "하락", "취소", "적자", "경고"]:
+            if kw in text:
+                score -= 0.2
+        return max(-1.0, min(1.0, score))
+
+    def _score_urgency(self, text: str) -> float:
+        score = 0.0
+        for kw in ["속보", "긴급", "방금", "단독", "급등", "상한가"]:
+            if kw in text:
+                score += 0.2
+        return max(0.0, min(1.0, score))
+
+    def _hash(self, value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+```
+
+---
+
+## 7) `src/workers/inference_worker.py`
+
+```python
+from __future__ import annotations
+
+from src.common.logger import logger
+from src.infra.db.models import (
+    AnalysisJob,
+    AnalysisResult,
+    JobTargetType,
+    JobType,
+    MessageFeature,
+    NormalizedMessage,
+    ResultType,
+)
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+from src.workers.base_worker import BaseWorker
+
+
+class InferenceWorker(BaseWorker):
+    def __init__(self, worker_name: str, poll_interval: float = 2.0, job_types: list[str] | None = None):
+        super().__init__(worker_name, poll_interval)
+        self.job_types = self._resolve_job_types(job_types)
+
+    async def run_once(self) -> bool:
+        async with AsyncSessionLocal() as session:
+            job = await AnalysisJobService.claim_next_job(
+                session,
+                worker_name=self.worker_name,
+                allowed_job_types=self.job_types,
+            )
+
+        if not job:
+            return False
+
+        if job.job_type == JobType.SINGLE_MESSAGE_SUMMARY:
+            await self._handle_single_message_summary(job.id)
+            return True
+
+        if job.job_type == JobType.WINDOW_THEME_ANALYSIS:
+            await self._handle_window_theme_analysis(job.id)
+            return True
+
+        return False
+
+    async def _handle_single_message_summary(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                payload = job.payload_json or {}
+                target_id = job.target_id
+
+                normalized = await session.get(NormalizedMessage, int(payload["normalized_message_id"]))
+                feature = await session.get(MessageFeature, int(payload["feature_id"]))
+
+                if normalized is None or feature is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="INFERENCE_INPUT_NOT_FOUND",
+                        error_message=f"payload={payload}",
+                    )
+                    return
+
+                prompt_input = {
+                    "normalized_text": normalized.normalized_text,
+                    "ticker_candidates": feature.ticker_candidates_json,
+                    "theme_candidates": feature.theme_candidates_json,
+                    "keyword_hits": feature.keyword_hits_json,
+                }
+
+            result_json = await self._fake_llm_summarize(prompt_input)
+
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    AnalysisResult(
+                        job_id=job_id,
+                        target_type=JobTargetType.MESSAGE,
+                        target_id=target_id,
+                        result_type=ResultType.SUMMARY,
+                        model_name="gpt-4o",
+                        model_version="placeholder",
+                        prompt_version="summary_v1",
+                        input_version="normalize_v1_feature_v1",
+                        confidence=result_json.get("confidence"),
+                        latency_ms=result_json.get("latency_ms"),
+                        cost_input_tokens=result_json.get("input_tokens"),
+                        cost_output_tokens=result_json.get("output_tokens"),
+                        result_json=result_json,
+                    )
+                )
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="INFERENCE_ERROR",
+                    error_message=str(e),
+                )
+            logger.exception(f"[{self.worker_name}] single_message_summary failed: {e}")
+
+    async def _handle_window_theme_analysis(self, job_id: int) -> None:
+        async with AsyncSessionLocal() as session:
+            await AnalysisJobService.mark_done(session, job_id=job_id)
+
+    async def _fake_llm_summarize(self, prompt_input: dict) -> dict:
+        text = prompt_input.get("normalized_text") or ""
+        preview = text[:160]
+
+        return {
+            "summary": preview,
+            "event_type": "unknown",
+            "confidence": 0.62,
+            "input_tokens": max(1, len(text) // 4),
+            "output_tokens": 60,
+            "latency_ms": 350,
+            "evidence": {
+                "tickers": prompt_input.get("ticker_candidates"),
+                "themes": prompt_input.get("theme_candidates"),
+            },
+        }
+
+    def _resolve_job_types(self, job_types: list[str] | None) -> list[JobType]:
+        if not job_types:
+            return [JobType.SINGLE_MESSAGE_SUMMARY, JobType.WINDOW_THEME_ANALYSIS]
+        return [JobType(item) for item in job_types]
+```
+
+---
+
+## 8) `run_worker.py`
+
+```python
+import argparse
+import asyncio
+
+from src.workers.inference_worker import InferenceWorker
+from src.workers.preprocess_worker import PreprocessWorker
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Background worker runner")
+    parser.add_argument(
+        "--type",
+        required=True,
+        choices=["preprocess", "inference"],
+        help="Worker type to run",
+    )
+    parser.add_argument(
+        "--worker-name",
+        default=None,
+        help="Logical worker name",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2.0,
+        help="Polling interval seconds",
+    )
+    parser.add_argument(
+        "--job-types",
+        nargs="*",
+        default=None,
+        help="Optional inference job type filter",
+    )
+    return parser
+
+
+async def async_main(args) -> None:
+    worker_name = args.worker_name or f"{args.type}-worker-1"
+
+    if args.type == "preprocess":
+        worker = PreprocessWorker(
+            worker_name=worker_name,
+            poll_interval=args.poll_interval,
+        )
+    elif args.type == "inference":
+        worker = InferenceWorker(
+            worker_name=worker_name,
+            poll_interval=args.poll_interval,
+            job_types=args.job_types,
+        )
+    else:
+        raise ValueError(f"Unsupported worker type: {args.type}")
+
+    await worker.run_forever()
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    asyncio.run(async_main(args))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 9) 실행 예시
+
+```bash
+python run_worker.py --type preprocess --worker-name preprocess-1
+python run_worker.py --type inference --worker-name inference-1
+```
+
+특정 inference job만 돌리고 싶으면:
+
+```bash
+python run_worker.py --type inference --job-types single_message_summary
+```
+
+---
+
+## 10) 마지막 체크포인트
+
+바로 적용하기 전에 아래 네 가지만 확인하시면 됩니다.
+
+* `src.infra.db.session`에 `AsyncSessionLocal`이 실제로 있는지
+* `models.py`의 enum이 지금 코드와 같은 타입인지
+* `collector_worker.py`의 공통 persist 지점에서 `normalize` job을 enqueue하고 있는지
+* `AnalysisJobService.enqueue_job()`가 내부에서 commit하지 않는지
+
+이 네 가지만 맞으면, 지금까지 정리한 테스트 패키지와 실행 코드가 한 세트로 맞물립니다.
+
+

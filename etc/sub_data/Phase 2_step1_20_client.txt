@@ -1,0 +1,508 @@
+네. 지금 가장 자연스러운 수정은 두 파일입니다.
+
+* `collector_worker.py`는 현재 `run_startup_tasks()`를 인자 없이 호출하고, `persist_message_payload()`는 무조건 `is_backfill=False`로 checkpoint를 갱신하고 있습니다. 또 이벤트 등록도 `self._collector.add_event_handler(...)`를 직접 부릅니다.
+* `client.py`는 README상 Telethon 래퍼 역할이므로, 여기서 history iterator와 event registration을 감싸는 인터페이스를 두는 쪽이 맞습니다.
+
+아래 초안대로 가면 됩니다.
+
+---
+
+## 1) `collector_worker.py` 수정 초안
+
+핵심 변경은 4개입니다.
+
+* `persist_message_payload(..., is_backfill=False)` 추가
+* `persist_message_from_history()`는 `is_backfill=True`
+* `run_startup_tasks(collector=..., persist_func=...)`로 호출
+* event 등록은 client wrapper 메서드 사용
+
+```python
+from __future__ import annotations
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.telegram.client import TelegramCollector
+from src.workers.startup_tasks import run_startup_tasks
+from src.infra.telegram.schemas import UpsertResult
+from src.infra.telegram.translators import telethon_to_payload
+from src.infra.db.repository import upsert_telegram_message, update_channel_checkpoint
+
+
+async def persist_message_payload(db, payload, *, is_backfill: bool = False) -> UpsertResult:
+    """공통 메시지 저장 래퍼"""
+    result = await upsert_telegram_message(db, payload)
+
+    if result.action in {"created", "updated", "unchanged"}:
+        if result.checkpoint_candidate is not None:
+            await update_channel_checkpoint(
+                db,
+                payload.telegram_channel_id,
+                result.checkpoint_candidate,
+                is_backfill=is_backfill,
+            )
+
+    return result
+
+
+async def persist_message_from_event(db, event_message, telegram_channel_id: int):
+    """실시간 이벤트 기반 저장"""
+    payload = telethon_to_payload(telegram_channel_id, event_message)
+    return await persist_message_payload(db, payload, is_backfill=False)
+
+
+async def persist_message_from_history(db, history_message, telegram_channel_id: int):
+    """백필 기반 저장"""
+    payload = telethon_to_payload(telegram_channel_id, history_message)
+    return await persist_message_payload(db, payload, is_backfill=True)
+
+
+class CollectorWorker:
+    """텔레그램 메시지 수집 및 관리를 담당하는 워커 클래스"""
+
+    def __init__(self) -> None:
+        self.is_running = False
+        self._collector: TelegramCollector | None = None
+
+    async def _handle_new_message(self, event):
+        """신규 메시지 수신 시 호출되는 핸들러."""
+        from src.infra.db.models import TelegramChannel
+        from src.infra.db.session import get_session
+
+        try:
+            chat = await event.get_chat()
+            chat_id = str(chat.id)
+
+            async with get_session() as db:
+                channel = await db.scalar(
+                    select(TelegramChannel).where(TelegramChannel.tg_channel_id == chat_id)
+                )
+
+                if not channel or not channel.is_collecting:
+                    return
+
+                await persist_message_from_event(db, event.message, channel.id)
+                await db.commit()
+
+        except Exception as e:
+            logger.error(f"이벤트 저장 중 오류 발생: {e}")
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+    async def _handle_edited_message(self, event):
+        """수정 메시지 수신 시 호출되는 핸들러."""
+        # 현재 저장 경로는 동일하게 사용
+        await self._handle_new_message(event)
+
+    async def start(self) -> None:
+        """
+        워커를 시작합니다.
+
+        [수집 원칙]
+        - 선택 채널 활성화 시: 최근 3일 또는 최근 1,000건 백필
+        - 백필 완료 후: 실시간 이벤트 수집 전환
+        """
+        logger.info("Collector Worker 시작 중...")
+
+        self._collector = TelegramCollector()
+
+        try:
+            await self._collector.connect(interactive=False)
+        except Exception as e:
+            logger.error(f"텔레그램 연결 실패: {e}. 인증을 먼저 완료해야 합니다.")
+            return
+
+        # startup task에 collector와 history persistence 래퍼를 넘김
+        await run_startup_tasks(
+            collector=self._collector,
+            persist_func=persist_message_from_history,
+        )
+
+        # Telethon 세부 구현은 client wrapper 안으로 숨김
+        self._collector.register_new_message_handler(self._handle_new_message)
+        self._collector.register_edited_message_handler(self._handle_edited_message)
+
+        self.is_running = True
+        logger.info("Collector Worker 수집 루프 진입 - 실시간 모니터링 중...")
+
+        try:
+            await self._collector.run_until_disconnected()
+        except Exception as e:
+            logger.error(f"수집 루프 비정상 종료: {e}")
+        finally:
+            self.is_running = False
+
+    async def stop(self) -> None:
+        """워커를 정지합니다."""
+        logger.info("Collector Worker 정지 중...")
+        self.is_running = False
+        if self._collector:
+            await self._collector.disconnect()
+```
+
+### 이 수정의 의미
+
+지금 구조에서는 실시간 저장과 백필 저장이 둘 다 같은 `telethon_to_payload() -> upsert_telegram_message() -> update_channel_checkpoint()` 경로를 타지만, checkpoint 갱신 시 `is_backfill` 구분이 없었습니다. 이 수정으로 그 구분이 생깁니다. 또한 현재 worker는 startup task를 인자 없이 호출하고, 이벤트 등록도 Telethon API를 직접 쓰고 있으므로 그 부분도 wrapper 방식으로 정리됩니다.
+
+---
+
+## 2) `client.py` 수정 초안
+
+이건 실제 내부 Telethon 속성명이 무엇인지에 따라 `self.client` 또는 `self._client`만 맞추면 됩니다. README상 역할은 “Telethon 라이브러리를 래핑한 텔레그램 통신 클라이언트”이므로 아래 정도 인터페이스가 가장 자연스럽습니다.
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timezone, timedelta
+
+from telethon import TelegramClient, events
+
+from src.common.logger import logger
+from config.settings import settings
+
+
+class TelegramCollector:
+    def __init__(self):
+        self.client = TelegramClient(
+            settings.TELEGRAM_SESSION_NAME,
+            settings.TELEGRAM_API_ID,
+            settings.TELEGRAM_API_HASH,
+        )
+
+    async def __aenter__(self):
+        await self.connect(interactive=False)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.disconnect()
+
+    async def connect(self, interactive: bool = False):
+        await self.client.connect()
+
+        if not await self.client.is_user_authorized():
+            if not interactive:
+                raise RuntimeError("텔레그램 인증 세션이 없습니다.")
+            # 필요 시 interactive 인증 로직 연결
+            raise RuntimeError("interactive 인증 로직이 아직 연결되지 않았습니다.")
+
+    async def disconnect(self):
+        await self.client.disconnect()
+
+    async def run_until_disconnected(self):
+        await self.client.run_until_disconnected()
+
+    async def get_dialogs(self):
+        dialogs = await self.client.get_dialogs()
+        result = []
+
+        for d in dialogs:
+            if not d.is_channel and not d.is_group:
+                continue
+
+            entity = d.entity
+            result.append(
+                {
+                    "id": str(entity.id),
+                    "title": d.name,
+                    "username": getattr(entity, "username", None),
+                    "access_hash": str(getattr(entity, "access_hash", "")),
+                    "is_channel": d.is_channel,
+                }
+            )
+
+        return result
+
+    async def iter_channel_messages(self, entity, limit: int = 1000, days: int = 3):
+        """
+        최근 N일 또는 최대 N건까지 메시지를 순회합니다.
+        entity는 tg_channel_id(str) 또는 username/entity 모두 허용합니다.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        async for message in self.client.iter_messages(entity, limit=limit):
+            msg_date = getattr(message, "date", None)
+
+            if msg_date is not None:
+                if msg_date.tzinfo is None:
+                    msg_date = msg_date.replace(tzinfo=timezone.utc)
+                else:
+                    msg_date = msg_date.astimezone(timezone.utc)
+
+                if msg_date < cutoff:
+                    break
+
+            yield message
+
+    def register_new_message_handler(self, handler):
+        self.client.add_event_handler(handler, events.NewMessage)
+
+    def register_edited_message_handler(self, handler):
+        self.client.add_event_handler(handler, events.MessageEdited)
+```
+
+### 이 수정의 의미
+
+현재 worker는 `self._collector.add_event_handler(..., events.NewMessage)`를 직접 쓰고 있는데, 이건 Telethon 세부 구현이 worker로 새는 구조입니다. wrapper 메서드로 감추면 worker는 `register_*_handler()`만 알면 됩니다. 또한 STEP 2 백필은 `startup_tasks.py`에서 history를 순회해야 하므로 `iter_channel_messages()`는 client 쪽에 반드시 있어야 합니다.
+
+---
+
+## 3) 같이 바꿔야 하는 한 줄
+
+`startup_tasks.py`는 지금 `run_startup_tasks()`가 무인자 함수라서, 아래처럼 시그니처를 바꿔야 방금 수정안이 연결됩니다.
+
+```python
+async def run_startup_tasks(collector, persist_func) -> None:
+    ...
+```
+
+그리고 내부에서:
+
+```python
+await backfill_missed_messages(
+    collector=collector,
+    persist_func=persist_func,
+)
+```
+
+이렇게 연결하면 됩니다. 현재 `startup_tasks.py`는 백필 대상 조회 껍데기만 있고 실제 history 순회는 비어 있으므로, 이 연결이 STEP 2 본체의 시작입니다. 
+
+---
+
+## 4) 적용 순서
+
+먼저 이 순서로 가면 됩니다.
+
+1. `collector_worker.py` 수정
+2. `client.py`에 `iter_channel_messages()`, `register_*_handler()` 추가
+3. `startup_tasks.py` 시그니처 변경
+4. 마지막으로 `tests/test_collector_worker.py`에서
+
+   * `persist_message_from_history()`가 `is_backfill=True`로 checkpoint를 갱신하는지
+     한 케이스 추가
+
+좋습니다.
+그럼 바로 이어서 **`perform_backfill_for_channel()` 테스트 초안**을 드리겠습니다.
+
+이 테스트의 목적은 3가지입니다.
+
+* 최근 메시지만 처리되는지
+* 오래된 메시지를 만나면 중단하는지
+* `persist_func(db, history_message, channel.id)`가 정확히 호출되는지
+
+아래 코드는 **`tests/test_startup_tasks.py`**로 새로 만들거나, 기존 테스트 파일에 추가하면 됩니다.
+
+```python
+import pytest
+from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
+
+from src.workers.startup_tasks import perform_backfill_for_channel
+
+
+class FakeCollector:
+    def __init__(self, messages):
+        self.messages = messages
+        self.called_with = None
+
+    async def iter_channel_messages(self, entity, limit=1000, days=3):
+        self.called_with = {
+            "entity": entity,
+            "limit": limit,
+            "days": days,
+        }
+        for msg in self.messages:
+            yield msg
+
+
+def make_message(message_id: int, dt: datetime, text: str = "msg"):
+    return SimpleNamespace(
+        id=message_id,
+        date=dt,
+        text=text,
+    )
+
+
+@pytest.mark.asyncio
+async def test_perform_backfill_for_channel_processes_recent_messages_only():
+    now = datetime.now(timezone.utc)
+
+    messages = [
+        make_message(1, now - timedelta(hours=1), "recent-1"),
+        make_message(2, now - timedelta(hours=5), "recent-2"),
+        make_message(3, now - timedelta(days=1), "recent-3"),
+    ]
+    collector = FakeCollector(messages)
+
+    channel = SimpleNamespace(
+        id=10,
+        tg_channel_id="1001",
+        title="Test Channel",
+    )
+
+    called = []
+
+    async def fake_persist(db, history_message, telegram_channel_id):
+        called.append(
+            {
+                "message_id": history_message.id,
+                "channel_id": telegram_channel_id,
+            }
+        )
+        return SimpleNamespace(action="created", checkpoint_candidate=history_message.id)
+
+    processed_count = await perform_backfill_for_channel(
+        db=object(),
+        collector=collector,
+        channel=channel,
+        persist_func=fake_persist,
+        days=3,
+        limit=1000,
+    )
+
+    assert processed_count == 3
+    assert [x["message_id"] for x in called] == [1, 2, 3]
+    assert all(x["channel_id"] == 10 for x in called)
+
+    assert collector.called_with == {
+        "entity": "1001",
+        "limit": 1000,
+        "days": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_perform_backfill_for_channel_stops_when_message_is_older_than_cutoff():
+    now = datetime.now(timezone.utc)
+
+    messages = [
+        make_message(1, now - timedelta(hours=2), "recent"),
+        make_message(2, now - timedelta(days=4), "too-old"),
+        make_message(3, now - timedelta(hours=1), "should-not-be-processed"),
+    ]
+    collector = FakeCollector(messages)
+
+    channel = SimpleNamespace(
+        id=20,
+        tg_channel_id="2001",
+        title="Old Cutoff Channel",
+    )
+
+    called_ids = []
+
+    async def fake_persist(db, history_message, telegram_channel_id):
+        called_ids.append(history_message.id)
+        return SimpleNamespace(action="created", checkpoint_candidate=history_message.id)
+
+    processed_count = await perform_backfill_for_channel(
+        db=object(),
+        collector=collector,
+        channel=channel,
+        persist_func=fake_persist,
+        days=3,
+        limit=1000,
+    )
+
+    # 2번 메시지에서 cutoff 미만이라 break 되므로 1번만 처리
+    assert processed_count == 1
+    assert called_ids == [1]
+
+
+@pytest.mark.asyncio
+async def test_perform_backfill_for_channel_passes_naive_datetime_messages():
+    now_naive = datetime.utcnow()  # tzinfo 없음
+
+    messages = [
+        make_message(1, now_naive - timedelta(hours=1), "naive-recent"),
+        make_message(2, now_naive - timedelta(days=5), "naive-old"),
+    ]
+    collector = FakeCollector(messages)
+
+    channel = SimpleNamespace(
+        id=30,
+        tg_channel_id="3001",
+        title="Naive Datetime Channel",
+    )
+
+    called_ids = []
+
+    async def fake_persist(db, history_message, telegram_channel_id):
+        called_ids.append(history_message.id)
+        return SimpleNamespace(action="created", checkpoint_candidate=history_message.id)
+
+    processed_count = await perform_backfill_for_channel(
+        db=object(),
+        collector=collector,
+        channel=channel,
+        persist_func=fake_persist,
+        days=3,
+        limit=1000,
+    )
+
+    assert processed_count == 1
+    assert called_ids == [1]
+```
+
+이 다음으로 바로 붙이면 좋은 테스트 2개도 있습니다.
+
+첫째는 **`mark_backfill_completed()`** 테스트입니다.
+
+```python
+@pytest.mark.asyncio
+async def test_mark_backfill_completed_sets_active_and_clears_error(db_session):
+    from datetime import datetime, timezone
+    from sqlalchemy import select
+    from src.infra.db.models import TelegramChannelCollectionState
+    from src.workers.startup_tasks import mark_backfill_completed
+
+    state = TelegramChannelCollectionState(
+        telegram_channel_id=1,
+        status="PENDING_BACKFILL",
+        last_error_message="old error",
+        last_error_at=datetime.now(timezone.utc),
+    )
+    db_session.add(state)
+    await db_session.commit()
+
+    await mark_backfill_completed(db_session, channel_id=1)
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalar_one()
+
+    assert saved.status == "ACTIVE"
+    assert saved.last_backfill_at is not None
+    assert saved.last_error_message is None
+```
+
+둘째는 **`mark_backfill_failed()`** 테스트입니다.
+
+```python
+@pytest.mark.asyncio
+async def test_mark_backfill_failed_sets_error_and_message(db_session):
+    from sqlalchemy import select
+    from src.infra.db.models import TelegramChannelCollectionState
+    from src.workers.startup_tasks import mark_backfill_failed
+
+    await mark_backfill_failed(db_session, channel_id=1, error_message="forced failure")
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalar_one()
+
+    assert saved.status == "ERROR"
+    assert saved.last_error_message == "forced failure"
+    assert saved.last_error_at is not None
+```
+
+주의할 점은 하나입니다.
+
+현재 프로젝트에서 상태 테이블 키가 `telegram_channel_id`인지 `channel_id`인지가 파일마다 흔들릴 여지가 있었으니,
+위 테스트의 `TelegramChannelCollectionState(telegram_channel_id=1, ...)` 부분은 **실제 모델 필드명**에 맞춰 한 번만 맞춰주면 됩니다.
+
+다음으로 가장 자연스러운 작업은 **`tests/test_startup_tasks.py` 전체본**을 지금 구조에 맞춰 한 번에 정리하는 것입니다.
+
+

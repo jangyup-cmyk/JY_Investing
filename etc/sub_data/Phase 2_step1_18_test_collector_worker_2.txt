@@ -1,0 +1,330 @@
+좋습니다.
+아래는 지금까지 공유해주신 `collector_worker.py` 구조를 기준으로 정리한 **`tests/test_collector_worker.py` 전체본**입니다.
+
+한 군데만 먼저 확인하면 됩니다.
+
+* 상태 테이블의 FK 컬럼이 **`telegram_channel_id`** 기준이면 아래 그대로 사용
+* 상태 테이블이 내부 PK인 **`channel_id`** 기준이면 `select(...where(... == 1))` 부분만 `channel_id`로 바꾸면 됩니다
+
+```python
+import pytest
+import pytest_asyncio
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+from src.infra.db.models import (
+    Base,
+    TelegramChannel,
+    TelegramChannelCollectionState,
+)
+from src.infra.telegram.schemas import TelegramMessagePayload
+from src.workers.collector_worker import (
+    CollectorWorker,
+    persist_message_payload,
+)
+
+
+@pytest_asyncio.fixture
+async def db_session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with Session() as session:
+        # checkpoint 갱신 테스트용 채널 1건 생성
+        channel = TelegramChannel(
+            telegram_account_id=1,
+            tg_channel_id="1001",
+            title="Worker Test Channel",
+            username="worker_test",
+            channel_type="CHANNEL",
+            status="SYNCED",
+            is_collecting=True,
+            last_synced_at=datetime.now(timezone.utc),
+        )
+        session.add(channel)
+        await session.commit()
+
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
+def make_payload(message_id: int = 100) -> TelegramMessagePayload:
+    now = datetime.now(timezone.utc)
+    return TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=message_id,
+        sender_id=None,
+        message_text_raw=f"msg-{message_id}",
+        reply_to_message_id=None,
+        views=None,
+        forwards=None,
+        grouped_id=None,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=now,
+        collected_at=now,
+        raw_payload_json={"text": f"msg-{message_id}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_updates_checkpoint_on_created(db_session, monkeypatch):
+    payload = make_payload(101)
+
+    class DummyResult:
+        action = "created"
+        checkpoint_candidate = 101
+
+    async def fake_upsert(db, payload):
+        return DummyResult()
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        fake_upsert,
+    )
+
+    result = await persist_message_payload(db_session, payload)
+    await db_session.commit()
+
+    assert result.action == "created"
+
+    state = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert state.last_collected_message_id == 101
+    assert state.status == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_updates_checkpoint_on_updated(db_session, monkeypatch):
+    payload = make_payload(102)
+
+    class DummyResult:
+        action = "updated"
+        checkpoint_candidate = 102
+
+    async def fake_upsert(db, payload):
+        return DummyResult()
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        fake_upsert,
+    )
+
+    result = await persist_message_payload(db_session, payload)
+    await db_session.commit()
+
+    assert result.action == "updated"
+
+    state = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert state.last_collected_message_id == 102
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_updates_checkpoint_on_unchanged(db_session, monkeypatch):
+    payload = make_payload(123)
+
+    class DummyResult:
+        action = "unchanged"
+        checkpoint_candidate = 123
+
+    async def fake_upsert(db, payload):
+        return DummyResult()
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        fake_upsert,
+    )
+
+    result = await persist_message_payload(db_session, payload)
+    await db_session.commit()
+
+    assert result.action == "unchanged"
+
+    state = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert state.last_collected_message_id == 123
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_does_not_touch_checkpoint_when_upsert_raises(
+    db_session, monkeypatch
+):
+    payload = make_payload(999)
+
+    async def broken_upsert(db, payload):
+        raise RuntimeError("forced failure from repository")
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        broken_upsert,
+    )
+
+    with pytest.raises(RuntimeError, match="forced failure from repository"):
+        await persist_message_payload(db_session, payload)
+
+    state_rows = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalars().all()
+
+    # checkpoint row 자체가 생성되지 않아야 함
+    assert state_rows == []
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_rolls_back_when_persist_raises(monkeypatch):
+    worker = CollectorWorker()
+
+    fake_chat = SimpleNamespace(id=1001)
+    fake_event = SimpleNamespace(
+        message=SimpleNamespace(id=999, text="boom")
+    )
+
+    async def fake_get_chat():
+        return fake_chat
+
+    fake_event.get_chat = fake_get_chat
+
+    fake_channel = SimpleNamespace(
+        id=1,
+        tg_channel_id="1001",
+        is_collecting=True,
+    )
+
+    fake_db = SimpleNamespace(
+        scalar=AsyncMock(return_value=fake_channel),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return fake_db
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_get_session():
+        return FakeSessionContext()
+
+    async def broken_persist_message_from_event(db, event_message, telegram_channel_id):
+        raise RuntimeError("forced persist failure")
+
+    monkeypatch.setattr(
+        "src.infra.db.session.get_session",
+        fake_get_session,
+    )
+    monkeypatch.setattr(
+        "src.workers.collector_worker.persist_message_from_event",
+        broken_persist_message_from_event,
+    )
+
+    await worker._handle_new_message(fake_event)
+
+    fake_db.rollback.assert_awaited_once()
+    fake_db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_skips_when_channel_not_collecting(monkeypatch):
+    worker = CollectorWorker()
+
+    fake_chat = SimpleNamespace(id=1001)
+    fake_event = SimpleNamespace(
+        message=SimpleNamespace(id=1, text="skip")
+    )
+
+    async def fake_get_chat():
+        return fake_chat
+
+    fake_event.get_chat = fake_get_chat
+
+    fake_channel = SimpleNamespace(
+        id=1,
+        tg_channel_id="1001",
+        is_collecting=False,
+    )
+
+    fake_db = SimpleNamespace(
+        scalar=AsyncMock(return_value=fake_channel),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return fake_db
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_get_session():
+        return FakeSessionContext()
+
+    persist_mock = AsyncMock()
+
+    monkeypatch.setattr(
+        "src.infra.db.session.get_session",
+        fake_get_session,
+    )
+    monkeypatch.setattr(
+        "src.workers.collector_worker.persist_message_from_event",
+        persist_mock,
+    )
+
+    await worker._handle_new_message(fake_event)
+
+    persist_mock.assert_not_awaited()
+    fake_db.commit.assert_not_awaited()
+    fake_db.rollback.assert_not_awaited()
+```
+
+### 이 파일이 잠그는 규약
+
+* `persist_message_payload()`는 `created / updated / unchanged`에서 checkpoint를 갱신
+* repository가 예외를 던지면 checkpoint를 건드리지 않고 예외를 그대로 전달
+* `_handle_new_message()`는 저장 단계 예외 시 `rollback()` 수행
+* 수집 비활성 채널은 저장 로직 자체를 타지 않음
+
+### 실행 순서
+
+먼저 이것부터 돌려보면 됩니다.
+
+```bash
+pytest tests/test_collector_worker.py -q
+```
+
+실행 후 가장 먼저 깨질 가능성이 있는 부분은 대체로 둘 중 하나입니다.
+
+* 상태 테이블 조회 컬럼명이 `telegram_channel_id`가 아니라 `channel_id`인 경우
+* `CollectorWorker()` 생성자 시그니처가 기본 생성이 아닌 경우
+
+그 경우에는 그 부분만 맞춰서 바로 손보면 됩니다.

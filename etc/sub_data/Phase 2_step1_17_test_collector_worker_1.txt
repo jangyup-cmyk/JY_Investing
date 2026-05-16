@@ -1,0 +1,142 @@
+좋습니다.
+바로 다음 작업으로 넣기 가장 좋은 테스트는 **`CollectorWorker._handle_new_message()`가 repository 예외 상황에서 `rollback()`을 호출하고 `commit()`은 하지 않는지** 검증하는 것입니다.
+
+아래 코드를 `tests/test_collector_worker.py`에 **추가**하면 됩니다.
+
+```python
+import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+from src.workers.collector_worker import CollectorWorker
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_rolls_back_when_persist_raises(monkeypatch):
+    worker = CollectorWorker()
+
+    # 가짜 이벤트 객체
+    fake_chat = SimpleNamespace(id=1001)
+    fake_event = SimpleNamespace(
+        message=SimpleNamespace(id=999, text="boom")
+    )
+
+    async def fake_get_chat():
+        return fake_chat
+
+    fake_event.get_chat = fake_get_chat
+
+    # DB에서 조회될 가짜 채널
+    fake_channel = SimpleNamespace(
+        id=1,
+        tg_channel_id="1001",
+        is_collecting=True,
+    )
+
+    # 가짜 DB 세션
+    fake_db = SimpleNamespace(
+        scalar=AsyncMock(return_value=fake_channel),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    # async with get_session() 대응용 컨텍스트 매니저
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return fake_db
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_get_session():
+        return FakeSessionContext()
+
+    async def broken_persist_message_from_event(db, event_message, telegram_channel_id):
+        raise RuntimeError("forced persist failure")
+
+    # 함수 내부에서 import하는 get_session을 패치
+    monkeypatch.setattr(
+        "src.infra.db.session.get_session",
+        fake_get_session,
+    )
+
+    # worker가 호출하는 저장 래퍼를 강제로 실패시킴
+    monkeypatch.setattr(
+        "src.workers.collector_worker.persist_message_from_event",
+        broken_persist_message_from_event,
+    )
+
+    await worker._handle_new_message(fake_event)
+
+    fake_db.rollback.assert_awaited_once()
+    fake_db.commit.assert_not_awaited()
+```
+
+### 이 테스트가 잠그는 규약
+
+이 테스트는 현재 `_handle_new_message()` 구현이
+
+* 채널이 존재하고
+* `is_collecting=True`인 경우
+* `persist_message_from_event()`가 예외를 던지면
+  **반드시 `rollback()`을 호출하고 `commit()`은 하지 않는다**
+  는 규약을 고정합니다. 현재 `_handle_new_message()`는 `persist_message_from_event()` 예외를 잡아 `rollback()`하는 구조이므로, 이 테스트가 정확히 맞닿습니다. 
+
+### 같이 넣으면 좋은 보조 테스트 1개
+
+아래도 바로 이어서 추가하면 좋습니다.
+
+```python
+@pytest.mark.asyncio
+async def test_handle_new_message_skips_when_channel_not_collecting(monkeypatch):
+    worker = CollectorWorker()
+
+    fake_chat = SimpleNamespace(id=1001)
+    fake_event = SimpleNamespace(message=SimpleNamespace(id=1, text="skip"))
+
+    async def fake_get_chat():
+        return fake_chat
+
+    fake_event.get_chat = fake_get_chat
+
+    fake_channel = SimpleNamespace(
+        id=1,
+        tg_channel_id="1001",
+        is_collecting=False,
+    )
+
+    fake_db = SimpleNamespace(
+        scalar=AsyncMock(return_value=fake_channel),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return fake_db
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_get_session():
+        return FakeSessionContext()
+
+    persist_mock = AsyncMock()
+
+    monkeypatch.setattr(
+        "src.infra.db.session.get_session",
+        fake_get_session,
+    )
+    monkeypatch.setattr(
+        "src.workers.collector_worker.persist_message_from_event",
+        persist_mock,
+    )
+
+    await worker._handle_new_message(fake_event)
+
+    persist_mock.assert_not_awaited()
+    fake_db.commit.assert_not_awaited()
+    fake_db.rollback.assert_not_awaited()
+```
+
+이건 현재 `_handle_new_message()`가 `channel.is_collecting`이 아니면 즉시 return 하는 흐름을 잠급니다. 

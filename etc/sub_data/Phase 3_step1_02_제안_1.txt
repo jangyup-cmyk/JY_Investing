@@ -1,0 +1,679 @@
+좋습니다. 현재 문서에 적힌 프로젝트 구조는 `src/infra/db`, `src/workers`, `run_worker.py` 축으로 확장하는 형태이고, 다음 단계도 Phase 3 전처리 → Phase 4 LLM 분석으로 이어지므로, 아래처럼 **서비스 레이어 1개 + 워커 1개 + 엔트리포인트 1개**로 붙이는 방식이 가장 자연스럽습니다. 특히 현재가 `Async SQLAlchemy + aiosqlite`, `run_collector.py`와 `run_web.py` 분리 구조이기 때문에, 분석 워커도 같은 패턴으로 별도 프로세스로 두는 편이 맞습니다.   
+
+아래 코드는 **지금 바로 뼈대로 넣을 수 있는 초안**입니다.
+다만 실제 `models.py`의 필드명과 enum 선언은 기존 코드에 맞게 조금만 조정하면 됩니다.
+
+---
+
+## 1) `src/services/analysis_job_service.py`
+
+이 파일은 `analysis_jobs`를 생성하고, SQLite 환경에서도 비교적 안전하게 claim/success/fail 처리하는 역할입니다.
+현재 DB가 `aiosqlite`이므로, 처음에는 `SELECT ... FOR UPDATE SKIP LOCKED` 같은 패턴보다 **낙관적 갱신 방식**이 더 현실적입니다. 현재 문서도 SQLite 기반 비동기 세션 구조를 전제로 하고 있습니다. 
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.infra.db.models import (
+    AnalysisJob,
+    JobStatus,
+    JobTargetType,
+    JobType,
+)
+
+
+UTC = timezone.utc
+
+
+class AnalysisJobService:
+    @staticmethod
+    async def enqueue_job(
+        session: AsyncSession,
+        *,
+        job_type: JobType,
+        target_type: JobTargetType,
+        target_id: int,
+        idempotency_key: str,
+        payload_json: dict | None = None,
+        priority: int = 100,
+        max_attempts: int = 3,
+    ) -> AnalysisJob:
+        """
+        동일 (job_type, idempotency_key) 중복 생성 방지 전제.
+        충돌 가능성이 있으면 select 후 재사용하거나,
+        나중에 IntegrityError 처리로 보강 가능.
+        """
+        existing = await session.scalar(
+            select(AnalysisJob).where(
+                AnalysisJob.job_type == job_type,
+                AnalysisJob.idempotency_key == idempotency_key,
+            )
+        )
+        if existing:
+            return existing
+
+        job = AnalysisJob(
+            job_type=job_type,
+            target_type=target_type,
+            target_id=target_id,
+            status=JobStatus.PENDING,
+            priority=priority,
+            attempt_count=0,
+            max_attempts=max_attempts,
+            scheduled_at=datetime.now(UTC),
+            idempotency_key=idempotency_key,
+            payload_json=payload_json or {},
+        )
+        session.add(job)
+        await session.flush()
+        return job
+
+    @staticmethod
+    async def claim_next_job(
+        session: AsyncSession,
+        *,
+        worker_name: str,
+        allowed_job_types: list[JobType] | None = None,
+        lease_seconds: int = 300,
+    ) -> Optional[AnalysisJob]:
+        """
+        SQLite 친화적인 claim 방식:
+        1) pending/lease-expired 후보 1건 조회
+        2) status 조건부 update
+        3) rowcount == 1 이면 claim 성공
+        """
+        now = datetime.now(UTC)
+
+        stmt = (
+            select(AnalysisJob)
+            .where(
+                AnalysisJob.status.in_([JobStatus.PENDING, JobStatus.RUNNING]),
+            )
+            .order_by(
+                AnalysisJob.priority.asc(),
+                AnalysisJob.scheduled_at.asc(),
+                AnalysisJob.id.asc(),
+            )
+        )
+
+        if allowed_job_types:
+            stmt = stmt.where(AnalysisJob.job_type.in_(allowed_job_types))
+
+        # lease 만료/미시작 job만 대상으로 필터
+        candidates = await session.scalars(stmt)
+        for candidate in candidates:
+            claimable = (
+                candidate.status == JobStatus.PENDING
+                or (
+                    candidate.status == JobStatus.RUNNING
+                    and candidate.lease_expires_at is not None
+                    and candidate.lease_expires_at <= now
+                )
+            )
+            if not claimable:
+                continue
+
+            upd = (
+                update(AnalysisJob)
+                .where(
+                    AnalysisJob.id == candidate.id,
+                    AnalysisJob.updated_at == candidate.updated_at,
+                )
+                .values(
+                    status=JobStatus.RUNNING,
+                    worker_name=worker_name,
+                    started_at=now if candidate.started_at is None else candidate.started_at,
+                    last_heartbeat_at=now,
+                    lease_expires_at=now + timedelta(seconds=lease_seconds),
+                    attempt_count=candidate.attempt_count + 1,
+                )
+            )
+
+            result = await session.execute(upd)
+            if result.rowcount == 1:
+                await session.commit()
+                return await session.get(AnalysisJob, candidate.id)
+
+            await session.rollback()
+
+        return None
+
+    @staticmethod
+    async def heartbeat(
+        session: AsyncSession,
+        *,
+        job_id: int,
+        lease_seconds: int = 300,
+    ) -> None:
+        now = datetime.now(UTC)
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                last_heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+            )
+        )
+        await session.commit()
+
+    @staticmethod
+    async def mark_done(
+        session: AsyncSession,
+        *,
+        job_id: int,
+    ) -> None:
+        now = datetime.now(UTC)
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(
+                status=JobStatus.DONE,
+                finished_at=now,
+                lease_expires_at=None,
+                last_heartbeat_at=now,
+                error_code=None,
+                error_message=None,
+            )
+        )
+        await session.commit()
+
+    @staticmethod
+    async def mark_failed(
+        session: AsyncSession,
+        *,
+        job_id: int,
+        error_code: str,
+        error_message: str,
+        retry_delay_seconds: int = 30,
+    ) -> None:
+        now = datetime.now(UTC)
+
+        job = await session.get(AnalysisJob, job_id)
+        if job is None:
+            return
+
+        terminal = job.attempt_count >= job.max_attempts
+        new_status = JobStatus.DEAD_LETTER if terminal else JobStatus.PENDING
+
+        values = dict(
+            status=new_status,
+            error_code=error_code,
+            error_message=error_message[:4000],
+            finished_at=now if terminal else None,
+            scheduled_at=now + timedelta(seconds=retry_delay_seconds) if not terminal else job.scheduled_at,
+            lease_expires_at=None,
+            last_heartbeat_at=now,
+        )
+
+        await session.execute(
+            update(AnalysisJob)
+            .where(AnalysisJob.id == job_id)
+            .values(**values)
+        )
+        await session.commit()
+```
+
+---
+
+## 2) `src/workers/preprocess_worker.py`
+
+이 파일은 Phase 3 전처리 워커의 최소 골격입니다.
+문서상 `src/workers/collector_worker.py`, `startup_tasks.py`가 이미 있고, 다음 단계가 “노이즈 제거 + 티커/키워드 추출”이므로, 같은 `workers` 계층에 두는 것이 자연스럽습니다.  
+
+```python
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.common.logger import logger
+from src.infra.db.models import (
+    AnalysisJob,
+    AnalysisResult,
+    JobStatus,
+    JobTargetType,
+    JobType,
+    Message,
+    MessageFeature,
+    MessageVersion,
+    NormalizedMessage,
+    ResultType,
+)
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+
+
+UTC = timezone.utc
+
+
+@dataclass
+class NormalizedPayload:
+    normalized_text: str
+    language_code: str
+    token_estimate: int
+    is_spam: bool
+    spam_reason: str | None
+    duplicate_group_key: str | None
+    quality_score: float
+
+
+class PreprocessWorker:
+    def __init__(self, worker_name: str = "preprocess-worker-1", poll_interval: float = 2.0):
+        self.worker_name = worker_name
+        self.poll_interval = poll_interval
+        self._running = True
+
+    async def run_forever(self) -> None:
+        logger.info(f"[{self.worker_name}] started")
+
+        while self._running:
+            job = None
+            try:
+                async with AsyncSessionLocal() as session:
+                    job = await AnalysisJobService.claim_next_job(
+                        session,
+                        worker_name=self.worker_name,
+                        allowed_job_types=[JobType.NORMALIZE, JobType.EXTRACT_FEATURES],
+                    )
+
+                if not job:
+                    await asyncio.sleep(self.poll_interval)
+                    continue
+
+                if job.job_type == JobType.NORMALIZE:
+                    await self._process_normalize_job(job.id)
+                elif job.job_type == JobType.EXTRACT_FEATURES:
+                    await self._process_extract_features_job(job.id)
+                else:
+                    logger.warning(f"[{self.worker_name}] unsupported job type: {job.job_type}")
+
+            except Exception as e:
+                logger.exception(f"[{self.worker_name}] loop error: {e}")
+                await asyncio.sleep(self.poll_interval)
+
+    async def _process_normalize_job(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                message = await session.get(Message, job.target_id)
+                if message is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="MESSAGE_NOT_FOUND",
+                        error_message=f"Message not found: {job.target_id}",
+                        retry_delay_seconds=1,
+                    )
+                    return
+
+                version = await self._get_or_create_current_version(session, message)
+                payload = self._normalize_text(message.message_text or "")
+
+                existing = await session.scalar(
+                    select(NormalizedMessage).where(
+                        NormalizedMessage.message_id == message.id,
+                        NormalizedMessage.version_id == version.id,
+                        NormalizedMessage.cleaning_version == "v1",
+                    )
+                )
+
+                if existing is None:
+                    normalized = NormalizedMessage(
+                        message_id=message.id,
+                        version_id=version.id,
+                        cleaning_version="v1",
+                        normalized_text=payload.normalized_text,
+                        language_code=payload.language_code,
+                        token_estimate=payload.token_estimate,
+                        is_spam=payload.is_spam,
+                        spam_reason=payload.spam_reason,
+                        is_duplicate_near=False,
+                        duplicate_group_key=payload.duplicate_group_key,
+                        quality_score=payload.quality_score,
+                    )
+                    session.add(normalized)
+                    await session.flush()
+                else:
+                    normalized = existing
+
+                await AnalysisJobService.enqueue_job(
+                    session,
+                    job_type=JobType.EXTRACT_FEATURES,
+                    target_type=JobTargetType.MESSAGE,
+                    target_id=message.id,
+                    idempotency_key=f"extract_features:message:{message.id}:version:{version.id}:v1",
+                    payload_json={
+                        "message_id": message.id,
+                        "version_id": version.id,
+                        "normalized_message_id": normalized.id,
+                    },
+                    priority=100,
+                )
+
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+                logger.info(f"[{self.worker_name}] normalize done: message_id={message.id}, job_id={job_id}")
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="NORMALIZE_ERROR",
+                    error_message=str(e),
+                    retry_delay_seconds=10,
+                )
+            logger.exception(f"[{self.worker_name}] normalize failed: job_id={job_id}, error={e}")
+
+    async def _process_extract_features_job(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                message_id = int(job.payload_json["message_id"])
+                version_id = int(job.payload_json["version_id"])
+                normalized_message_id = int(job.payload_json["normalized_message_id"])
+
+                message = await session.get(Message, message_id)
+                normalized = await session.get(NormalizedMessage, normalized_message_id)
+
+                if message is None or normalized is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="FEATURE_INPUT_NOT_FOUND",
+                        error_message=f"message={message_id}, normalized={normalized_message_id}",
+                        retry_delay_seconds=1,
+                    )
+                    return
+
+                ticker_candidates = self._extract_ticker_candidates(normalized.normalized_text or "")
+                keyword_hits = self._extract_keyword_hits(normalized.normalized_text or "")
+                theme_candidates = self._extract_theme_candidates(keyword_hits)
+
+                existing = await session.scalar(
+                    select(MessageFeature).where(
+                        MessageFeature.message_id == message_id,
+                        MessageFeature.version_id == version_id,
+                        MessageFeature.feature_version == "v1",
+                    )
+                )
+
+                if existing is None:
+                    feature = MessageFeature(
+                        message_id=message_id,
+                        version_id=version_id,
+                        normalized_message_id=normalized_message_id,
+                        feature_version="v1",
+                        ticker_candidates_json=ticker_candidates,
+                        company_alias_hits_json=None,
+                        theme_candidates_json=theme_candidates,
+                        keyword_hits_json=keyword_hits,
+                        entity_spans_json=None,
+                        sentiment_rule_score=self._score_sentiment(normalized.normalized_text or ""),
+                        urgency_score=self._score_urgency(normalized.normalized_text or ""),
+                        novelty_score=0.5,
+                        source_reliability_score=0.5,
+                    )
+                    session.add(feature)
+                    await session.flush()
+                else:
+                    feature = existing
+
+                # 향후 Phase 4용 단일 메시지 요약 작업 예약
+                await AnalysisJobService.enqueue_job(
+                    session,
+                    job_type=JobType.SINGLE_MESSAGE_SUMMARY,
+                    target_type=JobTargetType.MESSAGE,
+                    target_id=message_id,
+                    idempotency_key=f"single_message_summary:message:{message_id}:feature:v1",
+                    payload_json={
+                        "message_id": message_id,
+                        "version_id": version_id,
+                        "normalized_message_id": normalized_message_id,
+                        "feature_id": feature.id,
+                    },
+                    priority=200,
+                )
+
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+                logger.info(f"[{self.worker_name}] extract_features done: message_id={message_id}, job_id={job_id}")
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="EXTRACT_FEATURES_ERROR",
+                    error_message=str(e),
+                    retry_delay_seconds=10,
+                )
+            logger.exception(f"[{self.worker_name}] extract_features failed: job_id={job_id}, error={e}")
+
+    async def _get_or_create_current_version(self, session: AsyncSession, message: Message) -> MessageVersion:
+        current = await session.scalar(
+            select(MessageVersion).where(
+                MessageVersion.message_id == message.id,
+                MessageVersion.is_current.is_(True),
+            )
+        )
+        if current:
+            return current
+
+        version = MessageVersion(
+            message_id=message.id,
+            version_no=1,
+            message_text=message.message_text,
+            raw_hash=self._sha256(message.message_text or ""),
+            edit_date_utc=getattr(message, "edit_date_utc", None),
+            is_current=True,
+        )
+        session.add(version)
+        await session.flush()
+        return version
+
+    def _normalize_text(self, text: str) -> NormalizedPayload:
+        original = text or ""
+
+        normalized = original
+        normalized = re.sub(r"https?://\S+", " ", normalized)
+        normalized = re.sub(r"t\.me/\S+", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        lowered = normalized.lower()
+        spam_keywords = ["무료입장", "오픈채팅", "입장코드", "문의주세요", "수익인증"]
+        is_spam = any(k in normalized for k in spam_keywords)
+
+        duplicate_group_key = self._sha256(lowered[:200]) if normalized else None
+        token_estimate = max(1, len(normalized) // 4) if normalized else 0
+        quality_score = 0.1 if is_spam else 0.8
+
+        return NormalizedPayload(
+            normalized_text=normalized,
+            language_code="ko",
+            token_estimate=token_estimate,
+            is_spam=is_spam,
+            spam_reason="spam_keyword" if is_spam else None,
+            duplicate_group_key=duplicate_group_key,
+            quality_score=quality_score,
+        )
+
+    def _extract_ticker_candidates(self, text: str) -> dict:
+        # 임시 규칙:
+        # 6자리 숫자 한국 종목코드 후보 탐지
+        matches = re.findall(r"\b\d{6}\b", text)
+        unique_codes = list(dict.fromkeys(matches))
+        return {
+            "tickers": [
+                {"symbol": code, "confidence": 0.75, "source": "regex_6digit"}
+                for code in unique_codes
+            ]
+        }
+
+    def _extract_keyword_hits(self, text: str) -> dict:
+        keywords = [
+            "수주", "실적", "상한가", "급등", "승인", "계약", "반도체", "2차전지", "로봇", "바이오", "정책"
+        ]
+        hits = [kw for kw in keywords if kw in text]
+        return {"keywords": hits}
+
+    def _extract_theme_candidates(self, keyword_hits: dict) -> dict:
+        keywords = keyword_hits.get("keywords", [])
+        themes = []
+
+        mapping = {
+            "반도체": "반도체",
+            "2차전지": "2차전지",
+            "로봇": "로봇",
+            "바이오": "바이오",
+            "정책": "정책수혜",
+        }
+        for kw in keywords:
+            if kw in mapping:
+                themes.append({"theme": mapping[kw], "confidence": 0.7})
+
+        return {"themes": themes}
+
+    def _score_sentiment(self, text: str) -> float:
+        positive = ["수주", "실적", "승인", "계약", "확대", "급등"]
+        negative = ["악재", "하락", "취소", "적자", "경고"]
+        score = 0.0
+        for kw in positive:
+            if kw in text:
+                score += 0.2
+        for kw in negative:
+            if kw in text:
+                score -= 0.2
+        return max(-1.0, min(1.0, score))
+
+    def _score_urgency(self, text: str) -> float:
+        triggers = ["속보", "긴급", "방금", "단독", "급등", "상한가"]
+        score = 0.0
+        for kw in triggers:
+            if kw in text:
+                score += 0.2
+        return max(0.0, min(1.0, score))
+
+    @staticmethod
+    def _sha256(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+```
+
+---
+
+## 3) `run_worker.py`
+
+문서상 `run_worker.py`가 “기타 스케줄링/분석 등 복합 워커 구동 진입점”으로 이미 잡혀 있으니, preprocess 전용 실행 진입점으로 쓰는 것이 깔끔합니다. 
+
+```python
+import asyncio
+
+from src.common.logger import logger
+from src.workers.preprocess_worker import PreprocessWorker
+
+
+async def main() -> None:
+    worker = PreprocessWorker(
+        worker_name="preprocess-worker-1",
+        poll_interval=2.0,
+    )
+    await worker.run_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("preprocess worker stopped by user")
+```
+
+---
+
+## 4) 수집 워커와 연결하는 최소 코드
+
+현재 Phase 2 구조는 `collector_worker.py`가 실시간 신규/편집 메시지를 DB에 적재하는 흐름이므로, 메시지 insert/upsert 직후 아래 한 줄만 추가하면 됩니다. 문서상 현재 수집 경로가 바로 이 확장 지점입니다. 
+
+예시:
+
+```python
+await AnalysisJobService.enqueue_job(
+    session,
+    job_type=JobType.NORMALIZE,
+    target_type=JobTargetType.MESSAGE,
+    target_id=message.id,
+    idempotency_key=f"normalize:message:{message.id}:latest:v1",
+    payload_json={"message_id": message.id},
+    priority=100,
+)
+```
+
+다만 **편집 메시지까지 반영하려면** idempotency key를 `version_id` 기준으로 잡는 쪽이 더 좋습니다. 문서상 편집 메시지 실시간 반영이 요구사항에 포함돼 있으므로, 장기적으로는 `message_versions`를 먼저 생성한 뒤 그 `version_id`로 normalize job을 발행하는 편이 맞습니다. 
+
+권장 형태:
+
+```python
+f"normalize:message:{message.id}:version:{version.id}:v1"
+```
+
+---
+
+## 5) 지금 단계에서 꼭 같이 넣어야 할 보완점
+
+이 초안은 바로 돌아가는 골격이지만, 실무적으로는 아래 4개를 같이 넣는 것이 좋습니다.
+
+### A. `analysis_jobs` 소비 워커는 처음엔 1개만
+
+현재 DB가 `aiosqlite`이므로, preprocess worker를 여러 개 동시에 늘리기보다 **처음엔 1개만** 두는 것이 안전합니다. 문서도 SQLite 기반 비동기 엔진을 전제로 하고 있습니다. 
+
+### B. LLM 호출 전후로 세션 분리
+
+이 워커는 전처리용이라 아직 괜찮지만, 다음 단계 summary worker에서는
+
+* job claim
+* 세션 종료
+* LLM 호출
+* 새 세션 열어 결과 저장
+  구조를 유지해야 합니다.
+
+### C. `message_versions` 먼저 도입
+
+현재 문서상 편집 메시지 반영이 이미 완료 기준에 포함되어 있으므로, 장기적으로는 normalize 대상이 “message 최신값”이 아니라 “특정 version”이 되어야 안정적입니다. 
+
+### D. feature 추출은 지금은 규칙 기반으로 시작
+
+문서상 Phase 3는 노이즈 제거 + 티커/키워드 추출이므로, 지금은 위처럼 규칙 기반으로 시작하는 것이 맞고, 나중에 형태소/NER를 붙이면 됩니다. 
+
+---
+
+## 6) 지금 가장 자연스러운 적용 순서
+
+1. `models.py`에 `AnalysisJob`, `MessageVersion`, `NormalizedMessage`, `MessageFeature` 추가
+2. Alembic migration 생성/적용
+3. `analysis_job_service.py` 추가
+4. `preprocess_worker.py` 추가
+5. `collector_worker.py`에서 메시지 적재 직후 `normalize` job enqueue
+6. `run_worker.py`로 preprocess worker 실행
+
+이 순서가 현재 문서의 폴더 구조와 Phase 3 진입 흐름에 가장 잘 맞습니다.  
+
+---
+

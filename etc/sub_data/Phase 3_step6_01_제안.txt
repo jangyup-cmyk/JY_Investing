@@ -1,0 +1,204 @@
+좋습니다. 아래를 그대로 따라가면 됩니다.
+
+## 적용 순서 체크리스트
+
+### 1. 모델 정리
+
+`src/infra/db/models.py`
+
+* [ ] `Base`를 로컬 선언하지 말고 `src.infra.db.base.Base`로 통일
+* [ ] `TelegramMessage.normalized`를 `normalized_messages` one-to-many로 수정
+* [ ] `TelegramMessageFeature.normalized_message` relationship 추가
+* [ ] 필요하면 `message_version` relationship도 추가
+
+### 2. 서비스 레이어 추가
+
+`src/services/analysis_job_service.py`
+
+* [ ] `enqueue_job()` 추가
+* [ ] `claim_next_job()` 추가
+* [ ] `heartbeat()` 추가
+* [ ] `mark_done()` 추가
+* [ ] `mark_failed()` 추가
+* [ ] enum/string 호환 위해 `.value` 저장 처리
+* [ ] `telegram_message_id`, `message_version_id` 인자 반영
+* [ ] 내부에서 `commit()` 하지 않는지 확인 (`enqueue_job`만 해당)
+
+### 3. collector 패치
+
+`src/workers/collector_worker.py`
+
+* [ ] `upsert_message_from_telegram()` 반영
+* [ ] `create_message_version()` 반영
+* [ ] `persist_message()` 안에서
+
+  * [ ] message upsert
+  * [ ] version 생성
+  * [ ] normalize job enqueue
+* [ ] `priority=100 if is_backfill else 1`로 수정
+* [ ] 신규/편집 이벤트 핸들러가 `persist_message()`만 호출하는지 확인
+
+### 4. backfill 연결 확인
+
+`src/workers/startup_tasks.py`
+
+* [ ] `persist_func(...)` 호출 구조 유지
+* [ ] 실제로 주입되는 함수가 `persist_message`인지 확인
+
+### 5. 세션 확인
+
+`src/infra/db/session.py`
+
+* [ ] `AsyncSessionLocal()` alias 존재 확인
+* [ ] 워커 코드가 이 세션 팩토리를 사용하도록 맞춤
+* [ ] `session_scope()`는 backfill 저장 루프에서 그대로 활용
+
+### 6. 워커 추가
+
+`src/workers/base_worker.py`
+
+* [ ] 추가
+
+`src/workers/preprocess_worker.py`
+
+* [ ] 실제 모델명 기준으로 추가
+* [ ] `NORMALIZE`, `EXTRACT_FEATURES` 처리
+* [ ] `NormalizedTelegramMessage`, `TelegramMessageFeature` 생성
+* [ ] 다음 job enqueue
+
+`src/workers/inference_worker.py`
+
+* [ ] 실제 모델명 기준으로 추가
+* [ ] `SINGLE_MESSAGE_SUMMARY`, `WINDOW_THEME_ANALYSIS` 처리
+* [ ] `AnalysisResult` 저장
+* [ ] LLM 호출 전후 세션 분리
+
+`src/workers/scheduler_worker.py`
+
+* [ ] lease 만료 `RUNNING` job 복구 구현
+
+### 7. 실행 진입점 추가
+
+`run_worker.py`
+
+* [ ] `--type preprocess`
+* [ ] `--type inference`
+* [ ] `--type scheduler`
+* [ ] `--job-types` 옵션 반영
+* [ ] `run_collector.py`는 그대로 유지
+
+### 8. 테스트 환경 정리
+
+`pytest.ini`
+
+* [ ] 추가
+
+`tests/conftest.py`
+
+* [ ] 공용 DB fixture 추가
+* [ ] `channel_factory`, `message_factory`, `message_version_factory` 추가
+* [ ] `normalized_message_factory`, `message_feature_factory` 추가
+* [ ] `analysis_job_factory` 추가
+* [ ] enum/string 호환 보정 (`_enum_value`) 반영
+
+### 9. 테스트 파일 추가
+
+* [ ] `tests/services/test_analysis_job_service.py`
+* [ ] `tests/workers/test_collector_persist.py`
+* [ ] `tests/workers/test_preprocess_worker.py`
+* [ ] `tests/workers/test_inference_worker.py`
+* [ ] `tests/workers/test_scheduler_worker.py`
+* [ ] `tests/test_run_worker_smoke.py`
+
+---
+
+## 추천 실행 순서
+
+### 1단계: 서비스 레이어
+
+```bash id="g3xtst"
+python -m pytest tests/services/test_analysis_job_service.py -vv
+```
+
+### 2단계: collector 저장 경로
+
+```bash id="4zq6s7"
+python -m pytest tests/workers/test_collector_persist.py -vv
+```
+
+### 3단계: preprocess 파이프라인
+
+```bash id="vew2hv"
+python -m pytest tests/workers/test_preprocess_worker.py -vv
+```
+
+### 4단계: inference 파이프라인
+
+```bash id="9s706q"
+python -m pytest tests/workers/test_inference_worker.py -vv
+```
+
+### 5단계: scheduler / run_worker
+
+```bash id="n6stkp"
+python -m pytest tests/workers/test_scheduler_worker.py -vv
+python -m pytest tests/test_run_worker_smoke.py -vv
+```
+
+### 6단계: 전체
+
+```bash id="y3o0ys"
+python -m pytest tests -vv
+```
+
+---
+
+## 실제 실행 순서
+
+테스트가 통과하면 아래처럼 프로세스를 나눠 띄우면 됩니다.
+
+### 터미널 1: collector
+
+```bash id="xnpflq"
+python run_collector.py
+```
+
+### 터미널 2: preprocess
+
+```bash id="0fq6ri"
+python run_worker.py --type preprocess --worker-name preprocess-1
+```
+
+### 터미널 3: inference
+
+```bash id="ah01m8"
+python run_worker.py --type inference --worker-name inference-1
+```
+
+### 터미널 4: scheduler
+
+```bash id="km4x4n"
+python run_worker.py --type scheduler --worker-name scheduler-1 --poll-interval 10
+```
+
+---
+
+## 가장 먼저 막힐 가능성이 높은 지점
+
+우선순위대로 보면 이 셋입니다.
+
+* [ ] `models.py`의 `Base` 이중 선언
+* [ ] enum/string 혼용
+* [ ] `collector_worker.py`의 priority 방향 반대
+
+이 셋만 먼저 잡으면 나머지는 대부분 코드 연결 문제입니다.
+
+---
+
+## 최종 상태 기준 한 줄 요약
+
+적용이 끝나면 흐름은 이렇게 됩니다.
+
+**Telegram 수집 → `persist_message()` → 원문/버전 저장 → `NORMALIZE` job 생성 → `PreprocessWorker` → `SINGLE_MESSAGE_SUMMARY` job 생성 → `InferenceWorker` → 결과 저장 → `SchedulerWorker`가 stuck job 복구**
+
+이제 구현 단계에서 남은 건 “설계”가 아니라 “적용/테스트”입니다.

@@ -1,0 +1,452 @@
+좋습니다. 그럼 바로 **“기존 테이블 보정형” vs “신규 생성형”** 으로 나눠서, Alembic 적용 순서를 실무적으로 정리하겠습니다.
+
+핵심은 아주 단순합니다.
+
+* **빈 DB / 초기 구축 단계**면 → **신규 생성형 migration**
+* **이미 일부 테이블/데이터가 있음**면 → **보정형 migration**
+
+지금 파이프라인은 `job 상태`, `retry`, `stuck recovery`, `unique 제약`이 핵심이라서,
+기존 데이터가 있는 상태에서 무턱대고 recreate 하면 위험합니다.
+
+---
+
+# 1. 먼저 어떤 경우인지 판단하는 기준
+
+## A. 신규 생성형
+
+아래에 가깝다면 신규 생성형이 맞습니다.
+
+* 운영 DB가 사실상 비어 있음
+* `messages`, `analysis_jobs` 등이 아직 없거나, 있어도 버려도 되는 초기 개발 DB
+* 지금부터 모델 기준으로 스키마를 깔끔하게 맞추고 싶음
+
+이 경우는 가장 쉽습니다.
+**모델 → Alembic revision → upgrade head** 순서로 가면 됩니다.
+
+---
+
+## B. 기존 테이블 보정형
+
+아래에 가깝다면 보정형으로 가야 합니다.
+
+* 이미 `messages` 나 `analysis_jobs` 테이블이 있음
+* collector 또는 기존 worker 가 실제로 데이터 적재 중
+* 기존 데이터 보존이 중요함
+* 컬럼/제약/인덱스만 추가 보완하면 됨
+
+이 경우는 **drop/create** 보다 **add column / add constraint / backfill** 중심으로 가야 합니다.
+
+---
+
+# 2. 신규 생성형 적용 순서
+
+이건 가장 단순하고 안전합니다.
+
+## 1단계. 모델 정의 먼저 확정
+
+최소 아래 네 모델을 먼저 고정합니다.
+
+* `Message`
+* `AnalysisJob`
+* `PreprocessedMessage`
+* `MessageSummary`
+
+여기서 중요한 건 **DB 제약까지 모델에 같이 반영**하는 것입니다.
+
+특히 아래 4개는 꼭 있어야 합니다.
+
+* `uq_messages_channel_msg`
+* `uq_analysis_jobs_message_job_type`
+* `uq_preprocessed_messages_message_id`
+* `uq_message_summaries_message_id`
+
+---
+
+## 2단계. Alembic revision 생성
+
+예:
+
+```bash
+alembic revision -m "create pipeline tables"
+```
+
+그 다음 방금 정리한 create table 초안을 revision 파일에 넣습니다.
+
+---
+
+## 3단계. upgrade 적용
+
+```bash
+alembic upgrade head
+```
+
+---
+
+## 4단계. smoke test
+
+적용 직후 최소 이 순서로 검증합니다.
+
+1. `persist_message()`
+2. `preprocess_worker.run_once()`
+3. `inference_worker.run_once()`
+
+그리고 DB에서 아래를 확인합니다.
+
+* `messages` 1건
+* `analysis_jobs`
+
+  * `NORMALIZE = DONE`
+  * `SINGLE_MESSAGE_SUMMARY = DONE`
+* `preprocessed_messages` 1건
+* `message_summaries` 1건
+
+---
+
+## 5단계. pytest 실행
+
+이 순서가 가장 자연스럽습니다.
+
+```bash
+pytest tests/integration/test_pipeline_flow.py -q
+pytest tests/workers/test_scheduler_worker.py -q
+```
+
+---
+
+# 3. 기존 테이블 보정형 적용 순서
+
+이쪽이 더 중요합니다.
+실제 프로젝트는 대개 이 경우가 많습니다.
+
+핵심 원칙은 이겁니다.
+
+**“새 구조에 필요한 필드와 제약을 추가하되, 기존 적재 데이터는 최대한 보존한다.”**
+
+---
+
+## 1단계. 현재 실제 스키마부터 확인
+
+먼저 DB에 지금 뭐가 있는지 봐야 합니다.
+
+확인 대상은 아래입니다.
+
+### messages
+
+* 이미 있는가
+* `channel_id`, `telegram_message_id`, `text`, `sent_at`, `created_at` 존재 여부
+* `(channel_id, telegram_message_id)` 중복 데이터 존재 여부
+
+### analysis_jobs
+
+* 이미 있는가
+* `job_type`, `status`, `created_at` 존재 여부
+* 아래 컬럼 부족 여부
+
+  * `payload`
+  * `attempt_count`
+  * `max_attempts`
+  * `last_error`
+  * `started_at`
+  * `finished_at`
+  * `heartbeat_at`
+
+### 결과 테이블
+
+* `preprocessed_messages` 존재 여부
+* `message_summaries` 존재 여부
+* `message_id unique` 가능한 상태인지
+
+---
+
+## 2단계. “추가 컬럼” migration 먼저
+
+기존 테이블이 있으면 가장 먼저 해야 하는 건 컬럼 보강입니다.
+
+특히 `analysis_jobs` 에는 아래를 먼저 넣는 게 좋습니다.
+
+* `payload`
+* `attempt_count`
+* `max_attempts`
+* `last_error`
+* `started_at`
+* `finished_at`
+* `heartbeat_at`
+
+이 단계에서는 아직 unique 제약을 급하게 넣지 않아도 됩니다.
+먼저 컬럼을 넣고, 기존 row 가 새 구조를 수용할 수 있게 만드는 게 우선입니다.
+
+---
+
+## 3단계. 기본값/기존 데이터 backfill
+
+기존 row 들이 있으면 기본값 보정이 필요합니다.
+
+예를 들어 `analysis_jobs` 의 기존 row 는 이렇게 보정하는 편이 좋습니다.
+
+* `attempt_count = 0` where null
+* `max_attempts = 3` where null
+* `status` 값이 기존 enum 과 다르면 새 상태 체계로 매핑
+* `created_at` null 이면 가능한 기준 시각 보정
+
+예시 개념:
+
+```sql
+UPDATE analysis_jobs
+SET attempt_count = 0
+WHERE attempt_count IS NULL;
+
+UPDATE analysis_jobs
+SET max_attempts = 3
+WHERE max_attempts IS NULL;
+```
+
+---
+
+## 4단계. 중복 데이터 점검
+
+이 단계가 매우 중요합니다.
+
+unique constraint 를 넣기 전에 먼저 **중복이 있는지** 봐야 합니다.
+
+### messages 중복 점검
+
+```sql
+SELECT channel_id, telegram_message_id, COUNT(*)
+FROM messages
+GROUP BY channel_id, telegram_message_id
+HAVING COUNT(*) > 1;
+```
+
+### analysis_jobs 중복 점검
+
+```sql
+SELECT message_id, job_type, COUNT(*)
+FROM analysis_jobs
+GROUP BY message_id, job_type
+HAVING COUNT(*) > 1;
+```
+
+### preprocessed_messages 중복 점검
+
+```sql
+SELECT message_id, COUNT(*)
+FROM preprocessed_messages
+GROUP BY message_id
+HAVING COUNT(*) > 1;
+```
+
+### message_summaries 중복 점검
+
+```sql
+SELECT message_id, COUNT(*)
+FROM message_summaries
+GROUP BY message_id
+HAVING COUNT(*) > 1;
+```
+
+---
+
+## 5단계. 중복 정리
+
+중복이 있으면 바로 unique constraint 를 걸면 실패합니다.
+
+정리 원칙은 보통 아래가 좋습니다.
+
+### messages
+
+같은 `(channel_id, telegram_message_id)` 가 여러 건이면
+
+* 가장 최신/정상 row 1건 남기고
+* 나머지 제거 또는 병합
+
+### analysis_jobs
+
+같은 `(message_id, job_type)` 중복이면
+
+* `DONE` 우선
+* 없으면 가장 최신 row 우선
+* 나머지 삭제
+
+즉, constraint 전에 **데이터 정리 migration** 또는 **운영 수동 SQL** 이 필요할 수 있습니다.
+
+---
+
+## 6단계. unique constraint / index 추가
+
+중복이 정리된 뒤에 제약을 추가합니다.
+
+우선순위는 아래 순서가 좋습니다.
+
+1. `messages(channel_id, telegram_message_id)`
+2. `analysis_jobs(message_id, job_type)`
+3. `preprocessed_messages(message_id)`
+4. `message_summaries(message_id)`
+
+그 다음 인덱스를 추가합니다.
+
+특히 이건 꼭 추천합니다.
+
+* `ix_analysis_jobs_job_type_status_created_at`
+
+---
+
+## 7단계. worker 코드 반영
+
+DB 보정이 끝난 다음에 worker/service 를 새 구조로 바꾸는 편이 안전합니다.
+
+순서는:
+
+1. `AnalysisJobService` 추가
+2. `MessageService.persist_message()` 가 초기 `NORMALIZE` job 생성
+3. `PreprocessWorker.run_once()` 리팩토링
+4. `InferenceWorker.run_once()` 리팩토링
+5. `SchedulerWorker` 또는 `job_service.requeue_stuck_jobs()` 연결
+
+즉, **스키마 먼저, 코드 나중**이 안전합니다.
+
+---
+
+# 4. 보정형 migration 을 둘로 나누는 것이 좋은 이유
+
+기존 DB가 있으면 migration 을 한 번에 크게 하지 말고 **2개 이상으로 나누는 편**이 좋습니다.
+
+## 권장 분리 방식
+
+### Migration 1: 컬럼 추가
+
+* `analysis_jobs` 부족 컬럼 추가
+* 결과 테이블 생성(없으면)
+* nullable 상태로 먼저 도입 가능
+
+### Migration 2: 데이터 정리
+
+* null/default backfill
+* 중복 데이터 정리
+
+### Migration 3: 제약/인덱스 강화
+
+* unique constraint
+* composite index
+* nullable → non-nullable 강화
+
+이렇게 나누면 어디서 깨졌는지 추적이 쉽습니다.
+
+---
+
+# 5. 가장 실전적인 추천 시나리오
+
+지금 흐름상 가장 가능성 높은 건 **기존 테이블 보정형**입니다.
+왜냐하면 이미 collector/worker 흐름을 어느 정도 만지고 있었기 때문입니다.
+
+그래서 추천 순서는 이렇게 잡는 게 좋습니다.
+
+## 추천 순서
+
+1. 현재 DB 스키마 확인
+2. `analysis_jobs` 컬럼 보강 migration
+3. 결과 테이블 없으면 생성
+4. 기존 데이터 backfill
+5. 중복 점검 SQL 실행
+6. unique constraint 추가
+7. worker/service 리팩토링 코드 반영
+8. integration test / scheduler test 실행
+
+이 순서가 실제로 가장 덜 깨집니다.
+
+---
+
+# 6. 운영 반영 전 체크포인트
+
+운영 직전에는 아래만 확인하면 됩니다.
+
+## 체크 1
+
+`persist_message()` 한 번 호출 시:
+
+* message 1건
+* `NORMALIZE` job 1건만 생성되는가
+
+## 체크 2
+
+`preprocess_worker.run_once()` 후:
+
+* `NORMALIZE = DONE`
+* `SINGLE_MESSAGE_SUMMARY = PENDING`
+* `PreprocessedMessage` 1건
+
+## 체크 3
+
+`inference_worker.run_once()` 후:
+
+* `SINGLE_MESSAGE_SUMMARY = DONE`
+* `MessageSummary` 1건
+
+## 체크 4
+
+실패 시:
+
+* `RETRY_PENDING`
+* `attempt_count` 증가
+* `last_error` 저장
+
+## 체크 5
+
+stuck recovery 시:
+
+* 오래된 `RUNNING` 만 복구되는가
+
+---
+
+# 7. SQLite와 PostgreSQL에서 적용 감각 차이
+
+## SQLite
+
+장점:
+
+* 테스트가 빠름
+* 초기 개발 편함
+
+주의:
+
+* `FOR UPDATE SKIP LOCKED` 실효성 없음
+* 동시성 검증은 제한적
+
+즉, 테스트/로컬 개발엔 좋고,
+**실제 멀티워커 운영 검증엔 한계**가 있습니다.
+
+---
+
+## PostgreSQL
+
+장점:
+
+* `SKIP LOCKED` 사용 가능
+* 멀티워커 claim 구조에 적합
+* 운영 안정성 높음
+
+즉, 이 파이프라인이 실제로 병렬 worker 기반이면
+최종 운영은 PostgreSQL 쪽이 훨씬 자연스럽습니다.
+
+---
+
+# 8. 한 줄로 나누면
+
+## 신규 생성형
+
+**모델 확정 → create migration → upgrade → 테스트**
+
+## 기존 보정형
+
+**현재 스키마 점검 → 컬럼 추가 → backfill → 중복 정리 → unique/index 추가 → 코드 반영 → 테스트**
+
+---
+
+# 9. 지금 가장 자연스러운 다음 작업
+
+이제 다음으로 가장 실전적인 작업은 둘 중 하나입니다.
+
+첫째, **현재 네 코드 기준 실제 DB 모델/필드명을 반영한 “보정형 Alembic migration 초안”** 을 쓰는 것입니다.
+둘째, **`AnalysisJob` / `Message` / 결과 테이블의 현재 모델 코드를 기준으로 어떤 컬럼이 부족한지 갭 분석표**를 만드는 것입니다.
+
+다음 답변에서는 바로
+**“보정형 Alembic migration 초안 1개 + 데이터 정리용 SQL”** 형태로 이어가면 가장 좋습니다.

@@ -1,0 +1,250 @@
+맞습니다. **지금 가장 자연스러운 점검 대상은 `MessageIngestService.persist_message()`와 `TelegramMessage`, `MessageVersion`의 필드 정합성**입니다.
+
+다만 이 대화에서 **실제 코드 본문이 현재 보이지 않아** line-by-line로 정확 대조까지는 할 수 없습니다. 그래서 아래처럼 **실전 점검 기준**으로 바로 확인하면 됩니다.
+
+---
+
+## 1. 왜 지금 이 점검이 먼저인가
+
+`persist_message()`는 사실상 수집 파이프라인의 **DB 입력 관문**입니다.
+
+여기서 필드명이 모델과 조금만 어긋나도 바로 이런 문제가 납니다.
+
+* `TypeError: unexpected keyword argument ...`
+* 어떤 필드는 저장되지 않음
+* `nullable=False`인데 값 누락
+* `TelegramMessage`와 `MessageVersion` 간 참조키 연결 실패
+* 나중에 worker가 기대하는 원문/버전 데이터가 비어 있음
+
+즉, 이 단계는 “설계 검토”가 아니라 **실제 적재 가능 여부를 보장하는 핵심 점검**입니다.
+
+---
+
+## 2. 가장 먼저 대조할 항목
+
+`persist_message()` 내부에서 보통 아래 두 종류를 만듭니다.
+
+### A. `TelegramMessage(...)` 생성 시 넘기는 필드
+
+점검 포인트:
+
+* 인자 이름이 **모델 필드명과 100% 동일한지**
+* 필수값이 모두 들어가는지
+* `channel_id`, `telegram_message_id` 같이 **유니크/식별 필드**가 빠지지 않는지
+* `collected_at`, `message_date`, `created_at`, `updated_at` 역할이 뒤섞이지 않았는지
+
+대표적으로 자주 보는 필드:
+
+* `channel_id`
+* `telegram_message_id` 또는 `message_id`
+* `grouped_id`
+* `sender_id`
+* `posted_at` / `message_date`
+* `collected_at`
+* `edit_date`
+* `is_deleted`
+* `has_media`
+* `views`
+* `forwards`
+* `reply_to_message_id`
+* `raw_text` 또는 본문 저장 필드
+
+여기서 흔한 오류는:
+
+* 서비스는 `msg_id`를 쓰는데 모델은 `telegram_message_id`
+* 서비스는 `text`를 넣는데 모델은 `raw_text`
+* 서비스는 `date`를 넣는데 모델은 `message_date` 또는 `posted_at`
+* 서비스는 `reply_to_msg_id`를 넣는데 모델은 `reply_to_message_id`
+
+---
+
+### B. `MessageVersion(...)` 생성 시 넘기는 필드
+
+점검 포인트:
+
+* 원문 스냅샷 테이블이라면 **반드시 원본 메시지 FK**가 연결되는지
+* 버전 번호/버전 타입 필드가 모델명과 맞는지
+* 내용 필드가 `raw_text`, `content`, `text`, `body` 중 무엇인지 정확히 일치하는지
+* 최초 적재 시 version 1 정책이 일관적인지
+
+대표적으로 자주 보는 필드:
+
+* `telegram_message_id` 또는 `message_pk` 같은 FK
+* `version_no`
+* `source_type` / `version_type`
+* `raw_text`
+* `normalized_text`
+* `caption`
+* `created_at`
+* `edited_at`
+* `metadata_json`
+
+흔한 오류는:
+
+* FK 필드명을 `message_id`로 넣었는데 실제 모델은 `telegram_message_pk`
+* 서비스는 `text`를 넣는데 모델은 `raw_text`
+* 서비스는 `version`인데 모델은 `version_no`
+* 서비스는 `created_at`만 넣는데 모델은 `captured_at`을 필수로 요구
+
+---
+
+## 3. 가장 실전적인 점검 방법
+
+아래 순서로 보면 됩니다.
+
+### 1단계: `TelegramMessage` 모델 선언부에서 컬럼명만 먼저 추출
+
+예:
+
+```python
+class TelegramMessage(Base):
+    id = ...
+    channel_id = ...
+    telegram_message_id = ...
+    raw_text = ...
+    posted_at = ...
+```
+
+이렇게 **실제 ORM 속성명**만 목록화합니다.
+
+---
+
+### 2단계: `persist_message()`에서 `TelegramMessage(...)` 생성부를 펼쳐 놓고 1:1 비교
+
+예:
+
+```python
+message = TelegramMessage(
+    channel_id=channel.id,
+    telegram_message_id=tg_msg.id,
+    raw_text=text,
+    posted_at=tg_msg.date,
+)
+```
+
+여기서 확인할 것:
+
+* 왼쪽 이름이 모델 필드와 같은가
+* 오른쪽 값이 의미상 맞는가
+* 필수 필드가 누락되지 않았는가
+
+---
+
+### 3단계: `MessageVersion(...)` 생성부도 같은 방식으로 비교
+
+예:
+
+```python
+version = MessageVersion(
+    telegram_message_id=message.id,
+    version_no=1,
+    raw_text=text,
+)
+```
+
+여기서 특히 중요한 건 **FK 이름**입니다.
+
+`message.id`를 연결해야 하는데
+실수로 `telegram_message_id=tg_msg.id`를 넣으면,
+의미상 완전히 다른 값이 들어갈 수 있습니다.
+
+---
+
+## 4. 특히 먼저 의심해야 할 불일치 포인트
+
+지금 이 점검에서 가장 먼저 볼 항목은 아래입니다.
+
+### ① 메시지 식별자
+
+* 모델: `telegram_message_id`
+* 서비스: `message_id`, `msg_id`, `telegram_id` 등으로 넘기고 있지 않은지
+
+### ② 본문 필드
+
+* 모델: `raw_text`
+* 서비스: `text`, `message_text`, `content`로 넘기고 있지 않은지
+
+### ③ 게시 시각 / 수집 시각
+
+* 모델: `posted_at`, `collected_at`
+* 서비스: 둘 다 `created_at` 하나로 뭉개고 있지 않은지
+
+### ④ 수정 여부 관련 필드
+
+* `edit_date`, `is_edited`, `last_edited_at` 중 실제 모델명과 서비스명이 일치하는지
+
+### ⑤ 버전 테이블 FK
+
+* `MessageVersion.message_id`
+* `MessageVersion.telegram_message_id`
+* `MessageVersion.telegram_message_pk`
+
+이 셋 중 하나로 설계했을 가능성이 큰데, 여기서 자주 틀립니다.
+
+### ⑥ 메타데이터 JSON
+
+* 모델은 `metadata_json`
+* 서비스는 `metadata` dict를 그대로 넣고 있을 수 있음
+  → JSON 컬럼인지, 직렬화가 필요한지 확인 필요
+
+---
+
+## 5. 점검 결과를 정리할 때는 이렇게 쓰면 됩니다
+
+아래 형식으로 표를 채우면 가장 실전적입니다.
+
+### `TelegramMessage` 매핑 점검표
+
+| 서비스 인자       | 모델 필드                 | 상태    | 메모             |
+| ------------ | --------------------- | ----- | -------------- |
+| `channel_id` | `channel_id`          | 체크 완료 | 정상             |
+| `msg_id`     | `telegram_message_id` | 수정 필요 | 필드명 불일치        |
+| `text`       | `raw_text`            | 수정 필요 | 본문 필드명 불일치     |
+| `date`       | `posted_at`           | 수정 필요 | 의미는 맞지만 이름 불일치 |
+
+### `MessageVersion` 매핑 점검표
+
+| 서비스 인자                  | 모델 필드                 | 상태    | 메모         |
+| ----------------------- | --------------------- | ----- | ---------- |
+| `message_id=message.id` | `telegram_message_id` | 확인 필요 | FK 의미 확인   |
+| `version=1`             | `version_no`          | 수정 필요 | 필드명 불일치    |
+| `text`                  | `raw_text`            | 수정 필요 | 본문 필드명 불일치 |
+
+---
+
+## 6. 코드에서 바로 확인해야 하는 최소 체크리스트
+
+`persist_message()`를 열었을 때 아래 6개만 먼저 보시면 됩니다.
+
+1. `TelegramMessage(...)` 생성 인자명
+2. `MessageVersion(...)` 생성 인자명
+3. `flush()` 이후 FK 연결 방식
+4. 중복 메시지 처리 시 조회 조건 필드명
+5. edited message 재수집 시 version 추가 로직
+6. `session.add()` 순서와 `commit()` 위치
+
+특히 `flush()` 없이 `message.id`를 바로 쓰는 구조면,
+버전 테이블 FK가 비정상일 수 있으니 같이 봐야 합니다.
+
+---
+
+## 7. 가장 이상적인 최종 상태
+
+`persist_message()`는 최종적으로 아래 의미를 정확히 만족해야 합니다.
+
+* `TelegramMessage`에는 **메시지의 현재 대표 상태**
+* `MessageVersion`에는 **원문/수정본 이력**
+* 둘 사이 연결키가 명확함
+* 필드명은 서비스와 모델이 1:1 일치
+* edited message가 들어오면 덮어쓰기와 이력 저장 정책이 일관됨
+
+---
+
+## 8. 바로 다음 작업
+
+이제 바로 해야 할 일은 하나입니다.
+
+**`persist_message()`의 `TelegramMessage(...)`, `MessageVersion(...)` 생성부를 실제 모델 선언부와 나란히 놓고, 위 표 형식으로 “체크 완료 / 수정 필요”를 채우는 것**입니다.
+
+코드 본문을 이 대화에 붙여 주시면, 제가 다음 답변에서
+**필드 단위로 정확히 대조해서 불일치 항목만 바로 표시**해드리겠습니다.

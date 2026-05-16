@@ -1,0 +1,458 @@
+좋습니다. 아래는 **`tests/workers/test_collector_persist.py` 전체 초안**입니다.
+
+전제는 세 가지입니다.
+현재 문서 기준으로 프로젝트는 `pytest + Async SQLAlchemy + aiosqlite` 구조이고, 수집 경로의 핵심은 `collector_worker.py`의 공통 persist 함수이며, 다음 단계는 이 지점에서 `message upsert → version 생성 → normalize job enqueue`를 같은 트랜잭션 안에 묶는 것입니다.   
+
+아래 코드는 **테스트 파일 하나만으로도 돌아갈 수 있게 fixtures를 포함**한 형태로 적었습니다.
+실제 프로젝트의 `Base`, `Channel`, `Message`, `AnalysisJob`, `MessageVersion` import 경로만 맞춰서 조정하시면 됩니다.
+
+```python
+# tests/workers/test_collector_persist.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+# 실제 프로젝트 경로에 맞게 조정 필요
+from src.infra.db.base import Base
+from src.infra.db.models import (
+    Channel,
+    Message,
+    MessageVersion,
+    AnalysisJob,
+    JobType,
+)
+from src.workers.collector_worker import (
+    persist_message,
+    create_message_version,
+)
+from src.services.analysis_job_service import AnalysisJobService
+
+
+UTC = timezone.utc
+
+
+# =========================
+# Fake Telegram Message
+# =========================
+
+@dataclass
+class FakeTelegramMessage:
+    id: int
+    message: str | None
+    date: datetime
+    edit_date: datetime | None = None
+
+
+def aware_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+# =========================
+# Test DB Fixtures
+# =========================
+
+@pytest_asyncio.fixture
+async def engine():
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        future=True,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session_factory(engine):
+    return async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+        autocommit=False,
+    )
+
+
+@pytest_asyncio.fixture
+async def async_session(session_factory):
+    async with session_factory() as session:
+        yield session
+        await session.rollback()
+
+
+# =========================
+# Domain Fixtures
+# =========================
+
+@pytest_asyncio.fixture
+async def channel(async_session: AsyncSession) -> Channel:
+    item = Channel(
+        tg_channel_id=123456789,
+        title="테스트 채널",
+        username="test_channel",
+        is_collecting=True,
+        status="ACTIVE",
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+# =========================
+# Helper Queries
+# =========================
+
+async def get_message_by_tg_id(
+    session: AsyncSession,
+    *,
+    channel_id: int,
+    tg_message_id: int,
+) -> Message | None:
+    return await session.scalar(
+        select(Message).where(
+            Message.channel_id == channel_id,
+            Message.tg_message_id == tg_message_id,
+        )
+    )
+
+
+async def list_versions(
+    session: AsyncSession,
+    *,
+    message_id: int,
+) -> list[MessageVersion]:
+    result = await session.scalars(
+        select(MessageVersion)
+        .where(MessageVersion.message_id == message_id)
+        .order_by(MessageVersion.version_no.asc())
+    )
+    return list(result)
+
+
+async def list_normalize_jobs(
+    session: AsyncSession,
+    *,
+    target_id: int,
+) -> list[AnalysisJob]:
+    result = await session.scalars(
+        select(AnalysisJob)
+        .where(
+            AnalysisJob.target_id == target_id,
+            AnalysisJob.job_type == JobType.NORMALIZE,
+        )
+        .order_by(AnalysisJob.id.asc())
+    )
+    return list(result)
+
+
+async def count_rows(session: AsyncSession, model) -> int:
+    return int(await session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+# =========================
+# Tests
+# =========================
+
+@pytest.mark.asyncio
+async def test_persist_message_creates_version_and_normalize_job(
+    async_session: AsyncSession,
+    channel: Channel,
+):
+    tg_msg = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 수주 기대감",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=None,
+    )
+
+    stored = await persist_message(async_session, channel, tg_msg)
+    await async_session.commit()
+
+    fetched = await get_message_by_tg_id(
+        async_session,
+        channel_id=channel.id,
+        tg_message_id=101,
+    )
+    versions = await list_versions(async_session, message_id=stored.id)
+    jobs = await list_normalize_jobs(async_session, target_id=stored.id)
+
+    assert fetched is not None
+    assert fetched.id == stored.id
+    assert fetched.message_text == "삼성전자 005930 수주 기대감"
+
+    assert len(versions) == 1
+    assert versions[0].is_current is True
+    assert versions[0].version_no == 1
+    assert versions[0].message_text == "삼성전자 005930 수주 기대감"
+
+    assert len(jobs) == 1
+    assert jobs[0].job_type == JobType.NORMALIZE
+    assert jobs[0].target_id == stored.id
+    assert jobs[0].idempotency_key.startswith(
+        f"normalize:message:{stored.id}:version:{versions[0].id}:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_same_message_reingest_does_not_duplicate_version_or_job(
+    async_session: AsyncSession,
+    channel: Channel,
+):
+    tg_msg = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 수주 기대감",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=None,
+    )
+
+    first = await persist_message(async_session, channel, tg_msg)
+    await async_session.commit()
+
+    second = await persist_message(async_session, channel, tg_msg)
+    await async_session.commit()
+
+    assert first.id == second.id
+
+    versions = await list_versions(async_session, message_id=first.id)
+    jobs = await list_normalize_jobs(async_session, target_id=first.id)
+
+    assert len(versions) == 1
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_edited_message_creates_new_version_and_new_normalize_job(
+    async_session: AsyncSession,
+    channel: Channel,
+):
+    original = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 수주 기대감",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=None,
+    )
+    edited = FakeTelegramMessage(
+        id=101,
+        message="삼성전자 005930 대형 수주 기대감 확대",
+        date=aware_dt("2026-03-22T09:00:00+00:00"),
+        edit_date=aware_dt("2026-03-22T09:05:00+00:00"),
+    )
+
+    stored = await persist_message(async_session, channel, original)
+    await async_session.commit()
+
+    await persist_message(async_session, channel, edited)
+    await async_session.commit()
+
+    fetched = await get_message_by_tg_id(
+        async_session,
+        channel_id=channel.id,
+        tg_message_id=101,
+    )
+    versions = await list_versions(async_session, message_id=stored.id)
+    jobs = await list_normalize_jobs(async_session, target_id=stored.id)
+
+    assert fetched is not None
+    assert fetched.message_text == "삼성전자 005930 대형 수주 기대감 확대"
+    assert fetched.edit_date_utc == aware_dt("2026-03-22T09:05:00+00:00")
+
+    assert len(versions) == 2
+    assert versions[0].version_no == 1
+    assert versions[0].is_current is False
+    assert versions[1].version_no == 2
+    assert versions[1].is_current is True
+    assert versions[1].message_text == "삼성전자 005930 대형 수주 기대감 확대"
+
+    assert len(jobs) == 2
+    assert jobs[0].idempotency_key != jobs[1].idempotency_key
+
+
+@pytest.mark.asyncio
+async def test_enqueue_job_is_idempotent(
+    async_session: AsyncSession,
+    channel: Channel,
+):
+    tg_msg = FakeTelegramMessage(
+        id=201,
+        message="SK하이닉스 000660 HBM 기대",
+        date=aware_dt("2026-03-22T10:00:00+00:00"),
+        edit_date=None,
+    )
+
+    stored = await persist_message(async_session, channel, tg_msg)
+    await async_session.commit()
+
+    versions = await list_versions(async_session, message_id=stored.id)
+    version = versions[0]
+
+    job1 = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_type="message",  # 실제 enum이면 JobTargetType.MESSAGE 로 교체
+        target_id=stored.id,
+        idempotency_key=f"normalize:message:{stored.id}:version:{version.id}:cv1",
+        payload_json={"message_id": stored.id, "version_id": version.id},
+    )
+    await async_session.commit()
+
+    job2 = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.NORMALIZE,
+        target_type="message",  # 실제 enum이면 JobTargetType.MESSAGE 로 교체
+        target_id=stored.id,
+        idempotency_key=f"normalize:message:{stored.id}:version:{version.id}:cv1",
+        payload_json={"message_id": stored.id, "version_id": version.id},
+    )
+    await async_session.commit()
+
+    jobs = await list_normalize_jobs(async_session, target_id=stored.id)
+
+    # persist_message 에서 이미 normalize 1건을 넣었으므로,
+    # 위 두 enqueue는 기존 동일 job을 반환해야 함
+    assert len(jobs) == 1
+    assert job1.id == job2.id
+
+
+@pytest.mark.asyncio
+async def test_begin_nested_keeps_other_rows_when_one_message_fails(
+    async_session: AsyncSession,
+    channel: Channel,
+    monkeypatch,
+):
+    msgs = [
+        FakeTelegramMessage(
+            id=1,
+            message="a",
+            date=aware_dt("2026-03-22T09:00:00+00:00"),
+        ),
+        FakeTelegramMessage(
+            id=2,
+            message="b",
+            date=aware_dt("2026-03-22T09:01:00+00:00"),
+        ),
+        FakeTelegramMessage(
+            id=3,
+            message="c",
+            date=aware_dt("2026-03-22T09:02:00+00:00"),
+        ),
+    ]
+
+    original = create_message_version
+
+    async def broken_create_message_version(session, message, tg_msg):
+        if tg_msg.id == 2:
+            raise ValueError("forced failure")
+        return await original(session, message, tg_msg)
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.create_message_version",
+        broken_create_message_version,
+    )
+
+    for tg_msg in msgs:
+        try:
+            await persist_message(async_session, channel, tg_msg)
+        except ValueError:
+            pass
+
+    await async_session.commit()
+
+    count_messages = await count_rows(async_session, Message)
+    count_versions = await count_rows(async_session, MessageVersion)
+    count_jobs = await count_rows(async_session, AnalysisJob)
+
+    stored_ids = [
+        m.tg_message_id
+        for m in (
+            await async_session.scalars(
+                select(Message)
+                .where(Message.channel_id == channel.id)
+                .order_by(Message.tg_message_id.asc())
+            )
+        )
+    ]
+
+    assert stored_ids == [1, 3]
+    assert count_messages == 2
+    assert count_versions == 2
+    assert count_jobs == 2
+
+
+@pytest.mark.asyncio
+async def test_edit_same_hash_does_not_create_extra_version(
+    async_session: AsyncSession,
+    channel: Channel,
+):
+    original = FakeTelegramMessage(
+        id=300,
+        message="현대차 005380 실적 기대",
+        date=aware_dt("2026-03-22T11:00:00+00:00"),
+        edit_date=None,
+    )
+    edited_same_text = FakeTelegramMessage(
+        id=300,
+        message="현대차 005380 실적 기대",
+        date=aware_dt("2026-03-22T11:00:00+00:00"),
+        edit_date=aware_dt("2026-03-22T11:03:00+00:00"),
+    )
+
+    stored = await persist_message(async_session, channel, original)
+    await async_session.commit()
+
+    await persist_message(async_session, channel, edited_same_text)
+    await async_session.commit()
+
+    versions = await list_versions(async_session, message_id=stored.id)
+    jobs = await list_normalize_jobs(async_session, target_id=stored.id)
+
+    # create_message_version 가 raw_hash 동일 시 current 재사용한다는 전제
+    assert len(versions) == 1
+    assert len(jobs) == 1
+```
+
+---
+
+## 2) 이 파일을 붙일 때 바로 확인할 부분
+
+위 테스트는 설계 의도가 분명합니다.
+
+* 공통 persist 함수가 **실시간/백필 공통 저장 지점**이어야 하고,
+* `message upsert → version 생성 → normalize job enqueue`가 같은 세션 안에서 일어나야 하며,
+* 동일 메시지 replay 시 job이 늘어나지 않아야 하고,
+* 편집 메시지면 version과 normalize job이 새로 생겨야 합니다.
+  이건 지금까지 문서에서 강조한 savepoint, resume, 편집 메시지 반영 정합성과 정확히 연결됩니다.  
+
+---
+
+## 3) 실제 프로젝트에 맞춰 수정할 가능성이 높은 부분
+
+세 군데는 거의 확실히 손보셔야 합니다.
+
+첫째, `Channel` 모델 필드명입니다.
+예시에서는 `username`, `status`, `is_collecting`를 직접 넣었는데, 실제 모델 필수 필드와 다를 수 있습니다.
+
+둘째, `target_type="message"` 부분입니다.
+실제 ORM이 enum이면 `JobTargetType.MESSAGE`로 바꿔야 합니다.
+
+셋째, `Base.metadata.create_all` 방식입니다.
+프로젝트에 이미 공용 test DB fixture가 있으면 이 파일의 engine/session fixture는 빼고 `conftest.py` 공용 fixture를 재사용하는 편이 낫습니다.
+
+---
+

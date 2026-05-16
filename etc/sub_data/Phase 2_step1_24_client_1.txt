@@ -1,0 +1,333 @@
+좋습니다.
+그럼 바로 **`client.py` 최종 초안** 형태로 드리겠습니다.
+
+이 버전은 지금까지 연결한 흐름과 맞춰서 아래를 모두 포함합니다.
+
+* `connect / disconnect / run_until_disconnected`
+* `get_dialogs`
+* `register_new_message_handler`
+* `register_edited_message_handler`
+* `iter_channel_messages` 백필용 history iterator
+* `FloodWait` 대응 + resume
+* 너무 긴 대기는 `BackfillDeferredError`로 상위에 위임
+
+---
+
+## `src/infra/telegram/client.py`
+
+```python
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+from typing import AsyncIterator, Optional, Any
+
+from telethon import TelegramClient, events, errors
+
+from src.common.logger import logger
+from config.settings import settings
+
+
+@dataclass
+class BackfillDeferredError(Exception):
+    """
+    FloodWait이 너무 길어서 이번 백필 사이클에서는 중단하고
+    다음 사이클로 넘겨야 할 때 사용하는 예외
+    """
+    reason: str
+    wait_seconds: int = 0
+    retry_count: int = 0
+    total_wait_seconds: int = 0
+
+    def __str__(self) -> str:
+        return (
+            f"{self.reason} "
+            f"(wait_seconds={self.wait_seconds}, "
+            f"retry_count={self.retry_count}, "
+            f"total_wait_seconds={self.total_wait_seconds})"
+        )
+
+
+class TelegramCollector:
+    def __init__(self):
+        self.client = TelegramClient(
+            settings.TELEGRAM_SESSION_NAME,
+            settings.TELEGRAM_API_ID,
+            settings.TELEGRAM_API_HASH,
+            flood_sleep_threshold=30,
+            request_retries=3,
+            connection_retries=5,
+            retry_delay=1,
+            auto_reconnect=True,
+        )
+
+    async def __aenter__(self):
+        await self.connect(interactive=False)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.disconnect()
+
+    async def connect(self, interactive: bool = False):
+        await self.client.connect()
+
+        if not await self.client.is_user_authorized():
+            if not interactive:
+                raise RuntimeError("텔레그램 인증 세션이 없습니다.")
+            raise RuntimeError("interactive 인증 로직이 아직 연결되지 않았습니다.")
+
+        logger.info("텔레그램 연결 성공")
+
+    async def disconnect(self):
+        await self.client.disconnect()
+        logger.info("텔레그램 연결 해제")
+
+    async def run_until_disconnected(self):
+        await self.client.run_until_disconnected()
+
+    async def resolve_entity(self, entity: Any):
+        """
+        entity는 아래 형태를 허용
+        - tg_channel_id 문자열
+        - username 문자열
+        - Telethon entity 객체
+        """
+        try:
+            return await self.client.get_entity(entity)
+        except Exception:
+            # 이미 entity 객체거나 get_entity 없이도 iter_messages에 바로 넣을 수 있는 경우 대비
+            return entity
+
+    async def get_dialogs(self) -> list[dict]:
+        dialogs = await self.client.get_dialogs()
+        result = []
+
+        for d in dialogs:
+            if not d.is_channel and not d.is_group:
+                continue
+
+            entity = d.entity
+
+            result.append(
+                {
+                    "id": str(entity.id),
+                    "title": d.name,
+                    "username": getattr(entity, "username", None),
+                    "access_hash": str(getattr(entity, "access_hash", "")),
+                    "is_channel": bool(d.is_channel),
+                    "is_group": bool(d.is_group),
+                }
+            )
+
+        return result
+
+    def register_new_message_handler(self, handler):
+        self.client.add_event_handler(handler, events.NewMessage)
+
+    def register_edited_message_handler(self, handler):
+        self.client.add_event_handler(handler, events.MessageEdited)
+
+    @staticmethod
+    def _get_flood_wait_seconds(exc: Exception) -> int:
+        """
+        Telethon 버전 차이를 흡수하기 위한 헬퍼
+        - 일부 버전은 .seconds
+        - 일부 버전은 .value
+        """
+        seconds = getattr(exc, "seconds", None)
+        if seconds is not None:
+            return int(seconds)
+
+        value = getattr(exc, "value", None)
+        if value is not None:
+            return int(value)
+
+        return 0
+
+    async def iter_channel_messages(
+        self,
+        entity,
+        *,
+        limit: int = 1000,
+        days: int = 3,
+        max_retry_count: int = 2,
+        max_single_wait_seconds: int = 300,
+        max_total_wait_seconds: int = 600,
+    ) -> AsyncIterator:
+        """
+        최근 N일 또는 최대 N건까지 메시지를 순회합니다.
+
+        정책:
+        - 짧은 FloodWait은 Telethon 내부 auto-sleep + 여기의 재시도 로직으로 처리
+        - 너무 긴 FloodWait은 BackfillDeferredError로 상위에 위임
+        - 마지막 성공 메시지 ID 기준으로 resume
+        """
+        resolved_entity = await self.resolve_entity(entity)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        yielded_count = 0
+        retry_count = 0
+        total_wait_seconds = 0
+        last_success_message_id: Optional[int] = None
+
+        while yielded_count < limit:
+            try:
+                batch_count = 0
+
+                async for message in self.client.iter_messages(
+                    resolved_entity,
+                    limit=(limit - yielded_count),
+                    offset_id=last_success_message_id or 0,
+                ):
+                    msg_date = getattr(message, "date", None)
+
+                    if msg_date is not None:
+                        if msg_date.tzinfo is None:
+                            msg_date = msg_date.replace(tzinfo=timezone.utc)
+                        else:
+                            msg_date = msg_date.astimezone(timezone.utc)
+
+                        if msg_date < cutoff:
+                            logger.info(
+                                "백필 cutoff 도달 entity=%s cutoff=%s last_message_id=%s",
+                                entity,
+                                cutoff.isoformat(),
+                                getattr(message, "id", None),
+                            )
+                            return
+
+                    yield message
+
+                    yielded_count += 1
+                    batch_count += 1
+                    last_success_message_id = getattr(message, "id", None)
+
+                    if yielded_count >= limit:
+                        return
+
+                # 더 이상 메시지가 없으면 종료
+                if batch_count == 0:
+                    return
+
+                # 정상적으로 배치를 하나라도 읽었으면 retry 카운터 리셋
+                retry_count = 0
+
+            except errors.FloodWaitError as e:
+                wait_seconds = self._get_flood_wait_seconds(e)
+                retry_count += 1
+                total_wait_seconds += wait_seconds
+
+                logger.warning(
+                    "FloodWait 감지 entity=%s wait=%ss retry=%s total_wait=%s last_success_message_id=%s",
+                    entity,
+                    wait_seconds,
+                    retry_count,
+                    total_wait_seconds,
+                    last_success_message_id,
+                )
+
+                if wait_seconds > max_single_wait_seconds:
+                    raise BackfillDeferredError(
+                        reason="single_flood_wait_too_long",
+                        wait_seconds=wait_seconds,
+                        retry_count=retry_count,
+                        total_wait_seconds=total_wait_seconds,
+                    ) from e
+
+                if total_wait_seconds > max_total_wait_seconds:
+                    raise BackfillDeferredError(
+                        reason="total_flood_wait_too_long",
+                        wait_seconds=wait_seconds,
+                        retry_count=retry_count,
+                        total_wait_seconds=total_wait_seconds,
+                    ) from e
+
+                if retry_count > max_retry_count:
+                    raise BackfillDeferredError(
+                        reason="flood_wait_retry_exceeded",
+                        wait_seconds=wait_seconds,
+                        retry_count=retry_count,
+                        total_wait_seconds=total_wait_seconds,
+                    ) from e
+
+                await asyncio.sleep(wait_seconds + 1)
+                continue
+```
+
+---
+
+## 이 코드가 현재 구조와 맞는 이유
+
+### 1. `collector_worker.py`와 바로 연결됩니다
+
+이미 다음 구조로 바꾸기로 했기 때문에:
+
+```python
+await run_startup_tasks(
+    collector=self._collector,
+    persist_func=persist_message_from_history,
+)
+```
+
+`startup_tasks.py`의 `perform_backfill_for_channel()`에서 아래처럼 바로 쓸 수 있습니다.
+
+```python
+async for history_message in collector.iter_channel_messages(
+    channel.tg_channel_id,
+    limit=limit,
+    days=days,
+):
+    ...
+```
+
+### 2. FloodWait 장기 대기를 `ERROR`가 아니라 “연기”로 분리할 수 있습니다
+
+`BackfillDeferredError`를 던지므로, `startup_tasks.py`에서는:
+
+* `except BackfillDeferredError`
+* `mark_backfill_deferred(...)`
+
+로 자연스럽게 연결할 수 있습니다.
+
+### 3. 마지막 성공 메시지 기준 resume이 됩니다
+
+`last_success_message_id`를 저장하고 `offset_id`로 이어받기 때문에, FloodWait 이후 처음부터 다시 긁지 않습니다.
+
+---
+
+## 같이 확인할 것 3개
+
+### A. `settings` 이름
+
+아래 세 값 이름이 실제 프로젝트와 같아야 합니다.
+
+```python
+settings.TELEGRAM_SESSION_NAME
+settings.TELEGRAM_API_ID
+settings.TELEGRAM_API_HASH
+```
+
+이름이 다르면 그 부분만 바꾸면 됩니다.
+
+### B. logger 포맷
+
+지금 프로젝트 logger가 `%s` 포맷보다 f-string을 더 선호하면 아래 같은 로그는 f-string으로 바꿔도 됩니다.
+
+```python
+logger.warning(
+    "FloodWait 감지 entity=%s wait=%ss retry=%s total_wait=%s last_success_message_id=%s",
+    entity,
+    wait_seconds,
+    retry_count,
+    total_wait_seconds,
+    last_success_message_id,
+)
+```
+
+### C. `get_entity()` 해석
+
+`channel.tg_channel_id`가 문자열 숫자라면 `get_entity()`가 잘 풀리는 환경이 많지만, 일부 경우 username이나 entity object를 직접 쓰는 쪽이 더 안정적일 수 있습니다. 지금은 `resolve_entity()`로 한 번 감싸서 방어적으로 처리했습니다.
+
+---
+

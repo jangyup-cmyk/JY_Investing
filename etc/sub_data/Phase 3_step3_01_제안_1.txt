@@ -1,0 +1,574 @@
+문서 기준 구조와 실제 실행 진입점 이름을 다시 맞춰서, 이번에는 마이그레이션 초안과 collector_worker.py에서 어느 지점에 enqueue를 넣어야 하는지까지 바로 적용 가능한 수준으로 적겠습니다. 이미 수집/백필/세션 구조가 정리돼 있으니, 이번 작업은 그 흐름을 깨지 않고 전처리 큐를 삽입하는 데 초점을 두겠습니다.
+
+문서상 흐름을 다시 맞춰보니, enqueue는 이벤트 핸들러 곳곳에 흩뿌리는 방식보다 실시간/백필이 공통으로 타는 영속화 지점 하나에 넣는 것이 맞습니다. 특히 startup_tasks.py가 persist_func를 주입받는 구조라고 문서에 적혀 있어서, 그 공통 persist 함수가 이번 패치의 핵심 지점입니다.
+
+좋습니다. 이번에는 **바로 적용 가능한 수준**으로 적겠습니다.
+
+전제는 분명합니다. 현재 구조는 `run_web.py`와 `run_collector.py`가 분리되어 있고, DB는 `Async SQLAlchemy + aiosqlite`, 마이그레이션은 Alembic, 워커 쪽 핵심 모듈은 `src/workers/collector_worker.py`와 `src/workers/startup_tasks.py`, 공통 ORM은 `src/infra/db/models.py`에 있습니다. 또 Phase 3가 “전처리 엔진”, Phase 4가 “LLM 기반 테마 추론”으로 잡혀 있으므로, 이번 패치는 **Phase 2 수집 경로를 깨지 않고 Phase 3 작업 큐를 삽입**하는 목적에 가장 잘 맞습니다.    
+
+다만 한 가지는 분명히 말씀드리겠습니다. **실제 `collector_worker.py` 코드 본문은 첨부되지 않았기 때문에**, 아래 패치 포인트는 문서에 적힌 책임 분리와 현재 구조를 기준으로 한 **정확한 설계 초안**입니다. 함수명은 실제 코드에 맞춰 조정하셔야 합니다. 특히 문서상 `startup_tasks.py`가 `persist_func`를 주입받는 구조라고 되어 있으므로, 이번 패치는 **이 공통 persist 함수에 넣는 것**이 가장 안전합니다.  
+
+---
+
+## 1) 마이그레이션 전략
+
+지금 단계에서는 한 번에 너무 많이 넣기보다 **2개 리비전**으로 나누는 편이 좋습니다.
+
+### Revision A
+
+* `message_versions`
+* `normalized_messages`
+* `message_features`
+
+### Revision B
+
+* `analysis_jobs`
+* `analysis_results`
+
+이 순서가 좋은 이유는, 현재 문서상 Phase 3가 먼저 “티커 추출/스팸 필터링/노이즈 제거”이고, 그 다음이 Phase 4 LLM 분석이기 때문입니다. 그래서 먼저 전처리 산출물을 저장할 구조를 만들고, 그 다음 분석 작업 원장과 결과 테이블을 붙이는 흐름이 자연스럽습니다.  
+
+---
+
+## 2) Alembic revision 명령 예시
+
+README에 적힌 방식대로 `models.py` 변경 후 autogenerate를 써도 되지만, **SQLite + 신규 테이블 다수 추가** 구간은 수동 검토를 강하게 권장합니다. 특히 enum 컬럼은 SQLite 친화적으로 `String`으로 두는 편이 안전합니다. 현재 DB가 `aiosqlite`라는 점도 이 판단에 영향을 줍니다.  
+
+```bash
+alembic revision -m "add phase3 preprocessing tables"
+alembic revision -m "add analysis job tables"
+alembic upgrade head
+```
+
+---
+
+## 3) Revision A 초안
+
+파일 예시: `alembic/versions/20260322_add_phase3_preprocessing_tables.py`
+
+```python
+from alembic import op
+import sqlalchemy as sa
+
+# revision identifiers, used by Alembic.
+revision = "20260322_add_phase3_preprocessing_tables"
+down_revision = "<직전_revision_id>"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.create_table(
+        "message_versions",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("message_id", sa.BigInteger(), sa.ForeignKey("messages.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("version_no", sa.Integer(), nullable=False),
+        sa.Column("message_text", sa.Text(), nullable=True),
+        sa.Column("raw_hash", sa.String(length=64), nullable=True),
+        sa.Column("edit_date_utc", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("is_current", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.UniqueConstraint("message_id", "version_no", name="uq_message_versions_message_version"),
+    )
+    op.create_index("ix_message_versions_message_id", "message_versions", ["message_id"])
+    op.create_index("ix_message_versions_raw_hash", "message_versions", ["raw_hash"])
+
+    op.create_table(
+        "normalized_messages",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("message_id", sa.BigInteger(), sa.ForeignKey("messages.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("version_id", sa.BigInteger(), sa.ForeignKey("message_versions.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("cleaning_version", sa.String(length=50), nullable=False),
+        sa.Column("normalized_text", sa.Text(), nullable=True),
+        sa.Column("language_code", sa.String(length=16), nullable=True),
+        sa.Column("token_estimate", sa.Integer(), nullable=True),
+        sa.Column("is_spam", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("spam_reason", sa.String(length=255), nullable=True),
+        sa.Column("is_duplicate_near", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("duplicate_group_key", sa.String(length=128), nullable=True),
+        sa.Column("quality_score", sa.Float(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.UniqueConstraint(
+            "message_id", "version_id", "cleaning_version",
+            name="uq_normalized_messages_message_version_cleaning"
+        ),
+    )
+    op.create_index("ix_normalized_messages_message_id", "normalized_messages", ["message_id"])
+    op.create_index("ix_normalized_messages_version_id", "normalized_messages", ["version_id"])
+    op.create_index("ix_normalized_messages_duplicate_group_key", "normalized_messages", ["duplicate_group_key"])
+
+    op.create_table(
+        "message_features",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("message_id", sa.BigInteger(), sa.ForeignKey("messages.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("version_id", sa.BigInteger(), sa.ForeignKey("message_versions.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("normalized_message_id", sa.BigInteger(), sa.ForeignKey("normalized_messages.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("feature_version", sa.String(length=50), nullable=False),
+        sa.Column("ticker_candidates_json", sa.JSON(), nullable=True),
+        sa.Column("company_alias_hits_json", sa.JSON(), nullable=True),
+        sa.Column("theme_candidates_json", sa.JSON(), nullable=True),
+        sa.Column("keyword_hits_json", sa.JSON(), nullable=True),
+        sa.Column("entity_spans_json", sa.JSON(), nullable=True),
+        sa.Column("sentiment_rule_score", sa.Float(), nullable=True),
+        sa.Column("urgency_score", sa.Float(), nullable=True),
+        sa.Column("novelty_score", sa.Float(), nullable=True),
+        sa.Column("source_reliability_score", sa.Float(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.UniqueConstraint(
+            "message_id", "version_id", "feature_version",
+            name="uq_message_features_message_version_feature"
+        ),
+    )
+    op.create_index("ix_message_features_message_id", "message_features", ["message_id"])
+    op.create_index("ix_message_features_version_id", "message_features", ["version_id"])
+    op.create_index("ix_message_features_normalized_message_id", "message_features", ["normalized_message_id"])
+
+
+def downgrade():
+    op.drop_index("ix_message_features_normalized_message_id", table_name="message_features")
+    op.drop_index("ix_message_features_version_id", table_name="message_features")
+    op.drop_index("ix_message_features_message_id", table_name="message_features")
+    op.drop_table("message_features")
+
+    op.drop_index("ix_normalized_messages_duplicate_group_key", table_name="normalized_messages")
+    op.drop_index("ix_normalized_messages_version_id", table_name="normalized_messages")
+    op.drop_index("ix_normalized_messages_message_id", table_name="normalized_messages")
+    op.drop_table("normalized_messages")
+
+    op.drop_index("ix_message_versions_raw_hash", table_name="message_versions")
+    op.drop_index("ix_message_versions_message_id", table_name="message_versions")
+    op.drop_table("message_versions")
+```
+
+이 리비전은 현재 `messages` 원문 테이블을 건드리지 않고 **원문 위에 버전/정규화/피처 레이어를 얹는** 방식입니다. 현재 프로젝트가 이미 실시간 신규/편집 메시지를 DB에 적재하고 있고, 편집 메시지 반영이 완료 기준에 포함되어 있으므로 이 방식이 가장 충돌이 적습니다.  
+
+---
+
+## 4) Revision B 초안
+
+파일 예시: `alembic/versions/20260322_add_analysis_job_tables.py`
+
+```python
+from alembic import op
+import sqlalchemy as sa
+
+revision = "20260322_add_analysis_job_tables"
+down_revision = "20260322_add_phase3_preprocessing_tables"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.create_table(
+        "analysis_jobs",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("job_type", sa.String(length=50), nullable=False),
+        sa.Column("target_type", sa.String(length=50), nullable=False),
+        sa.Column("target_id", sa.BigInteger(), nullable=False),
+        sa.Column("status", sa.String(length=30), nullable=False, server_default="pending"),
+        sa.Column("priority", sa.Integer(), nullable=False, server_default="100"),
+        sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("max_attempts", sa.Integer(), nullable=False, server_default="3"),
+        sa.Column("scheduled_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("worker_name", sa.String(length=100), nullable=True),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_heartbeat_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("idempotency_key", sa.String(length=255), nullable=False),
+        sa.Column("payload_json", sa.JSON(), nullable=True),
+        sa.Column("error_code", sa.String(length=100), nullable=True),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.UniqueConstraint("job_type", "idempotency_key", name="uq_analysis_jobs_type_idempotency"),
+    )
+    op.create_index("ix_analysis_jobs_status", "analysis_jobs", ["status"])
+    op.create_index("ix_analysis_jobs_priority", "analysis_jobs", ["priority"])
+    op.create_index("ix_analysis_jobs_scheduled_at", "analysis_jobs", ["scheduled_at"])
+    op.create_index("ix_analysis_jobs_target", "analysis_jobs", ["target_type", "target_id"])
+    op.create_index("ix_analysis_jobs_lease_expires_at", "analysis_jobs", ["lease_expires_at"])
+
+    op.create_table(
+        "analysis_results",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("job_id", sa.BigInteger(), sa.ForeignKey("analysis_jobs.id", ondelete="CASCADE"), nullable=False),
+        sa.Column("target_type", sa.String(length=50), nullable=False),
+        sa.Column("target_id", sa.BigInteger(), nullable=False),
+        sa.Column("result_type", sa.String(length=50), nullable=False),
+        sa.Column("model_name", sa.String(length=100), nullable=True),
+        sa.Column("model_version", sa.String(length=100), nullable=True),
+        sa.Column("prompt_version", sa.String(length=100), nullable=True),
+        sa.Column("input_version", sa.String(length=100), nullable=True),
+        sa.Column("confidence", sa.Float(), nullable=True),
+        sa.Column("latency_ms", sa.Integer(), nullable=True),
+        sa.Column("cost_input_tokens", sa.Integer(), nullable=True),
+        sa.Column("cost_output_tokens", sa.Integer(), nullable=True),
+        sa.Column("result_json", sa.JSON(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+    )
+    op.create_index("ix_analysis_results_job_id", "analysis_results", ["job_id"])
+    op.create_index("ix_analysis_results_target", "analysis_results", ["target_type", "target_id"])
+    op.create_index("ix_analysis_results_result_type", "analysis_results", ["result_type"])
+
+
+def downgrade():
+    op.drop_index("ix_analysis_results_result_type", table_name="analysis_results")
+    op.drop_index("ix_analysis_results_target", table_name="analysis_results")
+    op.drop_index("ix_analysis_results_job_id", table_name="analysis_results")
+    op.drop_table("analysis_results")
+
+    op.drop_index("ix_analysis_jobs_lease_expires_at", table_name="analysis_jobs")
+    op.drop_index("ix_analysis_jobs_target", table_name="analysis_jobs")
+    op.drop_index("ix_analysis_jobs_scheduled_at", table_name="analysis_jobs")
+    op.drop_index("ix_analysis_jobs_priority", table_name="analysis_jobs")
+    op.drop_index("ix_analysis_jobs_status", table_name="analysis_jobs")
+    op.drop_table("analysis_jobs")
+```
+
+여기서 중요한 점은 **SQLite 친화성** 때문에 migration에서는 enum을 네이티브 enum으로 만들지 않고 문자열로 뒀다는 것입니다. 현재 프로젝트가 `aiosqlite` 기반이고, 목적도 지금은 “안정적인 Phase 3 진입”이므로 이 방식이 덜 위험합니다.  
+
+---
+
+## 5) `collector_worker.py` 패치 포인트: 어디에 넣어야 하나
+
+핵심은 하나입니다.
+
+**enqueue는 Telethon 이벤트 핸들러 끝단이 아니라, DB에 메시지를 실제 저장하는 공통 persistence 지점에 넣어야 합니다.**
+
+이유는 현재 구조에서
+
+* `collector_worker.py`가 실시간 신규/편집 메시지를 담당하고,
+* `startup_tasks.py`가 백필을 오케스트레이션하며,
+* 문서상 `startup_tasks.py`가 `persist_func`를 주입받는 구조이기 때문입니다.  
+
+즉, 아래 두 군데가 아니라:
+
+* `on_new_message` 핸들러 끝
+* `on_edited_message` 핸들러 끝
+
+이 두 군데에 중복 삽입하지 말고,
+**둘이 공통으로 호출하는 `persist_message(...)` 계열 함수 한 곳**에 넣는 것이 맞습니다.
+
+### 가장 이상적인 위치
+
+`src/workers/collector_worker.py` 안의 아래 성격의 함수입니다.
+
+```python
+async def persist_message(...):
+    ...
+```
+
+또는
+
+```python
+async def _upsert_message(...):
+    ...
+```
+
+또는
+
+```python
+async def handle_incoming_message(...):
+    ...
+```
+
+실제 이름은 다를 수 있지만, 문서상 책임 기준으로는 **“DB 저장 루프”가 있는 지점**입니다. 
+
+---
+
+## 6) 패치 원칙
+
+패치 원칙은 아래 4개입니다.
+
+### 1. `message` 저장과 `analysis_jobs` enqueue는 같은 트랜잭션
+
+현재 백필 엔진은 `begin_nested()` savepoint와 100건 단위 batch commit을 사용하고 있으므로, 전처리 작업 enqueue도 같은 트랜잭션에 태워야 합니다. 그래야 “메시지는 저장됐는데 job이 없거나”, “job만 생기고 메시지는 롤백된” 상태를 피할 수 있습니다.  
+
+### 2. `AnalysisJobService.enqueue_job()` 내부에서 commit 금지
+
+현재 백필은 100건 단위 batch commit 구조입니다. enqueue 함수가 내부에서 commit을 해버리면 현재 Phase 2의 안전한 배치 커밋/Savepoint 설계를 깨뜨립니다.  
+
+### 3. 새 메시지와 편집 메시지 모두 version 기준으로 enqueue
+
+현재 프로젝트는 편집 메시지 실시간 반영이 검증 항목에 포함되어 있으므로, `message.id`만 기준으로 잡으면 edit 재분석이 꼬입니다. 반드시 `message_version` 기준 idempotency key를 써야 합니다.  
+
+### 4. 중복/재백필/재시작은 unique idempotency로 흡수
+
+현재 구조는 중복 적재 0건, resume, backfill replay를 목표로 검증되어 있으므로, analysis job도 같은 철학으로 가야 합니다. `uq_analysis_jobs_type_idempotency`가 그 역할을 합니다.  
+
+---
+
+## 7) `collector_worker.py` 실제 패치 형태
+
+아래는 **가장 가능성이 높은 형태의 패치 골격**입니다.
+
+### A. import 추가
+
+```python
+from src.services.analysis_job_service import AnalysisJobService
+from src.infra.db.models import JobType, JobTargetType, MessageVersion
+```
+
+### B. 공통 persist 함수 안에서 처리
+
+```python
+async def persist_message(session: AsyncSession, channel, tg_msg) -> Message:
+    """
+    신규/편집 메시지 공통 저장 지점
+    - message upsert
+    - version 생성/갱신
+    - normalize job enqueue
+    """
+    async with session.begin_nested():
+        message, changed = await upsert_message_from_telegram(session, channel, tg_msg)
+
+        # 내용 변경이 전혀 없으면 추가 작업 없음
+        if not changed:
+            return message
+
+        version = await create_message_version(session, message, tg_msg)
+
+        await session.flush()  # message.id, version.id 확보
+
+        await AnalysisJobService.enqueue_job(
+            session,
+            job_type=JobType.NORMALIZE,
+            target_type=JobTargetType.MESSAGE,
+            target_id=message.id,
+            idempotency_key=f"normalize:message:{message.id}:version:{version.id}:cv1",
+            payload_json={
+                "message_id": message.id,
+                "version_id": version.id,
+                "channel_id": message.channel_id,
+                "tg_message_id": message.tg_message_id,
+                "cleaning_version": "v1",
+            },
+            priority=100,
+            max_attempts=3,
+        )
+
+        return message
+```
+
+여기서 핵심은 `session.begin_nested()` 안에서
+
+* message upsert
+* version 생성
+* job enqueue
+  를 **같이 묶는 것**입니다. 이게 현재 Savepoint 설계와 제일 잘 맞습니다.  
+
+---
+
+## 8) `upsert_message_from_telegram()` 쪽에서 반드시 돌려줘야 할 값
+
+이 함수는 지금까지 단순히 `message`만 반환했을 가능성이 높습니다.
+이번 패치부터는 최소한 아래 둘을 돌려주는 편이 좋습니다.
+
+```python
+return message, changed
+```
+
+여기서 `changed`는 아래 중 하나면 `True`입니다.
+
+* 신규 insert
+* 기존 메시지의 text 변경
+* `edit_date_utc` 변경
+* 삭제/미디어 상태 등 분석 입력에 영향을 주는 필드 변경
+
+반대로 아래면 `False`입니다.
+
+* 단순 재수집으로 같은 메시지가 또 들어옴
+* 동일 text, 동일 edit timestamp
+
+이렇게 해야 같은 메시지에 normalize job이 계속 중복 생성되지 않습니다. 현재 시스템이 중복 적재 0건과 resume 정합성을 중요하게 보므로, 이 조건 분기는 꽤 중요합니다.  
+
+---
+
+## 9) `create_message_version()` 권장 형태
+
+```python
+async def create_message_version(session: AsyncSession, message: Message, tg_msg) -> MessageVersion:
+    current = await session.scalar(
+        select(MessageVersion).where(
+            MessageVersion.message_id == message.id,
+            MessageVersion.is_current.is_(True),
+        )
+    )
+
+    new_hash = sha256((tg_msg.message or "").encode("utf-8")).hexdigest()
+
+    if current and current.raw_hash == new_hash:
+        return current
+
+    if current:
+        current.is_current = False
+        next_version_no = current.version_no + 1
+    else:
+        next_version_no = 1
+
+    version = MessageVersion(
+        message_id=message.id,
+        version_no=next_version_no,
+        message_text=tg_msg.message,
+        raw_hash=new_hash,
+        edit_date_utc=getattr(tg_msg, "edit_date", None),
+        is_current=True,
+    )
+    session.add(version)
+    await session.flush()
+    return version
+```
+
+이 함수는 편집 메시지 대응을 위해 필요합니다. 현재 문서상 원본 채널 편집 메시지의 실시간 반영이 이미 검증 대상으로 포함되어 있으므로, LLM 파이프라인으로 넘어갈 때는 이 버전 계보가 특히 중요합니다.  
+
+---
+
+## 10) 이벤트 핸들러 쪽은 최대한 얇게 유지
+
+실시간 이벤트 핸들러는 아래처럼 얇게 두는 편이 좋습니다.
+
+```python
+async def on_new_message(event):
+    async with AsyncSessionLocal() as session:
+        await persist_message(session, channel=..., tg_msg=event.message)
+        await session.commit()
+
+async def on_edited_message(event):
+    async with AsyncSessionLocal() as session:
+        await persist_message(session, channel=..., tg_msg=event.message)
+        await session.commit()
+```
+
+하지만 현재 백필은 100건 배치 커밋 구조이므로,
+백필 루프에서는 이런 식으로 **건별 commit**을 하면 안 됩니다.
+백필 경로에서는 기존 배치 커밋 구조를 그대로 유지하고, `persist_message()`만 재사용해야 합니다. 문서에서 백필 엔진의 강점이 바로 batch commit + resume + savepoint이기 때문입니다.  
+
+---
+
+## 11) `startup_tasks.py`는 어떻게 손대야 하나
+
+문서상 `startup_tasks.py`는 `persist_func`를 주입받는 구조이므로, **이 파일은 크게 안 건드리는 게 더 좋습니다.** 공통 persist 함수가 이제 version 생성과 job enqueue까지 하게 만들면, 백필 경로도 자동으로 동일 로직을 타게 됩니다.  
+
+즉:
+
+* `startup_tasks.py`는 기존처럼 `persist_func(...)` 호출 유지
+* `collector_worker.py` 안 공통 `persist_func` 구현만 확장
+* 실시간/백필 둘 다 같은 정책 적용
+
+이게 현재 DI/결합도 완화 철학에도 맞습니다. 
+
+---
+
+## 12) idempotency key 권장안
+
+가장 추천하는 형태는 이것입니다.
+
+```python
+f"normalize:message:{message.id}:version:{version.id}:cv1"
+```
+
+이유:
+
+* `message.id`만 쓰면 edit 재분석 구분이 안 됨
+* `version_no`보다 `version.id`가 충돌에 더 강함
+* `cv1`은 cleaning_version 변경 시 재실행 기준이 됨
+
+나중에 feature job은:
+
+```python
+f"extract_features:message:{message.id}:version:{version.id}:fv1"
+```
+
+summary job은:
+
+```python
+f"single_message_summary:message:{message.id}:version:{version.id}:sv1"
+```
+
+이렇게 이어가면 됩니다.
+
+---
+
+## 13) `analysis_job_service.py`에서 꼭 지킬 점
+
+collector와 연결할 때 서비스 계층에서 가장 중요한 것은 딱 두 개입니다.
+
+### commit 하지 않기
+
+collector/backfill의 현재 commit 정책을 깨면 안 됩니다. 
+
+### 중복 시 기존 job 반환
+
+```python
+existing = await session.scalar(
+    select(AnalysisJob).where(
+        AnalysisJob.job_type == job_type,
+        AnalysisJob.idempotency_key == idempotency_key,
+    )
+)
+if existing:
+    return existing
+```
+
+이걸 넣어두면 replay/backfill/resume 상황에서도 job 중복이 억제됩니다. 현재 Phase 2의 정합성 철학과 맞습니다. 
+
+---
+
+## 14) 패치 후 실행 순서
+
+적용 순서는 아래가 가장 안전합니다.
+
+1. `src/infra/db/models.py` 수정
+2. Alembic revision A/B 생성 및 적용
+3. `src/services/analysis_job_service.py` 추가
+4. `src/workers/collector_worker.py` 공통 persist 함수 확장
+5. `src/workers/preprocess_worker.py` 추가
+6. `run_worker.py`에서 preprocess worker 실행
+
+현재 README에도 `run_worker.py`가 “기타 스케줄링/분석 등 복합 워커 구동 진입점”으로 정의되어 있으므로, preprocess worker를 여기에 붙이는 것이 맞습니다. 
+
+---
+
+## 15) 같이 추가해야 할 테스트
+
+이번 패치에서 테스트는 꼭 붙이는 게 좋습니다.
+
+### 테스트 1
+
+신규 메시지 1건 유입
+→ `messages` 1건
+→ `message_versions` 1건
+→ `analysis_jobs(normalize)` 1건
+
+### 테스트 2
+
+같은 메시지 재수집
+→ `analysis_jobs` 추가 생성 없음
+
+### 테스트 3
+
+편집 메시지 유입
+→ `message_versions` 2건째 생성
+→ `is_current` 전환
+→ 새 normalize job 1건 생성
+
+### 테스트 4
+
+백필 재시작 replay
+→ 중복 message/job 생성 없음
+
+이건 현재 프로젝트가 이미 pytest 기반 핵심 시나리오 검증을 하고 있고, 중복 방지/편집 반영/resume 정합성을 중요하게 보고 있기 때문에 꼭 맞물려야 하는 테스트들입니다.  
+
+---
+
+## 16) 한 줄 결론
+
+이번 패치의 핵심은 **이벤트 핸들러에 queue를 붙이는 것**이 아니라,
+**실시간/백필이 공통으로 통과하는 persist 함수 안에서 `message upsert → version 생성 → normalize job enqueue`를 같은 트랜잭션으로 묶는 것**입니다.
+이 방식이 현재 문서에 적힌 Phase 2 강점인 batch commit, savepoint, resume, edit 반영을 그대로 살리면서 Phase 3로 넘어가는 가장 안전한 경로입니다.  
+
+원하시면 바로 다음으로 **`collector_worker.py` 패치 diff 스타일 초안**과 **`models.py`에 넣을 ORM 정의 최종본**까지 이어서 적겠습니다.

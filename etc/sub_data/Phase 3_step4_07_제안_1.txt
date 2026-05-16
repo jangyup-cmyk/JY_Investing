@@ -1,0 +1,248 @@
+좋습니다. 그럼 마지막으로 **`collector_worker.py` 최종 패치본** 형태로 정리하겠습니다.
+
+핵심은 하나입니다.
+**실시간 신규/편집 메시지와 startup backfill이 공통으로 타는 persist 지점**에서
+
+1. `messages` upsert
+2. `message_versions` 생성/갱신
+3. `normalize` job enqueue
+
+를 **같은 트랜잭션** 안에서 처리하는 것입니다.
+
+아래 코드는 지금까지 정리한 `AnalysisJobService`, `PreprocessWorker`, 테스트 코드와 맞물리도록 맞춘 최종본입니다.
+
+---
+
+## `src/workers/collector_worker.py` 패치안
+
+```python
+from __future__ import annotations
+
+from hashlib import sha256
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.common.logger import logger
+from src.infra.db.models import (
+    Channel,
+    JobTargetType,
+    JobType,
+    Message,
+    MessageVersion,
+)
+from src.services.analysis_job_service import AnalysisJobService
+
+
+def _sha256(value: str) -> str:
+    return sha256(value.encode("utf-8")).hexdigest()
+
+
+async def upsert_message_from_telegram(
+    session: AsyncSession,
+    channel: Channel,
+    tg_msg,
+) -> tuple[Message, bool]:
+    """
+    텔레그램 메시지를 messages 테이블에 upsert.
+    반환값:
+      - message: 저장된 ORM 객체
+      - changed: 신규 생성 또는 실질 변경 여부
+    """
+    existing = await session.scalar(
+        select(Message).where(
+            Message.channel_id == channel.id,
+            Message.tg_message_id == tg_msg.id,
+        )
+    )
+
+    new_text = tg_msg.message or ""
+    new_edit_date = getattr(tg_msg, "edit_date", None)
+    new_hash = _sha256(new_text)
+
+    if existing is None:
+        message = Message(
+            channel_id=channel.id,
+            tg_message_id=tg_msg.id,
+            tg_date_utc=tg_msg.date,
+            message_text=new_text,
+            edit_date_utc=new_edit_date,
+            raw_hash=new_hash,
+            is_deleted=False,
+        )
+        session.add(message)
+        await session.flush()
+        return message, True
+
+    changed = False
+
+    if existing.message_text != new_text:
+        existing.message_text = new_text
+        changed = True
+
+    if existing.edit_date_utc != new_edit_date:
+        existing.edit_date_utc = new_edit_date
+        changed = True
+
+    if existing.raw_hash != new_hash:
+        existing.raw_hash = new_hash
+        changed = True
+
+    if changed:
+        await session.flush()
+
+    return existing, changed
+
+
+async def create_message_version(
+    session: AsyncSession,
+    message: Message,
+    tg_msg,
+) -> MessageVersion:
+    """
+    현재 메시지 상태를 message_versions에 버전으로 기록.
+    동일 raw_hash면 기존 current 버전 재사용.
+    """
+    current = await session.scalar(
+        select(MessageVersion).where(
+            MessageVersion.message_id == message.id,
+            MessageVersion.is_current.is_(True),
+        )
+    )
+
+    new_text = tg_msg.message or ""
+    new_hash = _sha256(new_text)
+    new_edit_date = getattr(tg_msg, "edit_date", None)
+
+    if current and current.raw_hash == new_hash:
+        return current
+
+    if current:
+        current.is_current = False
+        next_version_no = current.version_no + 1
+    else:
+        next_version_no = 1
+
+    version = MessageVersion(
+        message_id=message.id,
+        version_no=next_version_no,
+        message_text=new_text,
+        raw_hash=new_hash,
+        edit_date_utc=new_edit_date,
+        is_current=True,
+    )
+    session.add(version)
+    await session.flush()
+    return version
+
+
+async def persist_message(
+    session: AsyncSession,
+    channel: Channel,
+    tg_msg,
+) -> Message:
+    """
+    신규/편집/백필 공통 영속화 지점.
+
+    반드시 같은 트랜잭션 안에서:
+      - messages upsert
+      - message_versions 기록
+      - normalize job enqueue
+    """
+    async with session.begin_nested():
+        message, changed = await upsert_message_from_telegram(session, channel, tg_msg)
+
+        # 완전히 동일한 메시지 replay면 추가 작업 없음
+        if not changed:
+            return message
+
+        version = await create_message_version(session, message, tg_msg)
+        await session.flush()
+
+        await AnalysisJobService.enqueue_job(
+            session,
+            job_type=JobType.NORMALIZE,
+            target_type=JobTargetType.MESSAGE,
+            target_id=message.id,
+            idempotency_key=f"normalize:message:{message.id}:version:{version.id}:cv1",
+            payload_json={
+                "message_id": message.id,
+                "version_id": version.id,
+                "channel_id": message.channel_id,
+                "tg_message_id": message.tg_message_id,
+                "cleaning_version": "v1",
+            },
+            priority=100,
+            max_attempts=3,
+        )
+
+        return message
+```
+
+---
+
+## 이벤트 핸들러 쪽 연결 예시
+
+핵심은 **핸들러에서 직접 enqueue 하지 않고** `persist_message()`만 호출하는 것입니다.
+
+```python
+async def on_new_message(event, session_factory, channel: Channel) -> None:
+    async with session_factory() as session:
+        await persist_message(session, channel, event.message)
+        await session.commit()
+
+
+async def on_edited_message(event, session_factory, channel: Channel) -> None:
+    async with session_factory() as session:
+        await persist_message(session, channel, event.message)
+        await session.commit()
+```
+
+---
+
+## backfill 루프 쪽 연결 예시
+
+`startup_tasks.py`가 `persist_func`를 주입받는 구조라면, 이 함수만 교체하면 됩니다.
+
+```python
+# 예시
+await persist_func(session, channel, tg_msg)
+```
+
+즉, `startup_tasks.py`는 거의 건드리지 않고,
+주입되는 `persist_func`가 지금의 `persist_message()`가 되면 됩니다.
+
+---
+
+## 꼭 지켜야 하는 점
+
+`AnalysisJobService.enqueue_job()` 안에서 `commit()` 하면 안 됩니다.
+현재 backfill의 배치 커밋/세이브포인트 구조를 깨기 때문입니다.
+
+`persist_message()`는 반드시 **실시간/편집/백필 공통 지점**이어야 합니다.
+핸들러마다 따로 enqueue 하면 정책이 갈라집니다.
+
+idempotency key는 반드시 `message.id + version.id + cv1` 형태를 유지하는 게 좋습니다.
+그래야 edit 재분석과 cleaning version 재처리가 분리됩니다.
+
+---
+
+## 추천 적용 순서
+
+1. `collector_worker.py`에 위 패치 반영
+2. `run_collector.py`에서 실시간 이벤트가 `persist_message()`를 타는지 확인
+3. `startup_tasks.py`의 `persist_func`가 `persist_message()`를 쓰는지 확인
+4. `python -m pytest tests/workers/test_collector_persist.py -vv` 실행
+5. 통과 후 `test_preprocess_worker.py`, `test_inference_worker.py` 순서로 실행
+
+---
+
+## 마지막 한 줄 정리
+
+이 패치가 들어가면 전체 흐름이 이렇게 닫힙니다.
+
+**Telegram 수집 → `persist_message()` → `messages/message_versions` 저장 → `normalize` job 생성 → `PreprocessWorker` → `InferenceWorker`**
+
+이제 구조적으로는 Phase 3 진입 준비가 된 상태입니다.
+
+다음으로는 실제 프로젝트 코드와 이 초안의 **필드명/함수명 차이만 맞추는 매핑 작업**이 남습니다.

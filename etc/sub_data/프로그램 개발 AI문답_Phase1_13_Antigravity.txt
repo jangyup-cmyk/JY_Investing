@@ -1,0 +1,201 @@
+---------------------------------------------------------------------------------------------------------------------------------------------------
+[사용자 요청사항_13]
+다음으로는 **워커 분리형 기준으로 Antigravity 프롬프트를 수정본으로 다시 정리하는 단계**가 맞습니다.
+---------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Antigravity용 수정 프롬프트
+
+## 목적
+
+* **Phase 1 기반 구축**을 설계하되
+* **WEB/API 서버와 Collector Worker 분리 구조**를 반영
+* 과설계 없이 초기 현실형 구조로 설계안 받기
+
+```text
+프로젝트명: 텔레그램 테마연동 자동매매 프로그램
+
+프로젝트 목표:
+텔레그램 정보를 수집하여 AI 에이전트가 분석하고,
+5개 이상의 AI 에이전트가 상호 토론을 통해 신뢰성 있는 테마를 발굴한 뒤,
+발굴된 테마를 자동매매에 활용하는 시스템을 구축하려고 한다.
+
+현재 내가 진행하려는 범위는 전체 프로젝트가 아니라
+"Phase 1. 기반 구축"만이다.
+
+개발 환경:
+- Python 3.11.9 64bit
+- 가상환경: .venv
+- IDE: VS Code
+- 루트폴더: D:\telegram_trading
+
+중요한 시스템 전제:
+- 텔레그램 연동은 Bot API가 아니라 사용자 계정 세션 방식 예정
+- 향후 Telethon 기반 수집 예정
+- 증권사 API는 한국투자증권 API 예정
+- GUI는 WEB 버전 + APP 버전 예정
+- 백엔드는 FastAPI 중심 예정
+- DB는 PostgreSQL 중심으로 검토 중
+
+중요한 규모 전제:
+- 현재 채널 수는 약 150개 수준이며 앞으로 계속 증가 가능
+- 공시채널 1개는 하루 약 15,000건 수준
+- 나머지 다수 채널은 대체로 하루 500건 이하 수준
+- 따라서 초기부터 대규모 분산 시스템까지는 아니지만,
+  웹 서버와 텔레그램 수집 워커는 분리하는 구조가 적절하다고 판단하고 있음
+
+매우 중요:
+지금은 절대 Phase 2(텔레그램 수집 상세 구현)로 넘어가지 말고,
+오직 "Phase 1. 기반 구축"만 설계해줘.
+
+이번 Phase 1의 핵심 목표:
+1. WEB/API 서버와 Collector Worker를 분리 가능한 구조로 잡기
+2. requirements.txt
+3. .env / .env.example
+4. 설정 로더
+5. 로깅
+6. DB 연결
+7. 공통 예외 처리
+8. 최소 실행 가능한 FastAPI 앱 뼈대
+9. 최소 실행 가능한 Collector Worker 뼈대
+10. health check / ready check
+11. 이후 Phase 2 텔레그램 수집으로 자연스럽게 넘어갈 수 있는 기초 구조
+
+내가 원하는 설계 방향:
+- 설계자 관점으로 답변할 것
+- 추상론보다 실제 프로젝트에 바로 반영 가능한 수준으로 구체화할 것
+- 기능 분리, 파일 분리, 책임 분리를 명확히 할 것
+- 웹 서버와 워커가 같은 공통 모듈(settings/logger/db/exceptions)을 공유하는 구조로 설계할 것
+- 아직 이 단계에서는 텔레그램 상세 수집 로직 구현은 하지 말 것
+- 그러나 run_web.py, run_collector.py 수준의 실행 진입점은 고려할 것
+- 과도한 마이크로서비스 구조, Kafka, 큐 시스템 같은 과설계는 피할 것
+
+반드시 아래 형식으로 답변해줘.
+
+[출력 형식]
+
+1. Phase 1의 목표 요약
+- 왜 필요한지
+- 완료되면 무엇이 가능한지
+- 아직 하지 말아야 할 것은 무엇인지
+
+2. 이번 Phase 1의 구조적 핵심
+- 왜 WEB/API 서버와 Collector Worker를 분리해야 하는지
+- 현재 규모에서 왜 이 구조가 현실적인지
+- 지금 굳이 하지 않아도 되는 과설계 요소는 무엇인지
+
+3. Phase 1 범위 확정
+- 포함 범위
+- 제외 범위
+- 향후 Phase 2와의 연결 지점
+
+4. 기술 스택 권장안
+- 웹 프레임워크
+- 설정 관리 방식
+- 로깅 방식
+- DB/ORM/마이그레이션 방식
+- 테스트 도구
+- requirements.txt 초안
+- 각 패키지를 넣는 이유를 짧게 설명
+
+5. 워커 분리형 초기 폴더 구조 제안
+- D:\telegram_trading 기준
+- 트리 구조 보기 좋게 제시
+- 지금 꼭 필요한 폴더와 나중에 추가할 폴더를 구분
+- run_web.py 와 run_collector.py를 포함할 것
+
+6. 환경변수 설계
+- .env.example 초안 작성
+- 변수명, 용도, 예시값을 표 형태로 정리
+- App / DB / Log / Telegram / Collector / Broker 설정으로 구분
+- 지금 필요한 변수와 예약 변수 구분
+
+7. 설정 로더 설계
+- settings.py를 어떤 구조로 둘지
+- App / DB / Log / Telegram / Collector / Broker 설정을 어떻게 나눌지
+- 웹 서버와 워커가 같은 settings를 공유해야 하는 이유 설명
+
+8. 로깅 설계
+- 콘솔 로그 + 파일 로그
+- app.log / collector.log / error.log 같은 구조 검토
+- 모듈명, 레벨, 메시지 형식 표준
+- 웹 서버용 로거와 워커용 로거를 어떻게 나눌지
+- 추후 system_logs DB 저장과 연결하기 쉬운 구조로 설명
+
+9. DB 연결 설계
+- PostgreSQL 기준 권장안
+- SQLAlchemy + Alembic 기준
+- base.py / session.py / models.py 역할 구분
+- Phase 1에서 먼저 둘 최소 모델
+- Phase 2에서 telegram_channels, telegram_messages 등으로 어떻게 확장되는지 설명
+
+10. 공통 응답 / 공통 예외 처리 설계
+- API 성공 응답 표준 JSON
+- API 실패 응답 표준 JSON
+- AppException, DatabaseException, ExternalAPIException 등 구조 제안
+- FastAPI 예외 핸들러 설계 방향
+
+11. 최소 실행 가능한 WEB/API 서버 설계
+- app.py 역할
+- run_web.py 역할
+- /health, /ready 목적
+- startup 시 무엇을 체크할지
+
+12. 최소 실행 가능한 Collector Worker 설계
+- collector_worker.py 역할
+- startup_tasks.py 역할
+- run_collector.py 역할
+- 지금 단계에서 어떤 수준까지 구현하고 어떤 부분은 placeholder로 두는지 설명
+
+13. 추천 개발 순서
+- Step 1, Step 2, Step 3 형태
+- 각 단계 산출물까지 같이 제시
+
+14. 완료 기준(체크리스트)
+- 웹 서버 기준 완료 조건
+- 워커 기준 완료 조건
+- 공통 모듈 기준 완료 조건
+- 체크박스 형태
+
+15. 리스크 및 의사결정 포인트
+- Windows + .venv + VS Code 환경
+- PostgreSQL
+- Telethon 예정 구조
+- 웹/워커 분리 구조에서 미리 주의할 점
+- 지금 확정할 것과 나중으로 미룰 것을 구분
+
+16. 파일별 초안 코드 뼈대
+아래 파일들에 대해 실제 생성 가능한 최소 골격 코드를 제시해줘.
+지나치게 긴 완성형은 말고, 구조가 واضح한 실무형 초안으로 작성해줘.
+
+대상 파일:
+- requirements.txt
+- .env.example
+- config/settings.py
+- src/common/logger.py
+- src/common/exceptions.py
+- src/common/responses.py
+- src/infra/db/base.py
+- src/infra/db/session.py
+- src/infra/db/models.py
+- src/web/app.py
+- src/web/routes/health.py
+- src/workers/collector_worker.py
+- src/workers/startup_tasks.py
+- run_web.py
+- run_collector.py
+
+17. 최종 정리
+- 이 설계대로 가면 Phase 2에서 어떤 점이 쉬워지는지
+- 다음 단계에서 어떤 파일부터 구현하면 되는지 우선순위 정리
+- 마지막에 "권장 기본안"을 다시 짧게 요약
+
+응답 조건:
+- 한국어로 작성
+- 표, 트리 구조, 코드블록 적극 활용
+- 설명은 실무적으로 구체적으로 작성
+- 이 프로젝트에 바로 적용 가능한 수준으로 작성
+- 추상적인 일반론은 줄이고 결정 중심으로 작성
+- 설계와 코드 뼈대를 구분해서 보여줘
+```
+
+---

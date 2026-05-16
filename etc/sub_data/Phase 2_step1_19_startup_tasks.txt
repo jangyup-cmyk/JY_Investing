@@ -1,0 +1,652 @@
+`startup_tasks.py`는 **STEP 2 진입용 껍데기로는 괜찮지만, 지금 상태로는 바로 백필 엔진 본체를 얹기엔 몇 군데 정리해야 할 부분이 있습니다.** 특히 `restore_last_selected_channels()`는 현재 구조와 잘 맞는데, `find_channels_pending_backfill()`의 join 키와 상태 판단 기준은 꼭 다시 확인하는 게 좋습니다. 
+
+가장 먼저 보이는 건 이겁니다.
+
+**1) 중복 import 정리 필요**
+파일 상단에 `select`, `logger`, `get_session`, `TelegramChannel` import가 두 번 반복돼 있습니다. 기능 문제는 아니지만 정리하는 게 좋습니다. 
+
+**2) `restore_last_selected_channels()`는 현재 구조와 잘 맞습니다**
+워커 시작 시 `TelegramChannel.is_collecting == True` 기준으로 복원 대상을 찾는 흐름은 자연스럽습니다. 다만 중기적으로는 이 boolean보다 상태 테이블의 `PENDING_BACKFILL / ACTIVE / PAUSED / ERROR`가 더 중심이 되어야 하므로, 나중에는 “복원 대상 로그 출력”과 “실제 수집 가능 상태 판정”을 분리하는 편이 좋습니다. 
+
+**3) `backfill_missed_messages()`의 방향은 좋습니다**
+문서화도 잘 되어 있습니다. “최근 3일 또는 최근 1,000건” 원칙이 함수 docstring에 박혀 있는 건 아주 좋습니다. STEP 2에서 실제 Telethon history 조회만 붙이면 되는 구조로 되어 있습니다. 
+
+**4) 가장 중요한 확인 포인트: `find_channels_pending_backfill()`의 join 키**
+여기서는
+
+* `TelegramChannel.id == TelegramChannelCollectionState.telegram_channel_id`
+
+로 join하고 있습니다. 그런데 이전에 공유된 repository 완성본에서는 `TelegramChannelCollectionState`를 **`channel_id` 기준**으로 다루고 있었습니다. 이 둘이 실제 모델에서 어느 쪽인지 반드시 통일돼야 합니다. 이 부분이 어긋나면 백필 대기 채널 조회가 조용히 틀어질 수 있습니다. 
+
+즉 반드시 확인할 것:
+
+* 상태 테이블 FK가 `telegram_channel_id`인지
+* 아니면 `channel_id`인지
+
+그리고 그 기준을
+
+* `repository.py`
+* `startup_tasks.py`
+* `test_collector_worker.py`
+  에서 모두 같게 맞춰야 합니다.
+
+**5) `find_channels_pending_backfill()`는 현재 설계 의도와 꽤 잘 맞습니다**
+`is_collecting == True`이고 상태가 `PENDING_BACKFILL`인 채널만 잡는 건 합리적입니다. 다만 한 단계 더 정교하게 하려면, 나중에는 `is_collecting`보다 상태 테이블만 믿고 가는 방향도 고려할 만합니다. 지금은 유지해도 괜찮습니다. 
+
+**6) `run_startup_tasks()`에서 `sync_channels_on_startup()`이 실제 호출되지 않습니다**
+지금 의도적으로 수동 API 호출만 쓰겠다면 괜찮지만, 함수가 있는데 전혀 호출되지 않으니 혼동을 줄 수 있습니다. 둘 중 하나가 좋습니다.
+
+* 정말 수동 sync만 쓸 거면 함수 주석에 그 정책을 더 강하게 명시
+* 아니면 `run_startup_tasks()`에서 선택적으로 호출
+
+현재는 약간 어중간합니다. 
+
+**7) 미구현 함수 3개는 STEP 2에서 가장 먼저 채워야 합니다**
+
+* `run_startup_recovery()`
+* `mark_backfill_completed()`
+* `mark_backfill_failed()` 
+
+특히 이 셋은 상태 전이 핵심입니다.
+
+권장 상태 전이:
+
+* `PENDING_BACKFILL` → 성공 시 `ACTIVE`
+* `PENDING_BACKFILL` → 실패 시 `ERROR`
+* 실패 시 `last_error_message`, `last_error_at` 갱신
+* 성공 시 `last_backfill_at` 갱신
+
+이 부분은 repository에 이미 `set_channel_collection_status()` 비슷한 함수가 있다면 그걸 재사용하는 편이 좋습니다.
+
+## 제 판단
+
+이 파일은 **STEP 2 시작점으로 충분히 괜찮습니다.**
+다만 바로 손볼 우선순위는 아래입니다.
+
+1. import 중복 제거
+2. `find_channels_pending_backfill()`의 join 키를 repository/모델과 통일
+3. `mark_backfill_completed()` / `mark_backfill_failed()` 구현
+4. `backfill_missed_messages()`에서 실제 백필 worker 호출 연결
+
+가장 중요한 건 **join 키 통일**입니다.
+이게 맞지 않으면 백필 대상 조회가 전부 흔들릴 수 있습니다.
+
+다음으로 보면 가장 자연스러운 건, 이 파일 기준으로 **`mark_backfill_completed()`와 `mark_backfill_failed()` 구현 초안**을 바로 잡아주는 것입니다.
+
+좋습니다. 바로 붙여 넣을 수 있게 `startup_tasks.py` 기준 구현 초안을 정리하겠습니다.
+
+핵심은 4개입니다.
+
+* `find_channels_pending_backfill()`의 **join 키 통일**
+* `run_startup_recovery()`에서 **대기 채널 순회**
+* `mark_backfill_completed()`에서 **ACTIVE 전이 + 시각 갱신**
+* `mark_backfill_failed()`에서 **ERROR 전이 + 에러 기록**
+
+아래 코드는 **상태 테이블이 `telegram_channel_id` 컬럼을 가진 현재 파일 기준**으로 맞췄습니다.
+만약 실제 모델이 `channel_id`라면, 아래 코드의 `telegram_channel_id`만 `channel_id`로 바꾸면 됩니다.
+
+---
+
+## 교체용 코드
+
+```python
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.db.session import get_session
+from src.infra.db.models import TelegramChannel, TelegramChannelCollectionState
+from src.infra.telegram.schemas import ChannelCollectionStatus
+
+
+async def run_startup_tasks() -> None:
+    """워커 시작 시 필요한 모든 자동화 작업을 순차적으로 실행합니다."""
+    logger.info("Startup 자동화 작업 시작...")
+
+    active_count = await restore_last_selected_channels()
+    logger.info(f"수집 활성화된 채널 수: {active_count}")
+
+    await run_startup_recovery()
+    await backfill_missed_messages()
+
+    logger.info("Startup 자동화 작업 완료")
+
+
+async def sync_channels_on_startup() -> None:
+    """설정에 따라 텔레그램 채널 목록을 자동으로 업데이트합니다."""
+    logger.info("자동 채널 업데이트 스킵 (UI에서 수동 실행 필요)")
+
+
+async def restore_last_selected_channels() -> int:
+    """마지막으로 선택된 채널들의 개수를 반환합니다."""
+    async with get_session() as db:
+        stmt = select(TelegramChannel).where(TelegramChannel.is_collecting.is_(True))
+        result = await db.execute(stmt)
+        channels = result.scalars().all()
+
+        for c in channels:
+            logger.info(f"수집 복원 대상 채널: [{c.title}] ({c.tg_channel_id})")
+
+        return len(channels)
+
+
+async def backfill_missed_messages() -> None:
+    """
+    [백필(Backfill) 핵심 원칙]
+    - 대상: '수집 활성화' 상태이지만 아직 수집 이력이 없거나, 워커 중단으로 누락이 발생한 채널
+    - 범위: 최근 3일 또는 최근 1,000건
+    - 동작: 백필 완료 후 ACTIVE 전이
+    """
+    logger.info("PENDING_BACKFILL 상태의 채널 스캔 시작...")
+
+    async with get_session() as db:
+        pending_channels = await find_channels_pending_backfill(db)
+
+        if not pending_channels:
+            logger.info("현재 백필이 필요한 채널이 없습니다.")
+            return
+
+        logger.info(f"총 {len(pending_channels)}개의 채널이 백필 대기 중입니다.")
+
+        for channel, state in pending_channels:
+            logger.info(f"백필 대상 채널: [{channel.title}] ({channel.tg_channel_id})")
+
+            try:
+                # TODO:
+                # 여기서 실제 Telethon history 조회 + persist_message_payload() 루프를 연결
+                # 예:
+                # await perform_backfill_for_channel(channel, state)
+
+                await mark_backfill_completed(db, channel.id)
+                await db.commit()
+
+                logger.info(f"백필 완료 처리: [{channel.title}] ({channel.tg_channel_id})")
+
+            except Exception as e:
+                await db.rollback()
+
+                # rollback 이후 새 트랜잭션에서 실패 상태 저장
+                await mark_backfill_failed(db, channel.id, str(e))
+                await db.commit()
+
+                logger.error(
+                    f"백필 실패 처리: [{channel.title}] ({channel.tg_channel_id}) error={e}"
+                )
+
+
+async def find_channels_pending_backfill(db) -> list:
+    """PENDING_BACKFILL 상태인 채널(channel, state 튜플 형태) 목록을 조회합니다."""
+    stmt = (
+        select(TelegramChannel, TelegramChannelCollectionState)
+        .join(
+            TelegramChannelCollectionState,
+            TelegramChannel.id == TelegramChannelCollectionState.telegram_channel_id,
+        )
+        .where(
+            TelegramChannel.is_collecting.is_(True),
+            TelegramChannelCollectionState.status
+            == ChannelCollectionStatus.PENDING_BACKFILL.value,
+        )
+    )
+    result = await db.execute(stmt)
+    return result.all()
+
+
+async def run_startup_recovery() -> None:
+    """
+    워커 시작 시 복구 절차를 수행합니다.
+
+    현재 단계에서는 PENDING_BACKFILL 대상 채널 수를 먼저 확인하고,
+    이후 백필 단계에서 실제 보강을 수행하도록 진입점 역할만 담당합니다.
+    """
+    async with get_session() as db:
+        pending_channels = await find_channels_pending_backfill(db)
+
+        if pending_channels:
+            logger.info(
+                f"스타트업 복구: 백필 대기 채널 {len(pending_channels)}개 확인"
+            )
+        else:
+            logger.info("스타트업 복구: 백필 대기 채널 없음")
+
+
+async def mark_backfill_completed(db, channel_id: int) -> None:
+    """백필이 완료된 채널 상태를 ACTIVE로 전환합니다."""
+    stmt = select(TelegramChannelCollectionState).where(
+        TelegramChannelCollectionState.telegram_channel_id == channel_id
+    )
+    result = await db.execute(stmt)
+    state = result.scalar_one_or_none()
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            telegram_channel_id=channel_id,
+            status=ChannelCollectionStatus.ACTIVE.value,
+            last_backfill_at=datetime.now(timezone.utc),
+            last_error_message=None,
+            last_error_at=None,
+        )
+        db.add(state)
+    else:
+        state.status = ChannelCollectionStatus.ACTIVE.value
+        state.last_backfill_at = datetime.now(timezone.utc)
+        state.last_error_message = None
+        state.last_error_at = None
+
+
+async def mark_backfill_failed(db, channel_id: int, error_message: str) -> None:
+    """백필 실패 시 상태를 ERROR로 전환하고 에러 메시지를 기록합니다."""
+    stmt = select(TelegramChannelCollectionState).where(
+        TelegramChannelCollectionState.telegram_channel_id == channel_id
+    )
+    result = await db.execute(stmt)
+    state = result.scalar_one_or_none()
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            telegram_channel_id=channel_id,
+            status=ChannelCollectionStatus.ERROR.value,
+            last_error_message=error_message,
+            last_error_at=datetime.now(timezone.utc),
+        )
+        db.add(state)
+    else:
+        state.status = ChannelCollectionStatus.ERROR.value
+        state.last_error_message = error_message
+        state.last_error_at = datetime.now(timezone.utc)
+```
+
+---
+
+## 바로 같이 손보면 좋은 점 3개
+
+### 1) import 중복 제거
+
+지금 파일 상단 중복 import는 정리하는 게 좋습니다.
+
+```python
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.db.session import get_session
+from src.infra.db.models import TelegramChannel, TelegramChannelCollectionState
+from src.infra.telegram.schemas import ChannelCollectionStatus
+```
+
+### 2) `== True` 대신 `.is_(True)`
+
+지금도 동작은 하지만 SQLAlchemy에서는 이쪽이 더 깔끔합니다.
+
+```python
+TelegramChannel.is_collecting.is_(True)
+```
+
+### 3) join 키 반드시 확인
+
+이건 정말 중요합니다.
+
+현재 초안은 아래 기준입니다.
+
+```python
+TelegramChannel.id == TelegramChannelCollectionState.telegram_channel_id
+```
+
+그런데 실제 모델이 `channel_id`라면 아래로 바꿔야 합니다.
+
+```python
+TelegramChannel.id == TelegramChannelCollectionState.channel_id
+```
+
+그리고 아래 조회도 같이 바꿔야 합니다.
+
+```python
+TelegramChannelCollectionState.channel_id == channel_id
+```
+
+---
+
+## 다음으로 바로 이어질 작업
+
+이제 가장 자연스러운 다음 단계는 `backfill_missed_messages()` 안의 TODO 자리에 들어갈
+
+**`perform_backfill_for_channel(channel, state)` 초안**
+
+을 잡는 것입니다.
+여기서 Telethon history 조회 → translator → `persist_message_payload()`까지 연결하면 STEP 2 본체가 시작됩니다.
+
+이제는 backfill_missed_messages()의 TODO를 실제로 채우는 단계입니다. 현재 구조상 가장 중요한 건 “히스토리 조회 → payload 변환 → 공통 persistence 래퍼”를 한 경로로 묶는 것입니다.
+
+
+다음 작업은 **`perform_backfill_for_channel()` 본체를 넣고, `startup_tasks.py`가 `TelegramCollector`와 `persist_message_from_history()`를 주입받도록 바꾸는 것**입니다. 지금 `startup_tasks.py`에는 실제 백필 호출이 TODO로 비어 있고, `collector_worker.py`에는 이미 `persist_message_from_history()`가 준비되어 있으니, 둘을 연결하면 됩니다.
+
+가장 중요한 구조 변화는 하나입니다.
+
+* 지금: `run_startup_tasks()`가 아무 인자 없이 호출됨
+* 변경: `run_startup_tasks(collector, persist_func)` 형태로 호출
+
+지금 `CollectorWorker.start()`는 이미 `self._collector`를 만든 뒤 `run_startup_tasks()`를 호출하므로, 이 지점에서 collector를 넘기는 방식이 가장 자연스럽습니다. 
+
+---
+
+## 1) `collector_worker.py` 수정안
+
+`start()` 안의 이 부분을 바꾸면 됩니다.
+
+```python
+# 기존
+await run_startup_tasks()
+```
+
+아래로 교체:
+
+```python id="i41eu8"
+await run_startup_tasks(
+    collector=self._collector,
+    persist_func=persist_message_from_history,
+)
+```
+
+이렇게 하면 startup task가 Telethon history 조회와 공통 persistence 래퍼를 직접 사용할 수 있습니다. `persist_message_from_history()`는 이미 `telethon_to_payload()` → `persist_message_payload()` 경로를 타도록 준비돼 있습니다.
+
+---
+
+## 2) `startup_tasks.py` 전체 수정 초안
+
+아래는 바로 붙여 넣을 수 있는 형태입니다.
+전제는 현재 파일 기준처럼 상태 테이블 FK가 `telegram_channel_id`라는 점입니다. 만약 실제 모델이 `channel_id`라면 그 부분만 바꾸면 됩니다. `startup_tasks.py`와 현재 route 테스트 모두 `telegram_channel_id`를 쓰고 있습니다.
+
+```python id="9odyr8"
+from datetime import datetime, timezone, timedelta
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.db.session import get_session
+from src.infra.db.models import TelegramChannel, TelegramChannelCollectionState
+from src.infra.telegram.schemas import ChannelCollectionStatus
+
+
+BACKFILL_DAYS = 3
+BACKFILL_LIMIT = 1000
+
+
+async def run_startup_tasks(collector, persist_func) -> None:
+    """워커 시작 시 필요한 자동화 작업을 순차적으로 수행합니다."""
+    logger.info("Startup 자동화 작업 시작...")
+
+    active_count = await restore_last_selected_channels()
+    logger.info(f"수집 활성화된 채널 수: {active_count}")
+
+    await run_startup_recovery()
+    await backfill_missed_messages(
+        collector=collector,
+        persist_func=persist_func,
+    )
+
+    logger.info("Startup 자동화 작업 완료")
+
+
+async def sync_channels_on_startup() -> None:
+    """설정에 따라 텔레그램 채널 목록을 자동으로 업데이트합니다."""
+    logger.info("자동 채널 업데이트 스킵 (UI에서 수동 실행 필요)")
+
+
+async def restore_last_selected_channels() -> int:
+    """마지막으로 선택된 채널들의 개수를 반환합니다."""
+    async with get_session() as db:
+        stmt = select(TelegramChannel).where(TelegramChannel.is_collecting.is_(True))
+        result = await db.execute(stmt)
+        channels = result.scalars().all()
+
+        for c in channels:
+            logger.info(f"수집 복원 대상 채널: [{c.title}] ({c.tg_channel_id})")
+
+        return len(channels)
+
+
+async def backfill_missed_messages(collector, persist_func) -> None:
+    """
+    [백필(Backfill) 핵심 원칙]
+    - 대상: '수집 활성화' 상태이지만 아직 수집 이력이 없거나, 워커 중단으로 누락이 발생한 채널
+    - 범위: 최근 3일 또는 최근 1,000건
+    - 동작: 백필 완료 후 ACTIVE 전이
+    """
+    logger.info("PENDING_BACKFILL 상태의 채널 스캔 시작...")
+
+    async with get_session() as db:
+        pending_channels = await find_channels_pending_backfill(db)
+
+        if not pending_channels:
+            logger.info("현재 백필이 필요한 채널이 없습니다.")
+            return
+
+        logger.info(f"총 {len(pending_channels)}개의 채널이 백필 대기 중입니다.")
+
+        for channel, state in pending_channels:
+            logger.info(f"백필 대상 채널: [{channel.title}] ({channel.tg_channel_id})")
+
+            try:
+                processed_count = await perform_backfill_for_channel(
+                    db=db,
+                    collector=collector,
+                    channel=channel,
+                    persist_func=persist_func,
+                    days=BACKFILL_DAYS,
+                    limit=BACKFILL_LIMIT,
+                )
+
+                await mark_backfill_completed(db, channel.id)
+                await db.commit()
+
+                logger.info(
+                    f"백필 완료 처리: [{channel.title}] ({channel.tg_channel_id}) "
+                    f"messages={processed_count}"
+                )
+
+            except Exception as e:
+                await db.rollback()
+
+                await mark_backfill_failed(db, channel.id, str(e))
+                await db.commit()
+
+                logger.error(
+                    f"백필 실패 처리: [{channel.title}] ({channel.tg_channel_id}) error={e}"
+                )
+
+
+async def perform_backfill_for_channel(
+    db,
+    collector,
+    channel,
+    persist_func,
+    *,
+    days: int = 3,
+    limit: int = 1000,
+) -> int:
+    """
+    단일 채널에 대해 최근 N일 또는 최대 N건까지 히스토리를 읽어 공통 persistence 경로로 적재합니다.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    processed_count = 0
+
+    # 전제:
+    # collector.iter_channel_messages(entity, limit=..., days=...) 또는
+    # collector.iter_channel_messages(entity, limit=...) 형태의 인터페이스를 제공한다고 가정
+    async for history_message in collector.iter_channel_messages(
+        channel.tg_channel_id,
+        limit=limit,
+        days=days,
+    ):
+        msg_date = getattr(history_message, "date", None)
+        if msg_date is not None:
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            else:
+                msg_date = msg_date.astimezone(timezone.utc)
+
+            if msg_date < cutoff:
+                break
+
+        result = await persist_func(db, history_message, channel.id)
+        processed_count += 1
+
+        if processed_count % 100 == 0:
+            logger.info(
+                f"백필 진행중: [{channel.title}] count={processed_count}"
+            )
+
+    return processed_count
+
+
+async def find_channels_pending_backfill(db) -> list:
+    """PENDING_BACKFILL 상태인 채널(channel, state 튜플 형태) 목록을 조회합니다."""
+    stmt = (
+        select(TelegramChannel, TelegramChannelCollectionState)
+        .join(
+            TelegramChannelCollectionState,
+            TelegramChannel.id == TelegramChannelCollectionState.telegram_channel_id,
+        )
+        .where(
+            TelegramChannel.is_collecting.is_(True),
+            TelegramChannelCollectionState.status
+            == ChannelCollectionStatus.PENDING_BACKFILL.value,
+        )
+    )
+    result = await db.execute(stmt)
+    return result.all()
+
+
+async def run_startup_recovery() -> None:
+    """스타트업 복구 절차를 수행합니다."""
+    async with get_session() as db:
+        pending_channels = await find_channels_pending_backfill(db)
+
+        if pending_channels:
+            logger.info(
+                f"스타트업 복구: 백필 대기 채널 {len(pending_channels)}개 확인"
+            )
+        else:
+            logger.info("스타트업 복구: 백필 대기 채널 없음")
+
+
+async def mark_backfill_completed(db, channel_id: int) -> None:
+    """백필이 완료된 채널 상태를 ACTIVE로 전환합니다."""
+    stmt = select(TelegramChannelCollectionState).where(
+        TelegramChannelCollectionState.telegram_channel_id == channel_id
+    )
+    result = await db.execute(stmt)
+    state = result.scalar_one_or_none()
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            telegram_channel_id=channel_id,
+            status=ChannelCollectionStatus.ACTIVE.value,
+            last_backfill_at=datetime.now(timezone.utc),
+            last_error_message=None,
+            last_error_at=None,
+        )
+        db.add(state)
+    else:
+        state.status = ChannelCollectionStatus.ACTIVE.value
+        state.last_backfill_at = datetime.now(timezone.utc)
+        state.last_error_message = None
+        state.last_error_at = None
+
+
+async def mark_backfill_failed(db, channel_id: int, error_message: str) -> None:
+    """백필 실패 시 상태를 ERROR로 전환하고 에러를 기록합니다."""
+    stmt = select(TelegramChannelCollectionState).where(
+        TelegramChannelCollectionState.telegram_channel_id == channel_id
+    )
+    result = await db.execute(stmt)
+    state = result.scalar_one_or_none()
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            telegram_channel_id=channel_id,
+            status=ChannelCollectionStatus.ERROR.value,
+            last_error_message=error_message,
+            last_error_at=datetime.now(timezone.utc),
+        )
+        db.add(state)
+    else:
+        state.status = ChannelCollectionStatus.ERROR.value
+        state.last_error_message = error_message
+        state.last_error_at = datetime.now(timezone.utc)
+```
+
+---
+
+## 3) `client.py`에 추가할 최소 인터페이스
+
+지금 `startup_tasks.py`의 TODO를 실제로 채우려면 collector 쪽에 최소 이 메서드가 필요합니다.
+
+```python id="ghv4r9"
+async def iter_channel_messages(self, entity, limit: int = 1000, days: int = 3):
+    ...
+```
+
+현재 README상 `src/infra/telegram/client.py`가 Telethon 래퍼 역할이고, 실제 worker도 `TelegramCollector`를 통해 연결/이벤트 등록을 수행하고 있으므로 이 메서드를 client 쪽에 넣는 게 가장 자연스럽습니다.
+
+Telethon 기반으로는 보통 이런 형태가 됩니다.
+
+```python id="vj9fuq"
+async def iter_channel_messages(self, entity, limit: int = 1000, days: int = 3):
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    async for message in self.iter_messages(entity, limit=limit):
+        msg_date = getattr(message, "date", None)
+        if msg_date is not None:
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            else:
+                msg_date = msg_date.astimezone(timezone.utc)
+
+            if msg_date < cutoff:
+                break
+
+        yield message
+```
+
+---
+
+## 4) 지금 단계에서 바로 체크할 포인트
+
+가장 먼저 확인할 건 이것입니다.
+
+### A. join 키 통일
+
+현재 `startup_tasks.py`와 route 테스트는 둘 다 `TelegramChannelCollectionState.telegram_channel_id`를 쓰고 있습니다.
+반면 이전에 제가 제안했던 repository 완성본은 `channel_id` 기준이어서, 이 부분은 반드시 한쪽으로 통일해야 합니다. 지금 코드 흐름을 보면 **당장은 `telegram_channel_id` 기준으로 유지하는 쪽이 더 마찰이 적습니다.**
+
+### B. `persist_message_from_history()`는 현재 `is_backfill=False`
+
+현재 `collector_worker.py`의 `persist_message_payload()`는 checkpoint 갱신 시 `is_backfill=False`를 고정하고 있습니다. 
+그래서 다음 수정으로는 아래 둘 중 하나가 필요합니다.
+
+* `persist_message_payload(db, payload, *, is_backfill=False)`
+* `persist_message_from_history()`에서 `is_backfill=True` 전달
+
+이건 백필 완료 시 `last_backfill_at`와 상태 전이를 더 정확히 다루려면 꼭 바꾸는 게 좋습니다.
+
+---
+
+## 5) 바로 이어서 할 다음 작업 순서
+
+1. `collector_worker.start()`에서 `run_startup_tasks(collector, persist_func)`로 변경
+2. `startup_tasks.py`를 위 코드로 교체
+3. `client.py`에 `iter_channel_messages()` 추가
+4. `persist_message_payload(..., is_backfill=True/False)` 분기 추가
+5. 마지막으로 `tests/test_startup_tasks.py`에서
+
+   * `find_channels_pending_backfill()`
+   * `mark_backfill_completed()`
+   * `mark_backfill_failed()`
+     세 개를 잠그는 테스트 추가
+
+

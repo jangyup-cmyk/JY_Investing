@@ -1,0 +1,510 @@
+ **현재 구조를 유지하는 전제**로, 바로 구현에 들어갈 수 있는 **STEP 1 파일별 구현 초안**
+
+README 기준 현재 프로젝트는 이미 `src/infra`, `src/web`, `src/workers` 중심 구조를 갖고 있고, API도 `/api/telegram/channels`, `/sync`, `/toggle`가 정의되어 있으며, Phase 2 확장 중심도 `src/workers`와 `src/infra/telegram`으로 잡혀 있습니다. 그래서 이번 초안은 **폴더 대공사 없이 현재 구조에 필요한 파일만 추가/보강**하는 방식이 가장 자연스럽습니다. 
+
+---
+
+# STEP 1 파일별 구현 초안
+
+## 0. 이번 단계의 목표
+
+이번 STEP 1의 산출물은 아래 3개입니다.
+
+* **표준 데이터 계약**
+* **공통 메시지 저장 경로**
+* **채널 상태 변경 API**
+
+즉, 아직 실시간 리스너 전체를 완성하는 단계가 아니라,
+**백필과 실시간 수집이 공통으로 사용할 저장 뼈대**를 먼저 만드는 단계입니다. README상 Phase 2 목표가 “실시간 이벤트 리스너, 채널 동기화, 메시지 DB 적재”인 만큼, 지금 단계는 그중 **동기화와 적재 규약**을 먼저 닫는 작업으로 보면 됩니다. 
+
+---
+
+## 1. `src/infra/db/schemas.py`  **[신규 추가]**
+
+### 역할
+
+DB 모델과는 별개로, **저장/응답/상태 전이용 타입 계약**을 모아두는 파일입니다.
+
+### 여기 넣을 것
+
+* `ChannelSyncStatus`
+* `ChannelCollectionStatus`
+* `UpsertAction`
+* `TelegramMessagePayload`
+* `UpsertMessageResult`
+* `ToggleChannelRequest`
+* `ToggleChannelResponse`
+* `SyncChannelsResponse`
+
+### 추천 예시
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+
+class ChannelSyncStatus(str, Enum):
+    DISCOVERED = "DISCOVERED"
+    SYNCED = "SYNCED"
+    MISSING = "MISSING"
+    INACCESSIBLE = "INACCESSIBLE"
+
+
+class ChannelCollectionStatus(str, Enum):
+    PENDING_BACKFILL = "PENDING_BACKFILL"
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    ERROR = "ERROR"
+
+
+class UpsertAction(str, Enum):
+    CREATED = "created"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    FAILED = "failed"
+
+
+@dataclass
+class TelegramMessagePayload:
+    telegram_channel_id: int
+    tg_message_id: int
+    sender_id: Optional[int]
+    message_text_raw: Optional[str]
+    reply_to_message_id: Optional[int]
+    views: Optional[int]
+    forwards: Optional[int]
+    grouped_id: Optional[int]
+    edited_at: Optional[datetime]
+    is_deleted: bool
+    message_date: datetime
+    collected_at: datetime
+    raw_payload_json: str
+
+
+@dataclass
+class UpsertMessageResult:
+    action: UpsertAction
+    telegram_channel_id: int
+    tg_message_id: int
+    checkpoint_candidate: Optional[int]
+    error_message: Optional[str] = None
+```
+
+### 포인트
+
+이 파일의 목적은 “비즈니스 로직”이 아니라 **타입 표준화**입니다.
+지금 단계에서는 여기에 Enum과 Result 타입을 모아두는 것이 가장 실용적입니다.
+
+---
+
+## 2. `src/infra/db/repository.py`  **[신규 추가]**
+
+### 역할
+
+실제 SQLAlchemy를 사용하는 **영속화 로직 전담 파일**입니다.
+즉, `upsert_message()`와 체크포인트 갱신을 여기로 모읍니다.
+
+### 핵심 함수
+
+* `get_or_create_channel_state(...)`
+* `upsert_message(db, payload)`
+* `update_channel_checkpoint(db, telegram_channel_id, candidate_message_id, collected_at)`
+* `mark_channel_sync_status(...)`
+* `set_channel_collection_status(...)`
+* `list_channels_with_state(...)`
+
+### 최소 구현 함수 초안
+
+```python
+async def upsert_message(db: AsyncSession, payload: TelegramMessagePayload) -> UpsertMessageResult:
+    ...
+
+async def update_channel_checkpoint(
+    db: AsyncSession,
+    telegram_channel_id: int,
+    candidate_message_id: int,
+    collected_at: datetime,
+) -> None:
+    ...
+
+async def set_channel_collection_status(
+    db: AsyncSession,
+    channel_id: int,
+    new_status: ChannelCollectionStatus,
+    last_error_message: str | None = None,
+) -> None:
+    ...
+```
+
+### 핵심 규칙
+
+`upsert_message()` 안에서 반드시 고정할 규칙은 아래입니다.
+
+* 유니크 기준: `(telegram_channel_id, tg_message_id)`
+* 신규면 `CREATED`
+* 기존 메시지에 변경이 있으면 `UPDATED`
+* 완전히 동일하면 `UNCHANGED`
+* 예외면 rollback 후 `FAILED`
+* 체크포인트는 이 함수 안에서 직접 올리지 말고, **호출부에서 성공 결과일 때만** `update_channel_checkpoint()`를 따로 호출
+
+### 왜 분리하나
+
+이렇게 해두면
+
+* 백필 루프
+* 실시간 이벤트 핸들러
+  둘 다 같은 저장 함수를 쓸 수 있습니다.
+
+이게 STEP 1의 핵심입니다.
+
+---
+
+## 3. `src/infra/telegram/translators.py`  **[신규 추가]**
+
+### 역할
+
+Telethon 객체를 내부 표준 payload로 바꾸는 **번역기**입니다.
+
+### 핵심 함수
+
+* `serialize_telethon_message(message) -> str`
+* `message_to_payload(message, telegram_channel_id) -> TelegramMessagePayload`
+* 필요 시 `edited_event_to_payload(...)`
+
+### 구현 초안
+
+```python
+from datetime import datetime, timezone
+
+def message_to_payload(message, telegram_channel_id: int) -> TelegramMessagePayload:
+    return TelegramMessagePayload(
+        telegram_channel_id=telegram_channel_id,
+        tg_message_id=message.id,
+        sender_id=getattr(message, "sender_id", None),
+        message_text_raw=getattr(message, "message", None),
+        reply_to_message_id=getattr(getattr(message, "reply_to", None), "reply_to_msg_id", None),
+        views=getattr(message, "views", None),
+        forwards=getattr(message, "forwards", None),
+        grouped_id=getattr(message, "grouped_id", None),
+        edited_at=getattr(message, "edit_date", None),
+        is_deleted=False,
+        message_date=message.date,
+        collected_at=datetime.now(timezone.utc),
+        raw_payload_json=serialize_telethon_message(message),
+    )
+```
+
+### 포인트
+
+이 파일은 Telethon 종속이므로 `infra/telegram` 아래에 두는 것이 맞습니다.
+외부 SDK를 직접 DB 저장 함수가 알지 않도록 중간 완충 역할을 합니다.
+
+---
+
+## 4. `src/infra/telegram/client.py`  **[기존 보강]**
+
+README상 이 파일은 Telethon 래퍼 역할입니다. 여기서 채널 조회와 이벤트 바인딩에 필요한 최소 인터페이스를 정리하면 됩니다. 
+
+### 추가할 메서드
+
+* `connect()`
+* `disconnect()`
+* `is_authorized()`
+* `get_joined_channels()`
+* `iter_channel_messages(channel, limit=1000, days=3)`
+* `register_new_message_handler(handler)`
+* `register_edited_message_handler(handler)`
+
+### 구현 방향
+
+이 파일에서는 SQLAlchemy를 몰라야 합니다.
+오직 Telethon 연결/조회/이벤트 등록만 담당하게 두는 게 좋습니다.
+
+### 예시 인터페이스
+
+```python
+class TelegramClient:
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def get_joined_channels(self) -> list: ...
+    async def iter_channel_messages(self, entity, limit: int = 1000): ...
+    def register_new_message_handler(self, handler): ...
+    def register_edited_message_handler(self, handler): ...
+```
+
+---
+
+## 5. `src/web/routes/telegram.py`  **[기존 보강]**
+
+README에 이미 `/channels`, `/channels/sync`, `/channels/{id}/toggle`가 정의되어 있으므로, STEP 1에서는 이 파일을 **얇은 라우터**로 정리하면 됩니다. 
+
+### 이 파일의 책임
+
+* 요청 body 검증
+* DB 세션 주입
+* repository 호출
+* 공통 응답 포맷 반환
+
+### 여기 넣을 엔드포인트
+
+#### `GET /api/telegram/channels`
+
+* 채널 + 상태 조회
+* 수집 상태, 마지막 체크포인트, 마지막 에러 반환
+
+#### `POST /api/telegram/channels/sync`
+
+* Telethon에서 현재 참여 채널 조회
+* DB 채널/상태 동기화
+* 신규/갱신/missing 건수 반환
+
+#### `POST /api/telegram/channels/{id}/toggle`
+
+* `enabled=true`면 `PENDING_BACKFILL`
+* `enabled=false`면 `PAUSED`
+
+### 구현 초안
+
+```python
+@router.post("/channels/{channel_id}/toggle")
+async def toggle_channel(
+    channel_id: int,
+    payload: ToggleChannelRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    ...
+```
+
+### 라우터에서 하지 말 것
+
+* 긴 SQL 직접 작성
+* Telethon 이벤트 수집 실행
+* 백필 루프 실행
+
+이 파일은 어디까지나 **입구** 역할만 해야 합니다.
+
+---
+
+## 6. `src/workers/startup_tasks.py`  **[기존 보강]**
+
+README상 이 파일은 워커 기동 시 초기화 태스크용입니다. STEP 1에서는 여기까지 다 구현할 필요는 없지만, STEP 2를 위해 함수 껍데기는 지금 만들어두는 편이 좋습니다. 
+
+### 이번 단계에서 넣을 것
+
+* `load_collectable_channels(db)`
+* `find_pending_backfill_channels(db)`
+* `mark_backfill_started(...)`
+* `mark_backfill_finished(...)`
+
+### 아직 미완성이어도 되는 것
+
+* 실제 백필 루프 전체
+* 복잡한 재시도 정책
+
+### 함수 시그니처 초안
+
+```python
+async def find_pending_backfill_channels(db: AsyncSession) -> list:
+    ...
+
+async def mark_backfill_finished(
+    db: AsyncSession,
+    channel_id: int,
+    success: bool,
+    error_message: str | None = None,
+) -> None:
+    ...
+```
+
+### 이유
+
+토글 ON 시 상태를 `PENDING_BACKFILL`로 두기로 했기 때문에,
+워커 시작 시 이 상태를 인식할 최소 진입점은 미리 잡아두는 게 맞습니다.
+
+---
+
+## 7. `src/workers/collector_worker.py`  **[기존 보강]**
+
+README상 이 파일은 실시간 텔레그램 메시지 이벤트 핸들러와 DB 저장 루프 역할입니다. STEP 1에서는 전체 완성이 아니라 **공통 저장 경로 호출 구조만** 먼저 심으면 됩니다. 
+
+### 이번 단계에서 넣을 것
+
+* `persist_message_from_event(...)`
+* `handle_new_message(event)`
+* `handle_edited_message(event)`
+* `safe_process_event(...)`
+
+### 핵심 흐름
+
+1. 이벤트 수신
+2. 채널 ACTIVE 여부 확인
+3. translator로 payload 변환
+4. repository `upsert_message()`
+5. 성공 시 `update_channel_checkpoint()`
+6. 실패 시 로그
+
+### 구현 초안
+
+```python
+async def persist_message_from_event(db: AsyncSession, event_message, telegram_channel_id: int):
+    payload = message_to_payload(event_message, telegram_channel_id)
+    result = await upsert_message(db, payload)
+
+    if result.action in {UpsertAction.CREATED, UpsertAction.UPDATED, UpsertAction.UNCHANGED}:
+        await update_channel_checkpoint(
+            db=db,
+            telegram_channel_id=telegram_channel_id,
+            candidate_message_id=result.checkpoint_candidate,
+            collected_at=payload.collected_at,
+        )
+    return result
+```
+
+### 포인트
+
+이 함수가 나중에 **백필에서도 그대로 재사용**되도록 만드는 것이 중요합니다.
+
+---
+
+## 8. `config/constants.py`  **[선택 보강]**
+
+README상 전역 상수 파일이 이미 있으므로, 상태 문자열을 여기 둘지 `schemas.py` Enum으로 둘지 한쪽으로 통일하는 게 좋습니다. 
+
+### 권장
+
+이번에는 상태값 문자열 상수보다 **Enum 중심**이 낫습니다.
+그래서 `constants.py`에는
+
+* 백필 기본 한도
+* 기본 일수
+* 재시도 횟수
+  같은 운영 상수만 두는 편이 더 깔끔합니다.
+
+### 추천 상수
+
+```python
+DEFAULT_BACKFILL_DAYS = 3
+DEFAULT_BACKFILL_LIMIT = 1000
+```
+
+---
+
+## 9. `tests/test_repository.py`  **[신규 추가]**
+
+### 역할
+
+STEP 1에서 가장 중요한 테스트 파일입니다.
+
+### 테스트 항목
+
+* 신규 메시지 insert
+* 동일 메시지 중복 insert 방지
+* edited_at 반영 update
+* is_deleted 반영
+* checkpoint 증가
+* 작은 message_id로 checkpoint 역행 금지
+
+### 이 파일이 중요한 이유
+
+Phase 2에서 실제로 위험한 부분은 Telethon 연결보다
+**저장 규약이 흔들리는 것**입니다.
+그래서 repository 테스트가 가장 우선입니다.
+
+---
+
+## 10. `tests/test_telegram_routes.py`  **[신규 추가]**
+
+### 역할
+
+라우터가 상태 전이를 정확히 수행하는지 확인
+
+### 최소 테스트
+
+* `/channels/sync` 정상 응답
+* `/channels/{id}/toggle` ON → `PENDING_BACKFILL`
+* `/channels/{id}/toggle` OFF → `PAUSED`
+
+---
+
+# 추천 구현 순서
+
+## 1순위
+
+`src/infra/db/schemas.py`
+`src/infra/db/repository.py`
+
+이 둘이 먼저입니다.
+타입 계약과 upsert 규약이 먼저 닫혀야 나머지가 흔들리지 않습니다.
+
+## 2순위
+
+`src/infra/telegram/translators.py`
+`src/infra/telegram/client.py`
+
+외부 Telethon 객체를 내부 payload로 바꾸는 경로를 닫습니다.
+
+## 3순위
+
+`src/web/routes/telegram.py`
+
+`/sync`, `/toggle`를 붙입니다.
+
+## 4순위
+
+`src/workers/startup_tasks.py`
+`src/workers/collector_worker.py`
+
+실시간/백필 공통 저장 경로를 연결합니다.
+
+## 5순위
+
+`tests/*`
+
+저장 규약과 상태 전이를 고정합니다.
+
+---
+
+# 이번 STEP 1에서 파일별 완료 기준
+
+### `schemas.py`
+
+* Enum, Payload, Result 타입 정의 완료
+
+### `repository.py`
+
+* `upsert_message()`와 `update_channel_checkpoint()` 완료
+
+### `translators.py`
+
+* Telethon message → payload 변환 완료
+
+### `telegram.py`
+
+* `/sync`, `/toggle` 동작 완료
+
+### `collector_worker.py`
+
+* 이벤트를 공통 persistence로 태우는 구조 완료
+
+### `tests`
+
+* 중복 방지와 상태 전이 검증 완료
+
+---
+
+# 결론
+
+지금 구조에서는 **새 폴더를 더 파는 것보다**
+
+* `schemas.py`
+* `repository.py`
+* `translators.py`
+  이 3개를 추가하고,
+  기존
+* `client.py`
+* `telegram.py`
+* `startup_tasks.py`
+* `collector_worker.py`
+  를 보강하는 방식이 가장 자연스럽습니다. README의 현재 구조와 API 설계, 그리고 Phase 2 확장 중심축과도 가장 잘 맞습니다. 

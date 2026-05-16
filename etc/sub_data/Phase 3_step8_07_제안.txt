@@ -1,0 +1,401 @@
+좋습니다. 지금 단계에서는 **테스트 코드 2개 + 선행 패치 3개**로 가는 게 가장 실전적입니다.
+
+업로드된 파일 기준으로 먼저 손봐야 하는 건 세 가지입니다.
+
+* `PreprocessWorker`는 `complete_job(..., next_payload={"preprocess_result_id": res_id})`를 쓰고 있는데, 현재 `complete_job()` 시그니처상 그 dict는 호출 시점에 만들어집니다. 주석과 달리 handler 실행 후 평가되는 구조가 아닙니다. 그래서 `InferenceWorker`가 기대하는 `preprocess_result_id`가 비어 있을 수 있습니다.
+* `SchedulerWorker`는 `self.session_factory`를 받아놓고도 실제론 `AsyncSessionLocal()`을 직접 열고, `_recover_stuck_jobs()`는 값을 반환하지 않는데 `run_once()`는 `recovered > 0`을 비교합니다. 
+* `AnalysisJobService`는 `create_job_if_not_exists()`에서 `JobTargetType.MESSAGE.value`와 `self.default_max_attempts`를 쓰지만, 파일 상단에는 `JobTargetType` import가 없고 `__init__`에 `default_max_attempts`도 없습니다. 또 워커 둘은 `fail_job()`를 호출하는데 서비스엔 그 메서드가 없습니다.
+
+먼저 이 3개만 고친 뒤 테스트를 넣는 게 맞습니다.
+
+## 1) 선행 패치
+
+### `analysis_job_service.py`
+
+```python
+from src.infra.db.models import AnalysisJob, JobTargetType
+
+class AnalysisJobService:
+    def __init__(
+        self,
+        job_repo: AnalysisJobRepository | None = None,
+        default_max_attempts: int = 3,
+    ):
+        self.job_repo = job_repo or AnalysisJobRepository()
+        self.default_max_attempts = default_max_attempts
+
+    async def fail_job(
+        self,
+        session: AsyncSession,
+        *,
+        job_id: int,
+        error,
+        retryable: bool = True,
+    ) -> None:
+        job = await self.job_repo.get_by_id(session, job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} not found")
+
+        error_code = error.__class__.__name__ if isinstance(error, Exception) else "JOB_ERROR"
+        error_message = str(error)
+
+        await self.mark_failed(
+            session,
+            job=job,
+            error_code=error_code,
+            error_message=error_message,
+            retryable=retryable,
+        )
+```
+
+### `preprocess_worker.py`
+
+가장 작은 수정은 `payload_holder`를 쓰는 방식입니다.
+
+```python
+async def run_once(self) -> int:
+    async with self.session_factory() as session:
+        job = await self.job_service.claim_next_job(
+            session,
+            job_type=JobType.NORMALIZE.value,
+            worker_name=self.worker_name,
+        )
+        if not job:
+            return 0
+        await session.commit()
+
+    try:
+        payload_holder = {"preprocess_result_id": None}
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                async def result_save_handler(s):
+                    result_id = await self.preprocess_service.run_normalize_job(s, job.job_id)
+                    payload_holder["preprocess_result_id"] = result_id
+
+                await self.job_service.complete_job(
+                    session,
+                    job_id=job.job_id,
+                    result_handler=result_save_handler,
+                    next_job_type=JobType.SINGLE_MESSAGE_SUMMARY.value,
+                    next_payload=payload_holder,
+                )
+        return 1
+    except Exception as e:
+        async with self.session_factory() as session:
+            async with session.begin():
+                await self.job_service.fail_job(
+                    session,
+                    job_id=job.job_id,
+                    error=e,
+                    retryable=True,
+                )
+        return 0
+```
+
+이 방식은 `payload_holder` 자체를 넘기고 handler 안에서 내부 값을 바꾸므로, 현재 `complete_job()` 시그니처를 바꾸지 않아도 됩니다. `res_id` 스칼라를 바로 dict에 넣는 현재 방식은 안전하지 않습니다.
+
+### `scheduler_worker.py`
+
+```python
+class SchedulerWorker(BaseWorker):
+    def __init__(self, session_factory, scheduler_service, worker_name, poll_interval):
+        super().__init__(worker_name=worker_name, poll_interval=poll_interval)
+        self.session_factory = session_factory
+        self.service = scheduler_service
+
+    async def run_once(self) -> bool:
+        recovered = await self._recover_stuck_jobs()
+        return recovered > 0
+
+    async def _recover_stuck_jobs(self) -> int:
+        try:
+            async with self.session_factory() as session:
+                count = await self.service.recover_stuck_jobs(session)
+                if count > 0:
+                    await session.commit()
+                return count
+        except Exception as e:
+            logger.error(f"[{self.worker_name}] Error during stuck job recovery: {e}")
+            return 0
+```
+
+## 2) `tests/repositories/test_analysis_job_repository.py`
+
+이건 `AnalysisJobRepository` 자체 계약을 보는 테스트입니다.
+핵심은 `enqueue → get_existing → claim → stuck recovery 대상 조회` 네 가지입니다.
+
+```python
+import pytest
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import select
+
+from src.infra.db.models import AnalysisJob, JobStatus, JobTargetType, JobType
+from src.infra.db.repositories.analysis_job_repository import AnalysisJobRepository
+from src.infra.db.session import AsyncSessionLocal
+
+UTC = timezone.utc
+
+
+@pytest.mark.asyncio
+async def test_enqueue_and_get_existing_job():
+    repo = AnalysisJobRepository()
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            job = await repo.enqueue_job(
+                session,
+                job_type=JobType.NORMALIZE.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=101,
+                telegram_message_id=101,
+                message_version_id=201,
+                payload_json={"message_version_id": 201},
+                priority=5,
+                max_attempts=3,
+            )
+
+        assert job.id is not None
+
+    async with AsyncSessionLocal() as session:
+        found = await repo.get_existing_job(
+            session,
+            telegram_message_id=101,
+            message_version_id=201,
+            job_type=JobType.NORMALIZE.value,
+        )
+
+        assert found is not None
+        assert found.id == job.id
+        assert found.status == JobStatus.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_claim_next_job_marks_running_and_increments_attempt():
+    repo = AnalysisJobRepository()
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            await repo.enqueue_job(
+                session,
+                job_type=JobType.NORMALIZE.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=102,
+                telegram_message_id=102,
+                message_version_id=202,
+                payload_json={"message_version_id": 202},
+                priority=1,
+                max_attempts=3,
+            )
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            claimed = await repo.claim_next_job(
+                session,
+                job_type=JobType.NORMALIZE.value,
+                worker_name="test-worker",
+            )
+
+            assert claimed is not None
+            assert claimed.status == JobStatus.RUNNING.value
+            assert claimed.worker_name == "test-worker"
+            assert claimed.attempt_count == 1
+            assert claimed.lease_expires_at is not None
+
+    async with AsyncSessionLocal() as session:
+        row = await session.get(AnalysisJob, claimed.id)
+        assert row.status == JobStatus.RUNNING.value
+        assert row.worker_name == "test-worker"
+
+
+@pytest.mark.asyncio
+async def test_find_stuck_jobs_returns_only_expired_running_jobs():
+    repo = AnalysisJobRepository()
+    now = datetime.now(UTC)
+
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            expired_running = AnalysisJob(
+                job_type=JobType.NORMALIZE.value,
+                status=JobStatus.RUNNING.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=103,
+                telegram_message_id=103,
+                priority=5,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=now - timedelta(minutes=10),
+            )
+            healthy_running = AnalysisJob(
+                job_type=JobType.NORMALIZE.value,
+                status=JobStatus.RUNNING.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=104,
+                telegram_message_id=104,
+                priority=5,
+                attempt_count=1,
+                max_attempts=3,
+                lease_expires_at=now + timedelta(minutes=10),
+            )
+            pending_job = AnalysisJob(
+                job_type=JobType.NORMALIZE.value,
+                status=JobStatus.PENDING.value,
+                target_type=JobTargetType.MESSAGE.value,
+                target_id=105,
+                telegram_message_id=105,
+                priority=5,
+                attempt_count=0,
+                max_attempts=3,
+            )
+            session.add_all([expired_running, healthy_running, pending_job])
+
+    async with AsyncSessionLocal() as session:
+        rows = await repo.find_stuck_jobs(session, timeout_seconds=1800)
+
+        ids = {row.telegram_message_id for row in rows}
+        assert 103 in ids
+        assert 104 not in ids
+        assert 105 not in ids
+```
+
+## 3) `tests/workers/test_pipeline_smoke.py`
+
+이건 **현재 코드 구조에 가장 맞는 스모크 테스트**입니다.
+핵심은 `persist_message → NORMALIZE job → preprocess_worker.run_once() → SINGLE_MESSAGE_SUMMARY job → inference_worker.run_once()` 흐름입니다.
+
+다만 이 테스트는 전제가 하나 있습니다.
+당신이 앞서 만든 `MessageIngestService.persist_message()`와 `analysis_job.py`, `analysis_job_repository.py`가 반영되어 있어야 합니다.
+
+```python
+import pytest
+from sqlalchemy import select
+
+from src.infra.db.models import (
+    AnalysisJob,
+    AnalysisResult,
+    JobStatus,
+    JobType,
+    NormalizedTelegramMessage,
+)
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+from src.services.message_ingest_service import MessageIngestService
+from src.services.worker_services import InferenceService, PreprocessService
+from src.workers.inference_worker import InferenceWorker
+from src.workers.preprocess_worker import PreprocessWorker
+
+
+@pytest.mark.asyncio
+async def test_smoke_persist_preprocess_inference_pipeline():
+    job_service = AnalysisJobService()
+    ingest_service = MessageIngestService(job_service=job_service)
+    preprocess_service = PreprocessService()
+    inference_service = InferenceService()
+
+    # 1) 메시지 저장 + NORMALIZE job 생성
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            result = await ingest_service.persist_message(
+                session,
+                channel_id=1,
+                telegram_message_no=10001,
+                raw_text="삼성전자 관련 테스트 속보 메시지",
+                published_at=None,
+                collected_at=None,
+                raw_payload={"source": "pytest"},
+            )
+
+    async with AsyncSessionLocal() as session:
+        normalize_jobs = (
+            await session.execute(
+                select(AnalysisJob).where(
+                    AnalysisJob.telegram_message_id == result.telegram_message_id,
+                    AnalysisJob.job_type == JobType.NORMALIZE.value,
+                )
+            )
+        ).scalars().all()
+
+        assert len(normalize_jobs) == 1
+        assert normalize_jobs[0].status == JobStatus.PENDING.value
+
+    # 2) preprocess worker 실행
+    preprocess_worker = PreprocessWorker(
+        session_factory=AsyncSessionLocal,
+        job_service=job_service,
+        preprocess_service=preprocess_service,
+        worker_name="test-preprocess-worker",
+        poll_interval=0.1,
+    )
+
+    handled = await preprocess_worker.run_once()
+    assert handled == 1
+
+    # 3) normalize 결과 저장 + summary job 생성 확인
+    async with AsyncSessionLocal() as session:
+        normalized_rows = (
+            await session.execute(select(NormalizedTelegramMessage))
+        ).scalars().all()
+        assert len(normalized_rows) >= 1
+
+        summary_jobs = (
+            await session.execute(
+                select(AnalysisJob).where(
+                    AnalysisJob.telegram_message_id == result.telegram_message_id,
+                    AnalysisJob.job_type == JobType.SINGLE_MESSAGE_SUMMARY.value,
+                )
+            )
+        ).scalars().all()
+
+        assert len(summary_jobs) == 1
+        assert summary_jobs[0].payload_json is not None
+        assert summary_jobs[0].payload_json["preprocess_result_id"] is not None
+
+    # 4) inference worker 실행
+    inference_worker = InferenceWorker(
+        session_factory=AsyncSessionLocal,
+        job_service=job_service,
+        inference_service=inference_service,
+        worker_name="test-inference-worker",
+        poll_interval=0.1,
+    )
+
+    handled = await inference_worker.run_once()
+    assert handled == 1
+
+    # 5) inference 결과 + job 완료 상태 확인
+    async with AsyncSessionLocal() as session:
+        results = (await session.execute(select(AnalysisResult))).scalars().all()
+        assert len(results) >= 1
+
+        jobs = (
+            await session.execute(
+                select(AnalysisJob).where(
+                    AnalysisJob.telegram_message_id == result.telegram_message_id
+                )
+            )
+        ).scalars().all()
+
+        status_map = {job.job_type: job.status for job in jobs}
+        assert status_map[JobType.NORMALIZE.value] == JobStatus.SUCCEEDED.value
+        assert status_map[JobType.SINGLE_MESSAGE_SUMMARY.value] == JobStatus.SUCCEEDED.value
+```
+
+## 4) 지금 테스트가 가장 먼저 깨질 가능성이 높은 지점
+
+우선순위대로 보면 이렇습니다.
+
+1. `AnalysisJobService.create_job_if_not_exists()`
+   여기서 `JobTargetType` import와 `self.default_max_attempts`가 빠져 있어 바로 터질 수 있습니다. 
+
+2. `PreprocessWorker`의 후속 payload 전달
+   현재 업로드본 주석은 “handler 수행 후 평가”라고 되어 있지만, 현재 `complete_job()` 정의만 보면 그렇게 동작하지 않습니다. 이 부분을 안 고치면 `InferenceWorker`가 `Normalized msg None not found`로 실패할 가능성이 큽니다.
+
+3. `fail_job()` 부재
+   `InferenceWorker`와 `PreprocessWorker`는 둘 다 `fail_job()`를 호출하는데 서비스에 없습니다. 실패 케이스 테스트는 이 부분에서 먼저 깨집니다.
+
+4. `SchedulerWorker.run_once()`
+   `_recover_stuck_jobs()`가 `None`을 반환하므로 `recovered > 0`에서 예외가 날 수 있습니다. 
+
+## 5) 가장 자연스러운 다음 작업
+
+이제 가장 좋은 다음 단계는 **실제 `analysis_job_repository.py` 파일을 업로드하거나 작성한 뒤, 위 repository 테스트를 기준으로 `체크 완료 / 누락 / 수정 필요`를 실제로 채우는 것**입니다. 그 다음에는 이 스모크 테스트를 당신 프로젝트의 실제 모델 필드명에 맞춰 최종본으로 다듬으면 됩니다.

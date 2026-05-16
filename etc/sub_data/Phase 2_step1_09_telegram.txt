@@ -1,0 +1,181 @@
+`telegram.py`는 **지금 단계의 라우터로서는 충분히 잘 돌아갈 구조**입니다.
+특히 `/channels/sync`에서 `TelegramChannelSyncLog`를 남기고, 신규 채널에는 `TelegramChannelCollectionState`까지 같이 생성해둔 점은 좋습니다. `/toggle`도 단순히 boolean만 바꾸지 않고 상태 테이블을 같이 갱신하도록 만든 방향은 맞습니다. 
+
+다만 **운영 기준으로 보면 수정 우선순위가 높은 부분**이 몇 개 있습니다.
+
+## 가장 먼저 고쳐야 할 부분
+
+### 1) `/channels/sync`의 예외 처리에서 부분 커밋 위험이 있습니다
+
+현재 `/channels/sync`는 시작 시 `sync_log`를 `RUNNING`으로 먼저 커밋하고, 이후 채널들을 순회하면서 `TelegramChannel`과 `TelegramChannelCollectionState`를 세션에 쌓습니다. 그런데 중간에 예외가 나면 `except` 블록에서 `sync_log.status = "FAILED"` 후 `await db.commit()`을 호출합니다. 문제는 **그 시점까지 세션에 남아 있던 채널 변경사항도 함께 커밋될 수 있다**는 점입니다. 즉 “동기화 실패”인데 일부 채널만 반쯤 반영된 상태가 저장될 수 있습니다. 
+
+이건 꽤 중요합니다.
+권장은:
+
+* `except`에 들어가면 먼저 `await db.rollback()`
+* 그 다음 실패용 로그 레코드만 다시 갱신해서 커밋
+
+또는 아예
+
+* sync log 시작 커밋
+* 채널 동기화는 별도 트랜잭션
+* 실패 시 rollback 후 sync log만 FAILED로 업데이트
+  처럼 분리하는 것입니다.
+
+이 부분은 **가장 먼저 손보는 게 좋습니다.**
+
+---
+
+### 2) `/toggle`이 “토글” 방식이라 idempotent하지 않습니다
+
+현재 `POST /channels/{channel_id}/toggle`은 body 없이 호출할 때마다 `channel.is_collecting = not channel.is_collecting`으로 뒤집습니다. 
+
+이 방식의 문제는:
+
+* 같은 요청이 중복 전송되면 상태가 다시 반대로 바뀜
+* 프론트/워커/테스트에서 “내가 ON을 요청했는지, 단지 뒤집은 건지”가 애매함
+* 운영 중 race condition에 취약
+
+STEP 1 설계 의도는 사실 “toggle”보다 **명시적 enable/disable**에 가깝습니다.
+
+권장은:
+
+* `POST /channels/{id}/toggle`을 유지하더라도 body에 `enabled: bool` 받기
+* `True`면 `PENDING_BACKFILL`
+* `False`면 `PAUSED`
+
+즉 “반전”이 아니라 **목표 상태 지정**으로 바꾸는 편이 더 안전합니다.
+
+---
+
+### 3) `/channels` 조회가 상태 테이블을 제대로 활용하지 않고 있습니다
+
+현재 `GET /channels`는 `TelegramChannel`만 조회해서
+
+* `is_collecting`
+* `status`
+* `last_message_at`
+* `last_synced_at`
+  를 반환합니다. 그런데 설계상 핵심 수집 상태는 `TelegramChannelCollectionState`에 있습니다. 지금 구조면 사용자는 실제 수집 상태(`PENDING_BACKFILL`, `ACTIVE`, `PAUSED`, `ERROR`)보다 채널 테이블 값만 보게 됩니다. 
+
+즉 현재 응답은 **상태머신 설계와 어긋날 가능성**이 큽니다.
+
+권장은 `/channels`에서 최소한 상태 테이블을 join해서 아래를 보여주는 것입니다.
+
+* `collection_status`
+* `last_collected_message_id`
+* `last_backfill_at`
+* `last_error_message`
+
+지금처럼 `TelegramChannel.status`와 `is_collecting`만 보여주면, 이후 Phase 2에서 화면과 실제 워커 상태가 어긋날 수 있습니다.
+
+---
+
+## 그 다음 중요한 부분
+
+### 4) `/channels/sync`가 기존 채널의 상태 레코드 존재를 보장하지 않습니다
+
+신규 채널일 때는 `TelegramChannelCollectionState`를 생성하지만, 기존 채널에 대해서는 채널 정보만 업데이트하고 상태 레코드가 없을 경우를 보정하지 않습니다. 
+
+즉 예전에 생성 누락이나 수동 수정으로 state row가 없어진 채널은 계속 비정상 상태로 남을 수 있습니다.
+
+권장은 기존 채널도 sync 시점에
+
+* state row 존재 여부 확인
+* 없으면 `PAUSED` 기본값으로 생성
+
+이 보정 로직을 넣는 것입니다.
+
+---
+
+### 5) “missing / inaccessible” 상태 반영이 없습니다
+
+지금 `/sync`는 새 채널 추가와 기존 채널 업데이트는 하지만, 이번 sync에서 더 이상 보이지 않는 채널을 `MISSING`으로 바꾸는 처리가 없습니다. 설계 단계에서 강조했던 **동기화 상태 정규화**가 아직 완성되지 않은 상태입니다. 
+
+권장은:
+
+* sync 전에 현재 계정의 기존 채널 목록 조회
+* 이번 dialogs에 없는 채널은 `ChannelSyncStatus.MISSING`으로 업데이트
+
+이게 있어야 “예전에 있던 채널인데 왜 지금 안 보이지?”를 추적할 수 있습니다.
+
+---
+
+### 6) 라우터가 파일 export까지 담당하는 것은 조금 과합니다
+
+동기화 성공 후 `data/telegram_channels_list.json` 파일을 자동 저장하도록 돼 있는데, 이건 개발 편의성 측면에서는 이해되지만 **라우터 책임으로는 조금 무겁습니다.** 환경에 따라 파일 시스템 권한, 실행 위치, 배포 컨테이너 구조 차이 등 운영 이슈가 생길 수 있습니다. 
+
+지금 단계에서 반드시 제거해야 하는 건 아니지만, 권장은:
+
+* 이건 디버그 옵션일 때만 실행
+* 또는 별도 export 스크립트/관리자 엔드포인트로 분리
+
+입니다.
+
+---
+
+## 손보면 좋은 부분
+
+### 7) `datetime.now()`가 모두 naive datetime입니다
+
+현재 파일 전반에서 `datetime.now()`를 쓰고 있습니다. 이전에 repository에서도 비슷한 포인트를 짚었듯이, 전체 프로젝트가 UTC aware datetime으로 가는 편이 더 안전합니다. 
+
+권장은:
+
+* `datetime.now(timezone.utc)` 통일
+* DB 저장 시 timezone-aware 기준 유지
+
+---
+
+### 8) 기본 계정을 라우터에서 자동 생성하는 정책은 재검토할 만합니다
+
+계정이 없으면 기본 계정을 하나 생성하는 건 개발 초기에는 편하지만, 운영에서는 “설정이 잘못됐는데도 조용히 기본값으로 진행”되는 문제가 생길 수 있습니다. 
+
+권장은:
+
+* 개발 모드에서만 자동 생성
+* 운영에서는 400/500으로 명확히 실패
+
+입니다.
+
+---
+
+### 9) `toggle`에서 channel/status 이중 관리가 계속 누적될 수 있습니다
+
+현재 `channel.is_collecting`과 `state_rec.status`를 동시에 관리합니다. 지금도 돌아가지만, 시간이 갈수록 둘이 어긋날 가능성이 있습니다. 
+
+중기적으로는:
+
+* 실시간 수집 여부 판단은 상태 테이블 기준
+* `is_collecting`은 캐시성 보조 필드이거나 제거
+  로 정리하는 편이 좋습니다.
+
+---
+
+## 우선순위 정리
+
+### 바로 수정
+
+1. `/sync` 예외 시 `rollback` 먼저 수행
+2. `/toggle`을 body 기반 명시적 상태 설정으로 변경
+3. `/channels`에 상태 테이블 join 반영
+
+### 다음 수정
+
+4. 기존 채널에도 state row 보정
+5. `MISSING` 상태 처리
+6. timezone-aware datetime 통일
+
+### 나중 수정
+
+7. JSON export를 라우터에서 분리
+8. 기본 계정 자동 생성 정책 분리
+9. `is_collecting`와 상태 테이블 역할 정리
+
+---
+
+## 총평
+
+이 파일은 **뼈대는 좋고, 지금 단계에서 충분히 쓸 수 있습니다.**
+하지만 실제로 가장 위험한 건 `/sync` 실패 시의 트랜잭션 처리입니다. 이건 꼭 먼저 고치세요. 그다음이 `/toggle`의 idempotency와 `/channels`의 상태 응답 정합성입니다. 
+

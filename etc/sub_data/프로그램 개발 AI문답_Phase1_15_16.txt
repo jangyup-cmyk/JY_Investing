@@ -1,0 +1,758 @@
+-----------------------------------------------------------------------------------------------------------------------------
+[사용자 요청사항_15]
+다음 단계는 **이 프롬프트 결과물을 바탕으로, 실제 Phase 1 파일 생성 순서 체크리스트**를 만드는 것입니다.
+-----------------------------------------------------------------------------------------------------------------------------
+
+좋습니다.
+그럼 바로 **실제 Phase 1 파일 생성 순서 체크리스트**로 이어가겠습니다.
+
+이 체크리스트는 **워커 분리형 구조** 기준이며,
+순서대로 만들면 `run_web.py` 와 `run_collector.py` 가 각각 독립 실행 가능한 상태까지 갈 수 있습니다.
+
+---
+
+# Phase 1 파일 생성 순서 체크리스트
+
+## 1단계. 루트 기본 파일 만들기
+
+### 생성 파일
+
+* `requirements.txt`
+* `.env.example`
+* `.env`
+* `README.md`
+
+### 목적
+
+* 패키지 설치 기준 확정
+* 환경변수 구조 확정
+* 프로젝트 실행 기준선 마련
+
+### 체크포인트
+
+* [ ] `pip install -r requirements.txt` 정상
+* [ ] `.env.example` 과 `.env` 항목 구조 일치
+* [ ] DB, 로그, 앱, collector 관련 변수 포함
+
+---
+
+## 2단계. 설정 파일 만들기
+
+### 생성 파일
+
+* `config/settings.py`
+* `config/constants.py` 선택
+
+### 목적
+
+* 모든 환경변수를 `settings` 객체로 통합
+* 웹 서버와 워커가 같은 설정 사용
+
+### 체크포인트
+
+* [ ] `.env` 값이 `settings` 에서 정상 로드됨
+* [ ] `APP_NAME`, `DB_*`, `LOG_*`, `COLLECTOR_*` 읽힘
+* [ ] 코드에서 `os.getenv()` 직접 호출하지 않음
+
+---
+
+## 3단계. 공통 모듈 만들기
+
+### 생성 파일
+
+* `src/common/logger.py`
+* `src/common/exceptions.py`
+* `src/common/responses.py`
+* `src/common/enums.py` 선택
+* `src/common/utils.py` 선택
+
+### 목적
+
+* 로그 방식 통일
+* 예외 형식 통일
+* API 응답 포맷 통일
+
+### 체크포인트
+
+* [ ] `logs/` 폴더 자동 생성
+* [ ] `app.log`, `collector.log`, `error.log` 생성 가능
+* [ ] 성공/실패 응답 helper 동작
+* [ ] 공통 예외 클래스 정의 완료
+
+---
+
+## 4단계. DB 기반 파일 만들기
+
+### 생성 파일
+
+* `src/infra/db/base.py`
+* `src/infra/db/session.py`
+* `src/infra/db/models.py`
+
+### 목적
+
+* SQLAlchemy Base/Engine/Session 준비
+* 최소 모델 정의
+* 웹/워커 공용 DB 연결 구조 확보
+
+### Phase 1 최소 모델 권장
+
+* `SystemLog`
+* `TelegramAccount`
+* `TelegramRuntimeSetting`
+
+### 체크포인트
+
+* [ ] DATABASE_URL 생성 정상
+* [ ] engine 생성 정상
+* [ ] 세션 생성 가능
+* [ ] 최소 모델 import 오류 없음
+
+---
+
+## 5단계. 웹 서버 최소 뼈대 만들기
+
+### 생성 파일
+
+* `src/web/app.py`
+* `src/web/routes/health.py`
+* `run_web.py`
+
+### 목적
+
+* FastAPI 앱 실행
+* `/health`, `/ready` 엔드포인트 제공
+* DB 연결 상태 확인 가능
+
+### 체크포인트
+
+* [ ] `python run_web.py` 실행 가능
+* [ ] `/health` 응답 정상
+* [ ] `/ready` 에서 DB 연결 확인 가능
+* [ ] 예외 발생 시 공통 JSON 형식 반환
+
+---
+
+## 6단계. Collector Worker 최소 뼈대 만들기
+
+### 생성 파일
+
+* `src/workers/collector_worker.py`
+* `src/workers/startup_tasks.py`
+* `run_collector.py`
+
+### 목적
+
+* 워커 독립 실행 가능
+* 설정 로드/DB 점검/시작 로그 출력
+* 향후 자동실행/채널업데이트/복원 훅 위치 확보
+
+### 체크포인트
+
+* [ ] `python run_collector.py` 실행 가능
+* [ ] 워커 시작 로그 출력
+* [ ] DB 연결 점검 로그 출력
+* [ ] startup task 호출 구조 존재
+* [ ] 아직 텔레그램 상세 수집 없이도 정상 종료/대기 가능
+
+---
+
+## 7단계. 디렉토리/임포트 정리
+
+### 점검 대상
+
+* `src` 하위 import
+* `config` import
+* `run_web.py`, `run_collector.py` 진입점 import
+
+### 목적
+
+* Windows + VS Code + `.venv` 환경에서 import 꼬임 방지
+
+### 체크포인트
+
+* [ ] 절대 import 기준 일관성 유지
+* [ ] `ModuleNotFoundError` 없음
+* [ ] 웹/워커 모두 같은 settings/logger/db 사용
+
+---
+
+## 8단계. 실제 실행 점검
+
+### 실행 순서
+
+```bash
+cd /d D:\telegram_trading
+.venv\Scripts\activate
+pip install -r requirements.txt
+python run_web.py
+```
+
+다른 터미널에서:
+
+```bash
+cd /d D:\telegram_trading
+.venv\Scripts\activate
+python run_collector.py
+```
+
+### 체크포인트
+
+* [ ] 웹 서버 실행
+* [ ] 워커 실행
+* [ ] 로그 파일 생성
+* [ ] DB 연결 정상 또는 실패 시 원인 로그 확인 가능
+
+---
+
+# 권장 생성 순서 요약
+
+## 가장 추천하는 실제 파일 생성 순서
+
+### 1차
+
+1. `requirements.txt`
+2. `.env.example`
+3. `config/settings.py`
+
+### 2차
+
+4. `src/common/logger.py`
+5. `src/common/exceptions.py`
+6. `src/common/responses.py`
+
+### 3차
+
+7. `src/infra/db/base.py`
+8. `src/infra/db/session.py`
+9. `src/infra/db/models.py`
+
+### 4차
+
+10. `src/web/app.py`
+11. `src/web/routes/health.py`
+12. `run_web.py`
+
+### 5차
+
+13. `src/workers/startup_tasks.py`
+14. `src/workers/collector_worker.py`
+15. `run_collector.py`
+
+이 순서가 가장 안전합니다.
+
+---
+
+# Phase 1 완료 체크리스트
+
+## 공통
+
+* [ ] `.env` 기반 설정 로드 가능
+* [ ] 로그 파일 생성 가능
+* [ ] DB 연결 구조 준비 완료
+* [ ] 공통 예외/응답 형식 확정
+
+## 웹 서버
+
+* [ ] `run_web.py` 실행 가능
+* [ ] `/health` 정상
+* [ ] `/ready` 정상
+* [ ] DB 연결 실패 시 일관된 에러 응답 반환
+
+## 워커
+
+* [ ] `run_collector.py` 실행 가능
+* [ ] 시작 로그 출력
+* [ ] DB 연결 점검 수행
+* [ ] startup task 호출 구조 존재
+
+---
+
+# 다음 단계 우선순위
+
+Phase 1 끝난 뒤에는 아래 순서가 자연스럽습니다.
+
+1. `telegram_channels` 관련 모델 추가
+2. 채널 업데이트 API 추가
+3. 자동실행 설정 저장 API 추가
+4. 마지막 선택 채널 저장 구조 추가
+5. Collector Worker에 채널 업데이트/복원 로직 연결
+
+
+--------------------------------------------------------------------------------------------------------
+[사용자 요청사항_16]
+**이 체크리스트 기준으로 “각 파일에 먼저 넣어야 할 최소 내용 요약표”**까지 이어서 정리
+--------------------------------------------------------------------------------------------------------
+
+
+좋습니다.
+아래에 **Phase 1 기준 각 파일에 먼저 넣어야 할 최소 내용 요약표**를 정리하겠습니다.
+
+이 표의 목적은 두 가지입니다.
+
+* 처음부터 과하게 만들지 않기
+* 그래도 **실행 가능한 최소 골격**은 갖추기
+
+---
+
+# 1) 루트 파일
+
+| 파일                 | 먼저 넣어야 할 최소 내용                                                                                                    | 비고                  |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- | ------------------- |
+| `requirements.txt` | FastAPI, Uvicorn, SQLAlchemy, Alembic, pydantic-settings, python-dotenv, psycopg[binary], Telethon, httpx, pytest | Phase 1에 필요한 최소 패키지 |
+| `.env.example`     | APP, DB, LOG, TELEGRAM, COLLECTOR, BROKER 관련 환경변수 키                                                               | 실제 값 말고 구조만         |
+| `.env`             | 로컬 실행용 실제 값                                                                                                       | Git 제외              |
+| `README.md`        | 프로젝트 실행 방법, `run_web.py`, `run_collector.py` 실행법                                                                  | 짧아도 됨               |
+
+---
+
+# 2) 설정 파일
+
+## `config/settings.py`
+
+### 최소 내용
+
+* `AppSettings`
+* `DBSettings`
+* `LogSettings`
+* `TelegramSettings`
+* `CollectorSettings`
+* `BrokerSettings`
+* `Settings`
+* `get_settings()` 또는 singleton `settings`
+
+### 꼭 있어야 할 항목
+
+* 앱 이름
+* 환경(local/dev/prod)
+* debug
+* host/port
+* DB 연결 정보
+* 로그 디렉토리/레벨
+* 텔레그램 예약 변수
+* collector on/off, interval 등 예약 변수
+
+### 지금은 없어도 되는 것
+
+* 복잡한 validation
+* 동적 secret manager 연동
+* 멀티 환경 분기 로직 과다 구현
+
+---
+
+## `config/constants.py` 선택
+
+### 최소 내용
+
+* 앱 버전
+* 기본 로그명
+* 상태값 상수 일부
+
+### 지금은 생략 가능
+
+공통 enum 파일로 대체해도 됩니다.
+
+---
+
+# 3) 공통 모듈
+
+## `src/common/logger.py`
+
+### 최소 내용
+
+* `logs/` 폴더 생성
+* 콘솔 핸들러
+* 파일 핸들러
+* `app.log`, `collector.log`, `error.log`
+* `get_logger(name: str, log_type: str = "app")`
+
+### 꼭 있어야 할 기능
+
+* 웹용 로거와 워커용 로거를 구분해서 생성 가능
+* 포맷 통일
+* 중복 핸들러 방지
+
+### 지금은 없어도 되는 것
+
+* JSON 로깅
+* 고급 structured logging
+* 외부 로깅 시스템 연동
+
+---
+
+## `src/common/exceptions.py`
+
+### 최소 내용
+
+* `AppException`
+* `DatabaseException`
+* `ExternalAPIException`
+* `ValidationAppException`
+* `NotFoundException`
+
+### 꼭 있어야 할 속성
+
+* `status_code`
+* `message`
+* `error_code`
+
+### 지금은 없어도 되는 것
+
+* 복잡한 예외 계층
+* 텔레그램 전용 예외 수십 개 분리
+
+---
+
+## `src/common/responses.py`
+
+### 최소 내용
+
+* 성공 응답 helper
+* 실패 응답 helper
+
+### 응답 형식
+
+```json
+{
+  "success": true,
+  "message": "ok",
+  "data": {}
+}
+```
+
+```json
+{
+  "success": false,
+  "message": "오류",
+  "error_code": "ERROR_CODE",
+  "data": null
+}
+```
+
+### 지금은 없어도 되는 것
+
+* 제네릭 ResponseModel 과설계
+* pagination helper 다수
+
+---
+
+## `src/common/enums.py` 선택
+
+### 최소 내용
+
+* 로그 레벨
+* 계정 상태
+* 런타임 상태 일부
+
+### 권장
+
+지금은 문자열 상수로 시작해도 괜찮습니다.
+
+---
+
+# 4) DB 계층
+
+## `src/infra/db/base.py`
+
+### 최소 내용
+
+* SQLAlchemy Base 선언
+* 공통 timestamp mixin 선택 가능
+
+### 꼭 있어야 할 것
+
+* ORM 모델들이 상속할 Base
+
+---
+
+## `src/infra/db/session.py`
+
+### 최소 내용
+
+* DATABASE_URL 조합
+* engine 생성
+* SessionLocal 생성
+* `get_db()`
+* `check_db_connection()` 같은 간단한 연결 확인 함수
+
+### 꼭 있어야 할 것
+
+* 웹과 워커가 같은 DB session 구조 사용
+
+### 지금은 없어도 되는 것
+
+* 읽기/쓰기 DB 분리
+* connection pool 고급 튜닝
+* async DB 구조
+
+---
+
+## `src/infra/db/models.py`
+
+### Phase 1 최소 모델
+
+* `SystemLog`
+* `TelegramAccount`
+* `TelegramRuntimeSetting`
+
+### 각 모델 최소 필드
+
+#### `SystemLog`
+
+* id
+* module_name
+* log_level
+* message
+* created_at
+
+#### `TelegramAccount`
+
+* id
+* account_name
+* session_name
+* status
+* created_at
+* updated_at
+
+#### `TelegramRuntimeSetting`
+
+* id
+* telegram_account_id
+* auto_channel_update
+* auto_add_new_channels_only
+* auto_start_last_selected_channels
+* auto_restore_last_selection
+* created_at
+* updated_at
+
+### 지금은 없어도 되는 것
+
+* `TelegramChannel`
+* `TelegramMessage`
+* `TelegramLastSelectedChannel`
+* `CollectorRuntimeStatus`
+
+이건 Phase 2 초반에 추가하면 됩니다.
+
+---
+
+# 5) 웹 서버
+
+## `src/web/app.py`
+
+### 최소 내용
+
+* FastAPI app 생성
+* 앱 제목/버전 설정
+* 예외 핸들러 등록
+* health 라우터 등록
+* startup 로그 출력
+
+### 꼭 있어야 할 것
+
+* `create_app()` 구조 또는 바로 `app = FastAPI(...)`
+* 공통 예외를 JSON 형태로 변환
+
+### 지금은 없어도 되는 것
+
+* 템플릿 엔진
+* 인증
+* 관리자 페이지
+* 텔레그램 채널 관리 라우터
+
+---
+
+## `src/web/routes/health.py`
+
+### 최소 내용
+
+* `GET /health`
+* `GET /ready`
+
+### 역할
+
+* `/health`: 앱 살아 있음 확인
+* `/ready`: DB 연결까지 포함한 준비 상태 확인
+
+### 꼭 있어야 할 것
+
+* 공통 응답 포맷 사용
+
+---
+
+## `run_web.py`
+
+### 최소 내용
+
+* settings 로드
+* uvicorn 실행
+* host, port, reload 반영
+
+### 꼭 있어야 할 것
+
+* Windows 환경에서 바로 실행 가능
+
+---
+
+# 6) 워커
+
+## `src/workers/startup_tasks.py`
+
+### 최소 내용
+
+* worker 시작 시 호출할 함수
+* 설정 로드 확인
+* DB 연결 확인
+* 향후 채널 업데이트/복원용 placeholder 함수 위치
+
+### 추천 함수 예시
+
+* `run_startup_tasks()`
+* `load_runtime_settings()`
+* `log_startup_summary()`
+
+### 지금은 없어도 되는 것
+
+* 실제 텔레그램 채널 업데이트 구현
+* 실제 자동복원 구현
+
+---
+
+## `src/workers/collector_worker.py`
+
+### 최소 내용
+
+* Worker 클래스 또는 실행 함수
+* logger 로드
+* settings 로드
+* DB 연결 확인
+* startup task 호출
+* 단순 실행 루프 또는 graceful 종료 구조
+
+### 꼭 있어야 할 것
+
+* “실행 가능”
+* “로그 남김”
+* “향후 확장 위치 명확”
+
+### 지금은 없어도 되는 것
+
+* Telethon 실제 연결
+* 메시지 수집 루프
+* 배치 저장 로직
+
+---
+
+## `run_collector.py`
+
+### 최소 내용
+
+* worker 시작 진입점
+* 시작/종료 로그
+* KeyboardInterrupt 처리
+
+### 꼭 있어야 할 것
+
+* `python run_collector.py` 로 독립 실행 가능
+
+---
+
+# 7) 파일별 최소 구현 우선순위
+
+## 먼저 만들어야 하는 핵심 파일 TOP 7
+
+1. `requirements.txt`
+2. `.env.example`
+3. `config/settings.py`
+4. `src/common/logger.py`
+5. `src/infra/db/session.py`
+6. `src/web/app.py`
+7. `run_web.py`
+
+이 7개가 먼저 있어야 웹 서버가 뜹니다.
+
+---
+
+## 그 다음 바로 필요한 파일
+
+8. `src/common/exceptions.py`
+9. `src/common/responses.py`
+10. `src/infra/db/base.py`
+11. `src/infra/db/models.py`
+12. `src/web/routes/health.py`
+
+---
+
+## 마지막으로 워커 뼈대
+
+13. `src/workers/startup_tasks.py`
+14. `src/workers/collector_worker.py`
+15. `run_collector.py`
+
+---
+
+# 8) 각 파일의 “완료 기준” 한 줄 요약
+
+| 파일                    | 완료 기준                               |
+| --------------------- | ----------------------------------- |
+| `requirements.txt`    | pip install 오류 없이 설치 가능             |
+| `.env.example`        | APP/DB/LOG/TELEGRAM/COLLECTOR 구조 포함 |
+| `settings.py`         | `.env` 값이 settings 객체로 로드됨          |
+| `logger.py`           | 콘솔/파일 로그 둘 다 출력됨                    |
+| `exceptions.py`       | 공통 예외 5종 정의됨                        |
+| `responses.py`        | 성공/실패 JSON helper 사용 가능             |
+| `base.py`             | ORM Base 선언 완료                      |
+| `session.py`          | DB engine/session/check 함수 동작       |
+| `models.py`           | 최소 3개 모델 import 가능                  |
+| `app.py`              | FastAPI 앱 생성 및 라우터 등록 가능            |
+| `health.py`           | `/health`, `/ready` 응답 가능           |
+| `run_web.py`          | 웹 서버 실행 가능                          |
+| `startup_tasks.py`    | worker 시작 태스크 함수 호출 가능              |
+| `collector_worker.py` | worker 시작/DB 확인/로그 출력 가능            |
+| `run_collector.py`    | 워커 독립 실행 가능                         |
+
+---
+
+# 9) 가장 실무적인 작업 방식
+
+Cursor에서 작업할 때는 아래처럼 하면 좋습니다.
+
+### 1차
+
+웹 서버 뜨는 데 필요한 파일만 먼저 생성
+
+### 2차
+
+DB/예외/응답 구조 정리
+
+### 3차
+
+워커 실행 뼈대 생성
+
+즉, 처음부터 전부 한 번에 하려고 하지 말고
+**웹 먼저 → 공통 정리 → 워커 추가** 순서가 가장 안전합니다.
+
+---
+
+# 10) 최종 요약
+
+지금 각 파일에 먼저 넣어야 할 최소 내용은:
+
+* **설정은 단순하지만 통합적으로**
+* **로그는 콘솔+파일**
+* **DB는 최소 모델만**
+* **웹은 health/ready까지만**
+* **워커는 실행 뼈대까지만**
+* **텔레그램 상세 수집은 아직 금지**
+
+이 기준이면 Phase 1이 과하지 않으면서도, Phase 2로 바로 넘어가기 좋은 상태가 됩니다.
+
+
+
+원하시면 다음으로
+**각 프롬프트를 더 짧고 강하게 다듬은 “붙여넣기 최적화 버전”**으로 다시 압축해드리겠습니다.
+
+
+
+
+

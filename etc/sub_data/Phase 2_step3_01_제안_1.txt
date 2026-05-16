@@ -1,0 +1,624 @@
+좋습니다. 다음 단계로는 **Phase 3~4를 견딜 수 있는 데이터 모델**을 먼저 고정하는 게 맞습니다.
+
+현재 문서상 프로젝트는 이미
+
+* API 서버와 수집 워커가 분리되어 있고,
+* 메시지 중복 방지 `upsert`,
+* 백필 커서 resume,
+* 실시간/백필 체크포인트 분리,
+* Phase 3 전처리와 Phase 4 LLM 분석이 다음 목표로 명시되어 있습니다.   
+
+그래서 지금 필요한 것은 “메시지를 저장한다”에서 끝나는 스키마가 아니라,
+**수집 → 정규화 → 특징 추출 → 분석 작업 생성 → LLM 결과 저장 → 다중 에이전트 합의**까지 자연스럽게 이어지는 스키마입니다.
+
+---
+
+# 1) 먼저 결론: 추천하는 핵심 설계 방향
+
+지금 구조에서는 기존 `Channel`, `Message` 테이블을 유지하되, 그 위에 아래 6개 계층을 추가하는 방식이 가장 안전합니다.
+
+1. `raw_messages`
+2. `message_versions`
+3. `normalized_messages`
+4. `message_features`
+5. `analysis_jobs`
+6. `analysis_results`
+
+그리고 Phase 5를 대비해서 추가로
+7. `theme_windows`
+8. `agent_opinions`
+9. `theme_consensus`
+
+까지 가면 됩니다.
+
+핵심 원칙은 딱 3개입니다.
+
+* **원문은 절대 덮어쓰지 말고 보존**
+* **전처리 결과와 LLM 결과를 분리**
+* **각 단계는 job/status 기반으로 비동기 재처리 가능하게 설계**
+
+이렇게 해야 편집 메시지, 재분석, 프롬프트 변경, 모델 변경, 멀티에이전트 재합의가 모두 쉬워집니다. 현재 문서에서도 원본 편집 메시지 반영, resume, 체크포인트 분리가 강조되어 있으므로 이 방향과 잘 맞습니다.  
+
+---
+
+# 2) 권장 스키마 초안
+
+## A. `channels`
+
+기존 채널 테이블 유지, 다만 분석용 컬럼 몇 개 추가 권장
+
+주요 컬럼
+
+* `id`
+* `tg_channel_id`
+* `title`
+* `username`
+* `is_collecting`
+* `status`
+* `last_collected_at`
+* `last_backfill_at`
+* `last_backfilled_message_id`
+* `reliability_score`
+* `spam_score`
+* `priority_tier`
+
+의미
+
+* `reliability_score`: 채널별 신뢰도 가중치
+* `priority_tier`: 분석 우선순위
+* `spam_score`: 광고/노이즈 성향
+
+문서상 이미 체크포인트 분리 구조가 있으므로, 이 테이블은 수집 제어와 채널 메타 중심으로 유지하면 됩니다. 
+
+---
+
+## B. `raw_messages`
+
+수집 직후 원문 저장소입니다. 현재 `Message` 테이블이 이 역할을 하고 있다면 이름을 유지해도 됩니다. 다만 역할은 명확히 “원문 저장”으로 두는 편이 좋습니다.
+
+주요 컬럼
+
+* `id` bigint pk
+* `channel_id` fk
+* `tg_message_id` bigint
+* `tg_date_utc` datetime
+* `received_at_utc` datetime
+* `message_text` text
+* `reply_to_tg_message_id` bigint nullable
+* `forwarded_from` varchar nullable
+* `has_media` bool
+* `media_type` varchar nullable
+* `view_count` int nullable
+* `edit_date_utc` datetime nullable
+* `is_deleted` bool default false
+* `raw_hash` varchar(64)
+* `ingest_source` varchar
+* `created_at`
+* `updated_at`
+
+유니크 키
+
+* `unique(channel_id, tg_message_id)`
+
+인덱스
+
+* `(channel_id, tg_date_utc desc)`
+* `(tg_date_utc desc)`
+* `(raw_hash)`
+
+포인트
+
+* 이 테이블에서는 **정규화/요약/티커 추출 결과를 넣지 않습니다**
+* 오직 “텔레그램에서 들어온 사실”만 저장합니다
+
+---
+
+## C. `message_versions`
+
+편집 메시지 대응용입니다. 이건 꽤 중요합니다.
+
+주요 컬럼
+
+* `id`
+* `raw_message_id` fk
+* `version_no`
+* `message_text`
+* `edit_date_utc`
+* `raw_hash`
+* `is_current`
+* `created_at`
+
+유니크 키
+
+* `unique(raw_message_id, version_no)`
+
+이유
+
+* 텔레그램 메시지는 수정될 수 있습니다
+* 현재 문서도 편집 메시지 실시간 반영을 이미 요구사항으로 잡고 있습니다. 
+* 그런데 원문을 overwrite만 하면 “예전 분석 결과가 어떤 텍스트 기준이었는지”를 추적할 수 없습니다
+
+따라서 추천 방식은:
+
+* `raw_messages`에는 최신 상태 요약본
+* `message_versions`에는 모든 버전 히스토리
+* 분석은 항상 특정 `version_id`를 기준으로 수행
+
+---
+
+## D. `normalized_messages`
+
+LLM 투입 전의 정제 결과입니다.
+
+주요 컬럼
+
+* `id`
+* `raw_message_id` fk
+* `version_id` fk
+* `normalized_text`
+* `language_code`
+* `cleaning_version`
+* `token_estimate`
+* `is_spam`
+* `spam_reason`
+* `is_duplicate_near`
+* `duplicate_group_key`
+* `quality_score`
+* `created_at`
+
+포인트
+
+* URL 제거 여부
+* 불필요한 공백/이모지 정리
+* 종목명 표기 정규화
+* 숫자/퍼센트/가격 표현 표준화
+* 홍보 문구 제거
+* 토큰 추정치 계산
+
+중요한 점은 **정규화 버전(`cleaning_version`)을 반드시 남기는 것**입니다.
+나중에 정제 규칙이 바뀌면 재실행이 필요하기 때문입니다.
+
+---
+
+## E. `message_features`
+
+규칙 기반/경량 모델 기반 피처 저장소입니다.
+
+주요 컬럼
+
+* `id`
+* `raw_message_id` fk
+* `version_id` fk
+* `normalized_message_id` fk
+* `ticker_candidates_json`
+* `company_alias_hits_json`
+* `theme_candidates_json`
+* `keyword_hits_json`
+* `entity_spans_json`
+* `sentiment_rule_score`
+* `urgency_score`
+* `novelty_score`
+* `source_reliability_score`
+* `feature_version`
+* `created_at`
+
+여기서 `json` 필드는 예를 들면 이런 형태입니다.
+
+```json
+{
+  "tickers": [
+    {"symbol": "005930", "name": "삼성전자", "confidence": 0.92},
+    {"symbol": "000660", "name": "SK하이닉스", "confidence": 0.54}
+  ]
+}
+```
+
+포인트
+
+* LLM에 매번 원문만 던지지 말고, 이런 구조화된 단서를 함께 넘겨야 합니다
+* 한국어 텔레그램 메시지는 별칭, 초성, 줄임말이 많기 때문에 alias 사전이 매우 중요합니다
+
+---
+
+## F. `analysis_jobs`
+
+여기가 핵심입니다. 큐가 아직 없을 때도 이 테이블이 사실상 내부 큐 역할을 합니다.
+
+주요 컬럼
+
+* `id`
+* `job_type`
+
+  * `normalize`
+  * `extract_features`
+  * `single_message_summary`
+  * `window_theme_analysis`
+  * `agent_debate`
+  * `consensus`
+* `target_type`
+
+  * `message`
+  * `window`
+  * `theme_cluster`
+* `target_id`
+* `status`
+
+  * `pending`
+  * `running`
+  * `done`
+  * `failed`
+  * `dead_letter`
+* `priority`
+* `attempt_count`
+* `max_attempts`
+* `scheduled_at`
+* `started_at`
+* `finished_at`
+* `worker_name`
+* `idempotency_key`
+* `error_code`
+* `error_message`
+* `payload_json`
+* `created_at`
+* `updated_at`
+
+유니크 권장
+
+* `unique(job_type, idempotency_key)`
+
+이유
+
+* 지금은 워커가 바로 DB에 쓰는 구조지만, 나중에 LLM 분석이 붙으면 반드시 비동기 작업 단위가 필요합니다
+* 이 테이블만 있어도 초기에는 큐 없이 운영 가능합니다
+* 나중에 RabbitMQ/Redis Streams를 붙이더라도, 이 테이블은 **작업 원장(job ledger)** 으로 계속 살아남는 편이 좋습니다
+
+---
+
+## G. `analysis_results`
+
+LLM 결과 저장 테이블입니다.
+
+주요 컬럼
+
+* `id`
+* `job_id` fk
+* `target_type`
+* `target_id`
+* `model_name`
+* `model_version`
+* `prompt_version`
+* `input_version`
+* `result_type`
+
+  * `summary`
+  * `event_classification`
+  * `theme_relevance`
+  * `risk_flag`
+* `result_json`
+* `confidence`
+* `cost_input_tokens`
+* `cost_output_tokens`
+* `latency_ms`
+* `created_at`
+
+핵심
+
+* LLM 출력은 절대 단일 문자열 컬럼 하나에 넣지 마세요
+* 최소한 JSON 구조로 저장하고, 어떤 모델/프롬프트/입력 버전으로 생성됐는지 남겨야 합니다
+
+그래야
+
+* 모델 교체 비교
+* 프롬프트 A/B 테스트
+* 품질 회귀 검증
+  이 가능합니다.
+
+---
+
+## H. `theme_windows`
+
+Phase 4~5 대비용입니다.
+
+주요 컬럼
+
+* `id`
+* `window_start_utc`
+* `window_end_utc`
+* `channel_scope_json`
+* `message_count`
+* `representative_message_ids_json`
+* `ticker_distribution_json`
+* `keyword_distribution_json`
+* `created_at`
+
+의미
+
+* 멀티에이전트는 보통 “메시지 하나”보다 “짧은 시간 창(window)” 기준이 더 안정적입니다
+* 예: 최근 5분, 15분, 30분 단위
+
+---
+
+## I. `agent_opinions`
+
+각 에이전트의 개별 판단
+
+주요 컬럼
+
+* `id`
+* `window_id` fk
+* `agent_name`
+* `agent_role`
+* `model_name`
+* `prompt_version`
+* `opinion_json`
+* `confidence`
+* `stance`
+* `created_at`
+
+예시 역할
+
+* macro analyst
+* sector analyst
+* trader
+* skeptic
+* risk officer
+
+---
+
+## J. `theme_consensus`
+
+최종 합의 결과
+
+주요 컬럼
+
+* `id`
+* `window_id` fk
+* `consensus_theme`
+* `consensus_score`
+* `bull_points_json`
+* `bear_points_json`
+* `evidence_message_ids_json`
+* `selected_tickers_json`
+* `risk_flags_json`
+* `created_at`
+
+이렇게 해야 나중에
+“왜 이 테마를 뽑았는가”
+를 로그처럼 되짚을 수 있습니다.
+
+---
+
+# 3) 데이터 흐름 권장안
+
+## 현재 단계
+
+`Telethon -> raw_messages 저장 -> analysis_jobs(normalize) 생성`
+
+## Phase 3
+
+`normalize worker -> normalized_messages 저장 -> analysis_jobs(extract_features) 생성`
+
+## Phase 4
+
+`feature worker -> message_features 저장 -> window 집계 -> analysis_jobs(window_theme_analysis) 생성`
+
+## Phase 5
+
+`window 분석 결과 -> agent_opinions 생성 -> consensus job 생성 -> theme_consensus 저장`
+
+즉, 각 단계는 이전 단계 테이블을 직접 덮어쓰지 않고,
+**새로운 산출물 테이블을 추가하는 방식**으로 갑니다.
+
+이 방식이 좋은 이유는:
+
+* 실패 시 재시도 쉬움
+* 특정 단계만 재실행 가능
+* 모델 바뀌어도 원문 재수집 불필요
+* 디버깅이 쉬움
+
+---
+
+# 4) 워커/API/추론 워커 간 세션 구조 권장안
+
+문서상 API는 `Depends(get_db)`로 잘 정리돼 있고, 워커는 자체 세션 컨텍스트를 쓰고 있습니다. 이 자체는 괜찮습니다. 다만 다음 단계에서는 세션 생명주기 규칙을 더 명확히 해야 합니다.  
+
+권장 규칙은 이렇습니다.
+
+## API 서버
+
+* 요청당 1세션
+* read-heavy
+* 가능한 짧게 종료
+
+## Collector Worker
+
+* 배치당 1세션
+* 네트워크 대기 중 세션 오래 물고 있지 않기
+* 100건 단위 커밋 유지
+
+## Preprocess Worker
+
+* job 1개 또는 소배치당 1세션
+* `analysis_jobs`에서 pending 읽고 running으로 전환 후 처리
+
+## LLM Worker
+
+* 외부 모델 호출 전 DB 세션 종료
+* 결과 저장 시 새 세션 열기
+
+특히 LLM 워커는
+**세션을 연 상태로 모델 응답을 기다리면 안 됩니다.**
+
+가장 안전한 패턴은:
+
+1. job claim
+2. 세션 종료
+3. 전처리/LLM 호출
+4. 새 세션 열어 결과 저장
+5. job done 처리
+
+입니다.
+
+---
+
+# 5) 지금 바로 넣으면 좋은 상태 머신
+
+## `analysis_jobs.status`
+
+* `pending`
+* `running`
+* `done`
+* `failed`
+* `dead_letter`
+
+## 재시도 규칙 예시
+
+* 네트워크/모델 일시 실패: 최대 3회
+* 포맷 오류: 1회 후 dead_letter
+* 입력 데이터 없음: done with skipped flag
+
+## 추가 컬럼
+
+* `last_heartbeat_at`
+* `lease_expires_at`
+
+이걸 넣으면 워커가 죽었을 때
+`running` 상태의 job을 다시 살릴 수 있습니다.
+
+---
+
+# 6) 큐 도입 전환도 이 스키마로 자연스럽게 가능
+
+## 지금
+
+DB 기반 job queue
+
+* `analysis_jobs`를 polling
+* 가장 단순
+* 디버깅 쉬움
+
+## 트래픽 증가 후
+
+메시지 브로커 추가
+
+* Collector는 `analysis_jobs` 기록 + MQ publish
+* Worker는 MQ consume
+* 최종 상태는 여전히 DB 기록
+
+즉, 큐를 붙여도 스키마를 갈아엎지 않습니다.
+이게 중요합니다.
+
+추천 기준은 이렇습니다.
+
+### DB job queue로 버텨도 되는 구간
+
+* 전처리 워커 1~2개
+* LLM 호출량이 제한적
+* 지연이 수십 초 수준이어도 괜찮음
+
+### MQ 도입 고려 구간
+
+* pending job이 지속적으로 누적
+* 분석 backlog가 장시간 해소되지 않음
+* 수집과 분석이 서로 간섭
+* 다중 워커 수평 확장이 필요
+
+현재 문서 기준으로는 아직 “수집 기반 완성 + 전처리 진입 직전”이라서,
+**바로 RabbitMQ를 넣기보다 DB job queue부터 시작**하는 것이 더 현실적입니다.  
+
+---
+
+# 7) LLM 정확도를 위해 전처리에서 꼭 넣어야 할 것
+
+형태소 분석 자체보다 먼저 아래가 중요합니다.
+
+## 필수
+
+* URL/초대링크 제거
+* 반복 이모지/장식어 제거
+* 종목명 alias 사전
+* 테마 사전
+* 숫자 표현 표준화
+* near-duplicate 제거
+* 채널 신뢰도 priors
+
+## 있으면 좋은 것
+
+* “급등/상한/수주/승인/실적/공급계약” 같은 이벤트 taxonomy
+* 시간창 기준 burst score
+* 동일 종목 반복 언급량
+* 채널 간 확산 속도
+
+즉, LLM 입력은 이런 식이 좋습니다.
+
+```json
+{
+  "normalized_text": "...",
+  "ticker_candidates": ["005930", "000660"],
+  "theme_candidates": ["반도체", "HBM"],
+  "channel_reliability": 0.81,
+  "novelty_score": 0.74,
+  "evidence_context": [
+    "최근 10분간 동일 테마 언급 18건",
+    "상위 신뢰 채널 3곳 동시 언급"
+  ]
+}
+```
+
+이렇게 구조화해두면 프롬프트 길이가 줄고, 추론 품질도 더 안정됩니다.
+
+---
+
+# 8) 지금 기준으로 가장 추천하는 구현 순서
+
+## Step 1
+
+기존 `Message` 테이블을 “원문 저장소” 역할로 명확히 고정
+
+## Step 2
+
+`message_versions`, `normalized_messages`, `message_features` 추가
+
+## Step 3
+
+`analysis_jobs`, `analysis_results` 추가
+
+## Step 4
+
+DB polling 기반 preprocess worker 1개 구현
+
+## Step 5
+
+단일 메시지 요약보다 먼저
+“5분 또는 15분 window 기반 theme analysis” 구현
+
+## Step 6
+
+그 다음에 `agent_opinions`, `theme_consensus` 추가
+
+이 순서가 좋은 이유는,
+멀티에이전트보다 먼저 **데이터 품질과 분석 단위**를 안정화할 수 있기 때문입니다.
+
+---
+
+# 9) 지금 바로 적용 가능한 최소 스키마 세트
+
+처음부터 너무 크게 가지 않으려면 아래 5개만 먼저 추가해도 됩니다.
+
+* `message_versions`
+* `normalized_messages`
+* `message_features`
+* `analysis_jobs`
+* `analysis_results`
+
+이 5개만 있어도
+
+* 편집 메시지 대응
+* 전처리 재실행
+* LLM 재분석
+* 작업 실패 복구
+* 모델/프롬프트 버전 관리
+  가 다 가능합니다.
+
+---
+

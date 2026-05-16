@@ -1,0 +1,519 @@
+좋습니다. 그럼 바로 **`tests/workers/test_scheduler_worker.py` 전체 초안**으로 정리하겠습니다.
+
+이번 초안은 앞서 정리한 구조를 그대로 전제로 합니다.
+
+* `AnalysisJobService.requeue_stuck_jobs()`
+* `AnalysisJobService.mark_dead_jobs()`
+* `AnalysisJob` 모델에 아래 필드 존재
+
+  * `message_id`
+  * `job_type`
+  * `status`
+  * `attempt_count`
+  * `max_attempts`
+  * `last_error`
+  * `created_at`
+  * `started_at`
+  * `finished_at`
+  * `heartbeat_at`
+
+그리고 테스트는 **2가지 방식 중 하나**로 쓸 수 있습니다.
+
+1. `SchedulerWorker` 가 아직 얇은 wrapper 이면 → `AnalysisJobService` 를 직접 테스트
+2. 이미 `SchedulerWorker` 클래스가 있으면 → worker 메서드를 호출하는 방식으로 감싸기
+
+일단은 **지금 바로 붙이기 쉬운 형태**로 `job_service` 직접 호출 기준으로 드리겠습니다.
+마지막에 `SchedulerWorker` wrapper 형태도 같이 적어드리겠습니다.
+
+---
+
+# 1) 권장 파일 위치
+
+```text
+tests/
+  workers/
+    test_scheduler_worker.py
+```
+
+---
+
+# 2) `tests/workers/test_scheduler_worker.py` 전체 초안
+
+```python
+from datetime import datetime, timedelta
+
+from src.models.analysis_job import AnalysisJob
+from src.services.analysis_job_service import JobStatus
+
+
+def make_job(
+    session,
+    *,
+    message_id: int,
+    job_type: str = "SINGLE_MESSAGE_SUMMARY",
+    status: str = JobStatus.PENDING,
+    attempt_count: int = 0,
+    max_attempts: int = 3,
+    created_at: datetime | None = None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+    heartbeat_at: datetime | None = None,
+    last_error: str | None = None,
+    payload: dict | None = None,
+):
+    now = datetime.utcnow()
+    job = AnalysisJob(
+        message_id=message_id,
+        job_type=job_type,
+        status=status,
+        payload=payload,
+        attempt_count=attempt_count,
+        max_attempts=max_attempts,
+        last_error=last_error,
+        created_at=created_at or now,
+        started_at=started_at,
+        finished_at=finished_at,
+        heartbeat_at=heartbeat_at,
+    )
+    session.add(job)
+    session.flush()
+    return job
+
+
+def test_requeue_stuck_running_job_to_retry_pending(
+    db_session_factory,
+    job_service,
+):
+    old_started_at = datetime.utcnow() - timedelta(minutes=30)
+
+    with db_session_factory() as session:
+        job = make_job(
+            session,
+            message_id=101,
+            job_type="SINGLE_MESSAGE_SUMMARY",
+            status=JobStatus.RUNNING,
+            attempt_count=1,
+            max_attempts=3,
+            started_at=old_started_at,
+            last_error=None,
+        )
+        job_id = job.id
+        session.commit()
+
+    updated_count = job_service.requeue_stuck_jobs(
+        job_type="SINGLE_MESSAGE_SUMMARY",
+        timeout_seconds=600,
+    )
+    assert updated_count == 1
+
+    with db_session_factory() as session:
+        updated = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == job_id)
+            .one()
+        )
+        assert updated.status == JobStatus.RETRY_PENDING
+        assert updated.finished_at is not None
+        assert updated.last_error is not None
+        assert "stuck job recovered by scheduler" in updated.last_error
+
+
+def test_requeue_stuck_running_job_to_dead_when_max_attempts_exceeded(
+    db_session_factory,
+    job_service,
+):
+    old_started_at = datetime.utcnow() - timedelta(minutes=30)
+
+    with db_session_factory() as session:
+        job = make_job(
+            session,
+            message_id=102,
+            job_type="SINGLE_MESSAGE_SUMMARY",
+            status=JobStatus.RUNNING,
+            attempt_count=3,
+            max_attempts=3,
+            started_at=old_started_at,
+            last_error="previous failure",
+        )
+        job_id = job.id
+        session.commit()
+
+    updated_count = job_service.requeue_stuck_jobs(
+        job_type="SINGLE_MESSAGE_SUMMARY",
+        timeout_seconds=600,
+    )
+    assert updated_count == 1
+
+    with db_session_factory() as session:
+        updated = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == job_id)
+            .one()
+        )
+        assert updated.status == JobStatus.DEAD
+        assert updated.finished_at is not None
+        # 기존 에러가 있으면 그대로 유지되는지 확인
+        assert updated.last_error == "previous failure"
+
+
+def test_requeue_stuck_jobs_does_not_touch_fresh_running_job(
+    db_session_factory,
+    job_service,
+):
+    fresh_started_at = datetime.utcnow() - timedelta(seconds=120)
+
+    with db_session_factory() as session:
+        job = make_job(
+            session,
+            message_id=103,
+            job_type="SINGLE_MESSAGE_SUMMARY",
+            status=JobStatus.RUNNING,
+            attempt_count=1,
+            max_attempts=3,
+            started_at=fresh_started_at,
+            last_error=None,
+        )
+        job_id = job.id
+        session.commit()
+
+    updated_count = job_service.requeue_stuck_jobs(
+        job_type="SINGLE_MESSAGE_SUMMARY",
+        timeout_seconds=600,
+    )
+    assert updated_count == 0
+
+    with db_session_factory() as session:
+        unchanged = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == job_id)
+            .one()
+        )
+        assert unchanged.status == JobStatus.RUNNING
+        assert unchanged.finished_at is None
+        assert unchanged.last_error is None
+
+
+def test_requeue_stuck_jobs_only_targets_requested_job_type(
+    db_session_factory,
+    job_service,
+):
+    old_started_at = datetime.utcnow() - timedelta(minutes=30)
+
+    with db_session_factory() as session:
+        target_job = make_job(
+            session,
+            message_id=104,
+            job_type="SINGLE_MESSAGE_SUMMARY",
+            status=JobStatus.RUNNING,
+            attempt_count=1,
+            max_attempts=3,
+            started_at=old_started_at,
+        )
+        other_job = make_job(
+            session,
+            message_id=105,
+            job_type="NORMALIZE",
+            status=JobStatus.RUNNING,
+            attempt_count=1,
+            max_attempts=3,
+            started_at=old_started_at,
+        )
+        target_job_id = target_job.id
+        other_job_id = other_job.id
+        session.commit()
+
+    updated_count = job_service.requeue_stuck_jobs(
+        job_type="SINGLE_MESSAGE_SUMMARY",
+        timeout_seconds=600,
+    )
+    assert updated_count == 1
+
+    with db_session_factory() as session:
+        target_updated = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == target_job_id)
+            .one()
+        )
+        other_unchanged = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == other_job_id)
+            .one()
+        )
+
+        assert target_updated.status == JobStatus.RETRY_PENDING
+        assert other_unchanged.status == JobStatus.RUNNING
+
+
+def test_mark_dead_jobs_converts_retry_pending_to_dead_when_attempts_exceeded(
+    db_session_factory,
+    job_service,
+):
+    with db_session_factory() as session:
+        dead_candidate = make_job(
+            session,
+            message_id=106,
+            job_type="SINGLE_MESSAGE_SUMMARY",
+            status=JobStatus.RETRY_PENDING,
+            attempt_count=3,
+            max_attempts=3,
+            last_error="mock llm timeout",
+        )
+        safe_job = make_job(
+            session,
+            message_id=107,
+            job_type="SINGLE_MESSAGE_SUMMARY",
+            status=JobStatus.RETRY_PENDING,
+            attempt_count=2,
+            max_attempts=3,
+            last_error="temporary issue",
+        )
+        dead_candidate_id = dead_candidate.id
+        safe_job_id = safe_job.id
+        session.commit()
+
+    updated_count = job_service.mark_dead_jobs()
+    assert updated_count == 1
+
+    with db_session_factory() as session:
+        dead_job = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == dead_candidate_id)
+            .one()
+        )
+        still_retry = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == safe_job_id)
+            .one()
+        )
+
+        assert dead_job.status == JobStatus.DEAD
+        assert still_retry.status == JobStatus.RETRY_PENDING
+
+
+def test_mark_dead_jobs_converts_failed_to_dead_when_attempts_exceeded(
+    db_session_factory,
+    job_service,
+):
+    with db_session_factory() as session:
+        failed_job = make_job(
+            session,
+            message_id=108,
+            job_type="SINGLE_MESSAGE_SUMMARY",
+            status=JobStatus.FAILED,
+            attempt_count=5,
+            max_attempts=5,
+            last_error="non-retryable parse error",
+        )
+        failed_job_id = failed_job.id
+        session.commit()
+
+    updated_count = job_service.mark_dead_jobs()
+    assert updated_count == 1
+
+    with db_session_factory() as session:
+        updated = (
+            session.query(AnalysisJob)
+            .filter(AnalysisJob.id == failed_job_id)
+            .one()
+        )
+        assert updated.status == JobStatus.DEAD
+        assert updated.last_error == "non-retryable parse error"
+```
+
+---
+
+# 3) 이 테스트 파일에서 핵심적으로 고정되는 계약
+
+위 테스트는 아래 동작을 강제로 고정합니다.
+
+### `requeue_stuck_jobs()`
+
+* 오래된 `RUNNING` job 만 대상으로 잡음
+* `attempt_count < max_attempts` 면 `RETRY_PENDING`
+* `attempt_count >= max_attempts` 면 `DEAD`
+* `job_type` 필터가 있으면 해당 타입만 처리
+* 아직 timeout 안 지난 `RUNNING` job 은 건드리지 않음
+
+### `mark_dead_jobs()`
+
+* `FAILED` 또는 `RETRY_PENDING`
+* 그리고 `attempt_count >= max_attempts`
+* 이 조건이면 `DEAD` 로 바꿈
+
+즉, scheduler 계층의 핵심 복구 정책이 테스트로 고정됩니다.
+
+---
+
+# 4) 2~3개만 먼저 붙이고 싶다면 최소 세트
+
+이전에 말씀하신 것처럼 **2~3개만 먼저 붙이려면** 아래 3개가 가장 우선입니다.
+
+## 필수 1
+
+```python
+test_requeue_stuck_running_job_to_retry_pending
+```
+
+## 필수 2
+
+```python
+test_requeue_stuck_running_job_to_dead_when_max_attempts_exceeded
+```
+
+## 필수 3
+
+```python
+test_requeue_stuck_jobs_does_not_touch_fresh_running_job
+```
+
+이 3개만 있어도 scheduler 핵심 로직은 대부분 커버됩니다.
+
+---
+
+# 5) `SchedulerWorker` 클래스가 이미 있다면 이렇게 감싸면 됩니다
+
+만약 실제 프로젝트에 `SchedulerWorker` 가 있고, 내부에서 `job_service` 를 호출하는 구조라면 테스트 호출부만 아래처럼 바꾸면 됩니다.
+
+예를 들어 worker 가 이렇게 생겼다고 가정하면:
+
+```python
+class SchedulerWorker:
+    def __init__(self, job_service):
+        self.job_service = job_service
+
+    def requeue_stuck_jobs(self, job_type=None, timeout_seconds=600):
+        return self.job_service.requeue_stuck_jobs(
+            job_type=job_type,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def mark_dead_jobs(self):
+        return self.job_service.mark_dead_jobs()
+```
+
+그럼 fixture 하나 추가:
+
+```python
+import pytest
+from src.workers.scheduler_worker import SchedulerWorker
+
+
+@pytest.fixture
+def scheduler_worker(job_service):
+    return SchedulerWorker(job_service=job_service)
+```
+
+그리고 테스트에서 아래처럼만 바꾸면 됩니다.
+
+```python
+updated_count = scheduler_worker.requeue_stuck_jobs(
+    job_type="SINGLE_MESSAGE_SUMMARY",
+    timeout_seconds=600,
+)
+```
+
+또는
+
+```python
+updated_count = scheduler_worker.mark_dead_jobs()
+```
+
+즉, **현재 드린 테스트는 `job_service` 직접 호출 버전이고, wrapper 가 있으면 호출자만 바꾸면 됩니다.**
+
+---
+
+# 6) 만약 `heartbeat_at` 기준으로 복구하고 싶다면
+
+지금 초안은 `started_at` 기준입니다.
+그런데 장기 작업에서는 `heartbeat_at` 기반이 더 낫습니다.
+
+그 경우 서비스 메서드가 이런 식으로 바뀔 수 있습니다.
+
+```python
+AnalysisJob.heartbeat_at.isnot(None),
+AnalysisJob.heartbeat_at < threshold,
+```
+
+그러면 테스트도 `started_at` 대신 `heartbeat_at` 을 세팅해서 검증하면 됩니다.
+
+예:
+
+```python
+job = make_job(
+    session,
+    message_id=101,
+    status=JobStatus.RUNNING,
+    attempt_count=1,
+    max_attempts=3,
+    started_at=datetime.utcnow() - timedelta(minutes=40),
+    heartbeat_at=datetime.utcnow() - timedelta(minutes=30),
+)
+```
+
+초기에는 `started_at` 기준도 충분하지만, inference 시간이 길어질 가능성이 크면 나중에 `heartbeat_at` 로 확장하는 편이 좋습니다.
+
+---
+
+# 7) 처음 실행할 때 흔히 깨지는 포인트
+
+이 테스트를 붙였을 때 흔히 바로 걸리는 건 아래입니다.
+
+## 1. `AnalysisJob.payload` 컬럼 없음
+
+`make_job()` 에서 `payload` 를 넣으므로 모델에 컬럼이 없으면 제거하거나 컬럼 추가가 필요합니다.
+
+## 2. `mark_dead_jobs()` 메서드 미구현
+
+앞서 `AnalysisJobService` 초안에 들어갔지만, 실제 코드에 아직 안 붙였으면 여기서 깨집니다.
+
+## 3. `JobStatus` import 경로 다름
+
+현재는
+
+```python
+from src.services.analysis_job_service import JobStatus
+```
+
+로 썼습니다.
+
+별도 enum 파일로 뺐다면 그 경로로 바꾸면 됩니다.
+
+## 4. SQLite에서 datetime 비교 이슈
+
+보통은 괜찮지만, timezone-aware datetime 과 naive datetime 이 섞이면 문제될 수 있습니다.
+초기 테스트는 `datetime.utcnow()` 로 통일하는 편이 안전합니다.
+
+---
+
+# 8) 지금 단계에서 가장 자연스러운 마무리 순서
+
+이제 실제 적용 순서는 이렇게 가는 게 가장 좋습니다.
+
+1. `test_pipeline_flow.py` 붙이기
+2. 지금 드린 `test_scheduler_worker.py` 붙이기
+3. `AnalysisJobService` / worker / model mismatch 수정
+4. happy path 통과
+5. scheduler 테스트 통과
+6. 마지막으로 `retry 후 성공` 테스트 추가
+
+---
+
+# 9) 다음으로 붙이기 좋은 테스트 하나
+
+이제 다음 한 개만 더 붙이면 파이프라인 안정성이 더 좋아집니다.
+
+`test_inference_retry_then_success`
+
+흐름은 이렇습니다.
+
+1. 첫 inference 실패
+2. job 이 `RETRY_PENDING`
+3. 다시 inference worker 실행
+4. 두 번째 성공
+5. 최종 summary row 는 1건만 존재
+6. job `attempt_count == 2`
+
+이 테스트가 붙으면 재시도 경로까지 거의 완성됩니다.
+
+원하시면 다음 답변에서 바로
+**`retry 후 성공` 통합 테스트 초안 1개**까지 이어서 적어드리겠습니다.

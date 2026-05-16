@@ -1,0 +1,656 @@
+좋습니다. 이어서 **`tests/workers/test_inference_worker.py` 전체 초안**을 드리겠습니다.
+
+이 파일의 목적은 아래를 검증하는 것입니다.
+
+* `InferenceWorker.run_once()`가 `single_message_summary` job을 정상 소비하는지
+* `NormalizedMessage + MessageFeature`를 읽어서 `AnalysisResult`를 생성하는지
+* job이 `DONE`으로 끝나는지
+* 입력 누락/LLM 오류 시 `FAILED` 또는 `DEAD_LETTER`로 전이되는지
+* `WINDOW_THEME_ANALYSIS` placeholder 경로도 최소한 깨지지 않는지
+
+아래 코드는 **앞서 제안한 `InferenceWorker` 골격 기준**입니다.
+실제 프로젝트에 맞게 import 경로, enum/string 비교, fixture 공용화 정도만 조정하시면 됩니다.
+
+```python
+# tests/workers/test_inference_worker.py
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+import pytest
+import pytest_asyncio
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import StaticPool
+
+# 실제 프로젝트 경로에 맞게 조정 필요
+from src.infra.db.base import Base
+from src.infra.db.models import (
+    AnalysisJob,
+    AnalysisResult,
+    Channel,
+    JobStatus,
+    JobTargetType,
+    JobType,
+    Message,
+    MessageFeature,
+    MessageVersion,
+    NormalizedMessage,
+    ResultType,
+)
+from src.services.analysis_job_service import AnalysisJobService
+from src.workers.inference_worker import InferenceWorker
+
+
+UTC = timezone.utc
+
+
+def aware_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+# =========================
+# Test DB Fixtures
+# =========================
+
+@pytest_asyncio.fixture
+async def engine():
+    engine = create_async_engine(
+        "sqlite+aiosqlite://",
+        future=True,
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session_factory(engine):
+    return async_sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+        autocommit=False,
+    )
+
+
+@pytest_asyncio.fixture
+async def async_session(session_factory):
+    async with session_factory() as session:
+        yield session
+        await session.rollback()
+
+
+# =========================
+# Domain Fixtures
+# =========================
+
+@pytest_asyncio.fixture
+async def channel(async_session: AsyncSession) -> Channel:
+    item = Channel(
+        tg_channel_id=222333444,
+        title="추론 테스트 채널",
+        username="inference_test_channel",
+        is_collecting=True,
+        status="ACTIVE",
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+@pytest_asyncio.fixture
+async def message(async_session: AsyncSession, channel: Channel) -> Message:
+    item = Message(
+        channel_id=channel.id,
+        tg_message_id=5001,
+        tg_date_utc=aware_dt("2026-03-22T09:00:00+00:00"),
+        message_text="속보 삼성전자 005930 반도체 수주 확대 기대",
+        edit_date_utc=None,
+        raw_hash="rawhash-message-1",
+        is_deleted=False,
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+@pytest_asyncio.fixture
+async def message_version(async_session: AsyncSession, message: Message) -> MessageVersion:
+    item = MessageVersion(
+        message_id=message.id,
+        version_no=1,
+        message_text=message.message_text,
+        raw_hash="versionhash-1",
+        edit_date_utc=None,
+        is_current=True,
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+@pytest_asyncio.fixture
+async def normalized_message(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+) -> NormalizedMessage:
+    item = NormalizedMessage(
+        message_id=message.id,
+        version_id=message_version.id,
+        cleaning_version="v1",
+        normalized_text="속보 삼성전자 005930 반도체 수주 확대 기대",
+        language_code="ko",
+        token_estimate=12,
+        is_spam=False,
+        spam_reason=None,
+        is_duplicate_near=False,
+        duplicate_group_key="dupkey-summary-1",
+        quality_score=0.85,
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+@pytest_asyncio.fixture
+async def message_feature(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+) -> MessageFeature:
+    item = MessageFeature(
+        message_id=message.id,
+        version_id=message_version.id,
+        normalized_message_id=normalized_message.id,
+        feature_version="v1",
+        ticker_candidates_json={
+            "tickers": [
+                {"symbol": "005930", "confidence": 0.93},
+            ]
+        },
+        company_alias_hits_json=None,
+        theme_candidates_json={
+            "themes": [
+                {"theme": "반도체", "confidence": 0.88},
+            ]
+        },
+        keyword_hits_json={
+            "keywords": ["속보", "반도체", "수주"],
+        },
+        entity_spans_json=None,
+        sentiment_rule_score=0.6,
+        urgency_score=0.8,
+        novelty_score=0.5,
+        source_reliability_score=0.5,
+    )
+    async_session.add(item)
+    await async_session.commit()
+    await async_session.refresh(item)
+    return item
+
+
+# =========================
+# Helper Functions
+# =========================
+
+async def count_rows(async_session: AsyncSession, model) -> int:
+    return int(await async_session.scalar(select(func.count()).select_from(model)) or 0)
+
+
+async def get_job(async_session: AsyncSession, job_id: int) -> AnalysisJob | None:
+    return await async_session.get(AnalysisJob, job_id)
+
+
+async def get_latest_result(async_session: AsyncSession, job_id: int) -> AnalysisResult | None:
+    return await async_session.scalar(
+        select(AnalysisResult)
+        .where(AnalysisResult.job_id == job_id)
+        .order_by(AnalysisResult.id.desc())
+    )
+
+
+async def get_jobs_by_type(async_session: AsyncSession, job_type: JobType) -> list[AnalysisJob]:
+    result = await async_session.scalars(
+        select(AnalysisJob)
+        .where(AnalysisJob.job_type == job_type)
+        .order_by(AnalysisJob.id.asc())
+    )
+    return list(result)
+
+
+async def seed_single_message_summary_job(
+    async_session: AsyncSession,
+    *,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+    message_feature: MessageFeature,
+    max_attempts: int = 3,
+) -> AnalysisJob:
+    job = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.SINGLE_MESSAGE_SUMMARY,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=f"single_message_summary:message:{message.id}:version:{message_version.id}:sv1",
+        payload_json={
+            "message_id": message.id,
+            "version_id": message_version.id,
+            "normalized_message_id": normalized_message.id,
+            "feature_id": message_feature.id,
+        },
+        priority=200,
+        max_attempts=max_attempts,
+    )
+    await async_session.commit()
+    return job
+
+
+async def seed_window_theme_analysis_job(
+    async_session: AsyncSession,
+    *,
+    target_id: int = 999,
+) -> AnalysisJob:
+    job = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.WINDOW_THEME_ANALYSIS,
+        target_type=JobTargetType.WINDOW,
+        target_id=target_id,
+        idempotency_key=f"window_theme_analysis:window:{target_id}:wv1",
+        payload_json={"window_id": target_id},
+        priority=300,
+        max_attempts=3,
+    )
+    await async_session.commit()
+    return job
+
+
+# =========================
+# Tests
+# =========================
+
+@pytest.mark.asyncio
+async def test_run_once_returns_false_when_no_job(async_session: AsyncSession):
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+
+    handled = await worker.run_once()
+
+    assert handled is False
+
+
+@pytest.mark.asyncio
+async def test_single_message_summary_creates_result_and_marks_job_done(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+    message_feature: MessageFeature,
+    monkeypatch,
+):
+    job = await seed_single_message_summary_job(
+        async_session,
+        message=message,
+        message_version=message_version,
+        normalized_message=normalized_message,
+        message_feature=message_feature,
+    )
+
+    async def fake_llm(_self, prompt_input: dict) -> dict:
+        assert prompt_input["normalized_text"] == "속보 삼성전자 005930 반도체 수주 확대 기대"
+        return {
+            "summary": "삼성전자 반도체 수주 확대 기대감 요약",
+            "event_type": "contract_expectation",
+            "confidence": 0.91,
+            "input_tokens": 33,
+            "output_tokens": 55,
+            "latency_ms": 420,
+            "evidence": {
+                "tickers": prompt_input["ticker_candidates"],
+                "themes": prompt_input["theme_candidates"],
+            },
+        }
+
+    monkeypatch.setattr(InferenceWorker, "_fake_llm_summarize", fake_llm)
+
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+    handled = await worker.run_once()
+
+    assert handled is True
+
+    result_count = await count_rows(async_session, AnalysisResult)
+    stored_job = await get_job(async_session, job.id)
+    stored_result = await get_latest_result(async_session, job.id)
+
+    assert result_count == 1
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.DONE
+
+    assert stored_result is not None
+    assert stored_result.job_id == job.id
+    assert stored_result.target_type == JobTargetType.MESSAGE
+    assert stored_result.target_id == message.id
+    assert stored_result.result_type == ResultType.SUMMARY
+    assert stored_result.prompt_version == "summary_v1"
+    assert stored_result.input_version == "normalize_v1_feature_v1"
+    assert stored_result.confidence == 0.91
+    assert stored_result.latency_ms == 420
+    assert stored_result.cost_input_tokens == 33
+    assert stored_result.cost_output_tokens == 55
+    assert stored_result.result_json["summary"] == "삼성전자 반도체 수주 확대 기대감 요약"
+    assert stored_result.result_json["event_type"] == "contract_expectation"
+
+
+@pytest.mark.asyncio
+async def test_single_message_summary_missing_normalized_marks_dead_letter_when_max_attempts_one(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    message_feature: MessageFeature,
+):
+    job = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.SINGLE_MESSAGE_SUMMARY,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=f"single_message_summary:message:{message.id}:missing-normalized",
+        payload_json={
+            "message_id": message.id,
+            "version_id": message_version.id,
+            "normalized_message_id": 999999,
+            "feature_id": message_feature.id,
+        },
+        priority=200,
+        max_attempts=1,
+    )
+    await async_session.commit()
+
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+    handled = await worker.run_once()
+
+    assert handled is True
+
+    stored_job = await get_job(async_session, job.id)
+    result_count = await count_rows(async_session, AnalysisResult)
+
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.DEAD_LETTER
+    assert stored_job.error_code == "INFERENCE_INPUT_NOT_FOUND"
+    assert result_count == 0
+
+
+@pytest.mark.asyncio
+async def test_single_message_summary_missing_feature_marks_dead_letter_when_max_attempts_one(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+):
+    job = await AnalysisJobService.enqueue_job(
+        async_session,
+        job_type=JobType.SINGLE_MESSAGE_SUMMARY,
+        target_type=JobTargetType.MESSAGE,
+        target_id=message.id,
+        idempotency_key=f"single_message_summary:message:{message.id}:missing-feature",
+        payload_json={
+            "message_id": message.id,
+            "version_id": message_version.id,
+            "normalized_message_id": normalized_message.id,
+            "feature_id": 999999,
+        },
+        priority=200,
+        max_attempts=1,
+    )
+    await async_session.commit()
+
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+    handled = await worker.run_once()
+
+    assert handled is True
+
+    stored_job = await get_job(async_session, job.id)
+    result_count = await count_rows(async_session, AnalysisResult)
+
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.DEAD_LETTER
+    assert stored_job.error_code == "INFERENCE_INPUT_NOT_FOUND"
+    assert result_count == 0
+
+
+@pytest.mark.asyncio
+async def test_single_message_summary_llm_exception_requeues_when_attempts_remain(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+    message_feature: MessageFeature,
+    monkeypatch,
+):
+    job = await seed_single_message_summary_job(
+        async_session,
+        message=message,
+        message_version=message_version,
+        normalized_message=normalized_message,
+        message_feature=message_feature,
+        max_attempts=3,
+    )
+
+    async def broken_llm(_self, prompt_input: dict) -> dict:
+        raise RuntimeError("temporary llm outage")
+
+    monkeypatch.setattr(InferenceWorker, "_fake_llm_summarize", broken_llm)
+
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+    handled = await worker.run_once()
+
+    assert handled is True
+
+    stored_job = await get_job(async_session, job.id)
+    result_count = await count_rows(async_session, AnalysisResult)
+
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.PENDING
+    assert stored_job.error_code == "INFERENCE_ERROR"
+    assert "temporary llm outage" in (stored_job.error_message or "")
+    assert result_count == 0
+
+
+@pytest.mark.asyncio
+async def test_single_message_summary_llm_exception_dead_letters_when_attempts_exhausted(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+    message_feature: MessageFeature,
+    monkeypatch,
+):
+    job = await seed_single_message_summary_job(
+        async_session,
+        message=message,
+        message_version=message_version,
+        normalized_message=normalized_message,
+        message_feature=message_feature,
+        max_attempts=1,
+    )
+
+    async def broken_llm(_self, prompt_input: dict) -> dict:
+        raise RuntimeError("permanent llm failure")
+
+    monkeypatch.setattr(InferenceWorker, "_fake_llm_summarize", broken_llm)
+
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+    handled = await worker.run_once()
+
+    assert handled is True
+
+    stored_job = await get_job(async_session, job.id)
+    result_count = await count_rows(async_session, AnalysisResult)
+
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.DEAD_LETTER
+    assert stored_job.error_code == "INFERENCE_ERROR"
+    assert "permanent llm failure" in (stored_job.error_message or "")
+    assert result_count == 0
+
+
+@pytest.mark.asyncio
+async def test_window_theme_analysis_placeholder_marks_done(
+    async_session: AsyncSession,
+):
+    job = await seed_window_theme_analysis_job(
+        async_session,
+        target_id=321,
+    )
+
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+    handled = await worker.run_once()
+
+    assert handled is True
+
+    stored_job = await get_job(async_session, job.id)
+    assert stored_job is not None
+    assert stored_job.status == JobStatus.DONE
+
+
+@pytest.mark.asyncio
+async def test_job_type_filter_only_claims_selected_types(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+    message_feature: MessageFeature,
+    monkeypatch,
+):
+    summary_job = await seed_single_message_summary_job(
+        async_session,
+        message=message,
+        message_version=message_version,
+        normalized_message=normalized_message,
+        message_feature=message_feature,
+    )
+    window_job = await seed_window_theme_analysis_job(
+        async_session,
+        target_id=777,
+    )
+
+    async def fake_llm(_self, prompt_input: dict) -> dict:
+        return {
+            "summary": "요약",
+            "event_type": "unknown",
+            "confidence": 0.7,
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "latency_ms": 100,
+            "evidence": {},
+        }
+
+    monkeypatch.setattr(InferenceWorker, "_fake_llm_summarize", fake_llm)
+
+    worker = InferenceWorker(
+        worker_name="test-inference",
+        poll_interval=0.01,
+        job_types=["single_message_summary"],
+    )
+    handled = await worker.run_once()
+
+    assert handled is True
+
+    stored_summary = await get_job(async_session, summary_job.id)
+    stored_window = await get_job(async_session, window_job.id)
+
+    assert stored_summary is not None
+    assert stored_summary.status == JobStatus.DONE
+
+    assert stored_window is not None
+    assert stored_window.status == JobStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_single_message_summary_creates_only_one_result_per_processed_job(
+    async_session: AsyncSession,
+    message: Message,
+    message_version: MessageVersion,
+    normalized_message: NormalizedMessage,
+    message_feature: MessageFeature,
+    monkeypatch,
+):
+    await seed_single_message_summary_job(
+        async_session,
+        message=message,
+        message_version=message_version,
+        normalized_message=normalized_message,
+        message_feature=message_feature,
+    )
+
+    async def fake_llm(_self, prompt_input: dict) -> dict:
+        return {
+            "summary": "단일 결과",
+            "event_type": "unknown",
+            "confidence": 0.66,
+            "input_tokens": 11,
+            "output_tokens": 21,
+            "latency_ms": 120,
+            "evidence": {},
+        }
+
+    monkeypatch.setattr(InferenceWorker, "_fake_llm_summarize", fake_llm)
+
+    worker = InferenceWorker(worker_name="test-inference", poll_interval=0.01)
+
+    handled1 = await worker.run_once()
+    handled2 = await worker.run_once()
+
+    assert handled1 is True
+    assert handled2 is False
+
+    result_count = await count_rows(async_session, AnalysisResult)
+    summary_jobs = await get_jobs_by_type(async_session, JobType.SINGLE_MESSAGE_SUMMARY)
+
+    assert result_count == 1
+    assert len(summary_jobs) == 1
+    assert summary_jobs[0].status == JobStatus.DONE
+```
+
+### 이 파일에서 실제 프로젝트에 맞춰 조정할 부분
+
+가장 가능성이 높은 수정 포인트는 아래입니다.
+
+`Channel`, `Message` 생성 시 필수 컬럼이 실제 모델과 다를 수 있습니다.
+`JobType`, `JobStatus`, `JobTargetType`, `ResultType`가 enum이 아니라 문자열이면 비교식을 문자열 기준으로 바꿔야 합니다.
+프로젝트에 공용 `conftest.py` fixture가 있다면 이 파일의 DB fixture는 제거하고 공용 fixture를 쓰는 편이 더 좋습니다.
+현재 `InferenceWorker`가 `AnalysisResult` 저장 후 같은 세션에서 `mark_done()`까지 호출하는 구조라면 테스트는 그대로 맞지만, 세션 분리 방식이 실제 구현과 다르면 일부 commit 타이밍만 맞춰주면 됩니다.
+
+### 이 테스트 파일이 검증하는 핵심
+
+이 파일이 통과하면 최소한 아래는 확인됩니다.
+
+* `InferenceWorker`가 idle 상태에서 `False`를 반환한다
+* `single_message_summary` job을 소비해 `AnalysisResult`를 생성한다
+* 입력이 없으면 `INFERENCE_INPUT_NOT_FOUND`로 실패 처리된다
+* LLM 오류가 나면 재시도 가능 job은 `PENDING`, 소진된 job은 `DEAD_LETTER`가 된다
+* `WINDOW_THEME_ANALYSIS` placeholder 경로가 깨지지 않는다
+* `job_types` 필터가 실제로 동작한다
+
+즉, 지금까지 정리한
+**collector → preprocess → inference**
+파이프라인의 테스트 골격이 한 세트로 갖춰지게 됩니다.
+
+

@@ -1,0 +1,556 @@
+좋습니다.
+아래처럼 **`startup_tasks.py`에 `BackfillDeferredError` 대응을 추가**하면 됩니다.
+
+전제는 하나입니다.
+
+* `TelegramChannelCollectionState`가 현재 코드처럼 `telegram_channel_id` 컬럼을 쓴다고 가정했습니다.
+  실제 모델이 `channel_id`면 그 부분만 바꾸면 됩니다.
+
+---
+
+## 1) import 추가
+
+파일 상단 import를 아래처럼 정리하세요.
+
+```python
+from datetime import datetime, timezone, timedelta
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.db.session import get_session
+from src.infra.db.models import TelegramChannel, TelegramChannelCollectionState
+from src.infra.telegram.schemas import ChannelCollectionStatus
+from src.infra.telegram.client import BackfillDeferredError
+```
+
+---
+
+## 2) `backfill_missed_messages()` 교체
+
+이 함수는 `BackfillDeferredError`를 일반 예외보다 먼저 잡아야 합니다.
+
+```python
+async def backfill_missed_messages(collector=None, persist_func=None) -> None:
+    """
+    [백필(Backfill) 핵심 원칙]
+    - 대상: 수집 활성화 상태이면서 PENDING_BACKFILL 상태인 채널
+    - 범위: 최근 3일 또는 최근 1,000건
+    - 동작: 백필 완료 후 ACTIVE 전이
+    """
+    logger.info("PENDING_BACKFILL 상태의 채널 스캔 시작...")
+
+    async with get_session() as db:
+        pending_channels = await find_channels_pending_backfill(db)
+
+        if not pending_channels:
+            logger.info("현재 백필이 필요한 채널이 없습니다.")
+            return
+
+        logger.info(f"총 {len(pending_channels)}개의 채널이 백필 대기 중입니다.")
+
+        if collector is None or persist_func is None:
+            logger.info("collector/persist_func 미주입 상태이므로 실제 백필은 건너뜁니다.")
+            return
+
+        for channel, state in pending_channels:
+            logger.info(f"백필 대상 채널: [{channel.title}] ({channel.tg_channel_id})")
+
+            try:
+                processed_count = await perform_backfill_for_channel(
+                    db=db,
+                    collector=collector,
+                    channel=channel,
+                    persist_func=persist_func,
+                    days=BACKFILL_DAYS,
+                    limit=BACKFILL_LIMIT,
+                )
+
+                await mark_backfill_completed(db, channel.id)
+                await db.commit()
+
+                logger.info(
+                    f"백필 완료 처리: [{channel.title}] ({channel.tg_channel_id}) "
+                    f"messages={processed_count}"
+                )
+
+            except BackfillDeferredError as e:
+                await db.rollback()
+
+                # FloodWait 장기 대기 등은 장애가 아니라 "연기"로 취급
+                await mark_backfill_deferred(db, channel.id, str(e))
+                await db.commit()
+
+                logger.warning(
+                    f"백필 연기 처리: [{channel.title}] ({channel.tg_channel_id}) {e}"
+                )
+
+            except Exception as e:
+                await db.rollback()
+
+                await mark_backfill_failed(db, channel.id, str(e))
+                await db.commit()
+
+                logger.error(
+                    f"백필 실패 처리: [{channel.title}] ({channel.tg_channel_id}) error={e}"
+                )
+```
+
+---
+
+## 3) `mark_backfill_deferred()` 추가
+
+이 함수는 상태를 **`ERROR`로 바꾸지 않고 `PENDING_BACKFILL` 유지**합니다.
+
+```python
+async def mark_backfill_deferred(db, channel_id: int, reason: str) -> None:
+    """
+    FloodWait 장기 대기 등으로 이번 백필 사이클을 연기할 때 사용.
+    상태는 PENDING_BACKFILL 유지, last_error_message만 기록.
+    """
+    stmt = select(TelegramChannelCollectionState).where(
+        TelegramChannelCollectionState.telegram_channel_id == channel_id
+    )
+    result = await db.execute(stmt)
+    state = result.scalar_one_or_none()
+
+    now = datetime.now(timezone.utc)
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            telegram_channel_id=channel_id,
+            status=ChannelCollectionStatus.PENDING_BACKFILL.value,
+            last_error_message=reason,
+            last_error_at=now,
+        )
+        db.add(state)
+    else:
+        state.status = ChannelCollectionStatus.PENDING_BACKFILL.value
+        state.last_error_message = reason
+        state.last_error_at = now
+```
+
+---
+
+## 4) `mark_backfill_completed()`는 그대로 두되 clear 정책만 유지
+
+```python
+async def mark_backfill_completed(db, channel_id: int) -> None:
+    """백필 완료 시 ACTIVE로 전환하고 에러 상태를 정리합니다."""
+    stmt = select(TelegramChannelCollectionState).where(
+        TelegramChannelCollectionState.telegram_channel_id == channel_id
+    )
+    result = await db.execute(stmt)
+    state = result.scalar_one_or_none()
+
+    now = datetime.now(timezone.utc)
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            telegram_channel_id=channel_id,
+            status=ChannelCollectionStatus.ACTIVE.value,
+            last_backfill_at=now,
+            last_error_message=None,
+            last_error_at=None,
+        )
+        db.add(state)
+    else:
+        state.status = ChannelCollectionStatus.ACTIVE.value
+        state.last_backfill_at = now
+        state.last_error_message = None
+        state.last_error_at = None
+```
+
+---
+
+## 5) `mark_backfill_failed()`는 진짜 실패만 ERROR
+
+```python
+async def mark_backfill_failed(db, channel_id: int, error_message: str) -> None:
+    """백필 실패 시 ERROR로 전환하고 에러 메시지를 기록합니다."""
+    stmt = select(TelegramChannelCollectionState).where(
+        TelegramChannelCollectionState.telegram_channel_id == channel_id
+    )
+    result = await db.execute(stmt)
+    state = result.scalar_one_or_none()
+
+    now = datetime.now(timezone.utc)
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            telegram_channel_id=channel_id,
+            status=ChannelCollectionStatus.ERROR.value,
+            last_error_message=error_message,
+            last_error_at=now,
+        )
+        db.add(state)
+    else:
+        state.status = ChannelCollectionStatus.ERROR.value
+        state.last_error_message = error_message
+        state.last_error_at = now
+```
+
+---
+
+## 6) 추가 테스트 1개
+
+`tests/test_startup_tasks.py`에 이것도 넣으면 좋습니다.
+
+```python
+@pytest.mark.asyncio
+async def test_mark_backfill_deferred_keeps_pending_status(db_session):
+    from sqlalchemy import select
+    from src.infra.db.models import TelegramChannelCollectionState
+    from src.workers.startup_tasks import mark_backfill_deferred
+
+    await mark_backfill_deferred(
+        db_session,
+        channel_id=1,
+        reason="single_flood_wait_too_long (wait_seconds=420, retry_count=1, total_wait_seconds=420)",
+    )
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert saved.status == "PENDING_BACKFILL"
+    assert "single_flood_wait_too_long" in saved.last_error_message
+    assert saved.last_error_at is not None
+```
+
+---
+
+## 의미 정리
+
+이제 상태 전이는 이렇게 됩니다.
+
+* **정상 완료** → `ACTIVE`
+* **FloodWait 장기 대기** → `PENDING_BACKFILL 유지`
+* **진짜 실패** → `ERROR`
+
+이 구분이 들어가면 운영할 때 훨씬 명확합니다.
+
+다음으로 가장 자연스러운 작업은 **`tests/test_startup_tasks.py`에 `mark_backfill_deferred()` 테스트까지 반영한 전체본 정리**입니다.
+
+
+좋습니다.
+아래는 **`mark_backfill_deferred()`까지 반영한 `tests/test_startup_tasks.py` 전체본**입니다.
+
+주의할 점은 하나입니다.
+
+* 상태 테이블 FK가 `telegram_channel_id`면 아래 그대로 사용
+* 실제 모델이 `channel_id`면 파일 전체에서 그 부분만 바꾸면 됩니다
+
+```python
+import pytest
+import pytest_asyncio
+from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+from src.infra.db.models import (
+    Base,
+    TelegramChannel,
+    TelegramChannelCollectionState,
+)
+from src.workers.startup_tasks import (
+    perform_backfill_for_channel,
+    mark_backfill_completed,
+    mark_backfill_failed,
+    mark_backfill_deferred,
+    find_channels_pending_backfill,
+)
+
+
+@pytest_asyncio.fixture
+async def db_session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with Session() as session:
+        ch1 = TelegramChannel(
+            telegram_account_id=1,
+            tg_channel_id="1001",
+            title="Pending Channel",
+            username="pending_test",
+            channel_type="CHANNEL",
+            status="SYNCED",
+            is_collecting=True,
+            last_synced_at=datetime.now(timezone.utc),
+        )
+        ch2 = TelegramChannel(
+            telegram_account_id=1,
+            tg_channel_id="1002",
+            title="Paused Channel",
+            username="paused_test",
+            channel_type="CHANNEL",
+            status="SYNCED",
+            is_collecting=True,
+            last_synced_at=datetime.now(timezone.utc),
+        )
+
+        session.add_all([ch1, ch2])
+        await session.commit()
+
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
+class FakeCollector:
+    def __init__(self, messages):
+        self.messages = messages
+        self.called_with = None
+
+    async def iter_channel_messages(self, entity, limit=1000, days=3):
+        self.called_with = {
+            "entity": entity,
+            "limit": limit,
+            "days": days,
+        }
+        for msg in self.messages:
+            yield msg
+
+
+def make_message(message_id: int, dt: datetime, text: str = "msg"):
+    return SimpleNamespace(
+        id=message_id,
+        date=dt,
+        text=text,
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_channels_pending_backfill_returns_only_pending_collecting_channels(db_session):
+    state1 = TelegramChannelCollectionState(
+        telegram_channel_id=1,
+        status="PENDING_BACKFILL",
+        last_error_message=None,
+        last_error_at=None,
+    )
+    state2 = TelegramChannelCollectionState(
+        telegram_channel_id=2,
+        status="PAUSED",
+        last_error_message=None,
+        last_error_at=None,
+    )
+
+    db_session.add_all([state1, state2])
+    await db_session.commit()
+
+    rows = await find_channels_pending_backfill(db_session)
+
+    assert len(rows) == 1
+    channel, state = rows[0]
+    assert channel.id == 1
+    assert channel.tg_channel_id == "1001"
+    assert state.status == "PENDING_BACKFILL"
+
+
+@pytest.mark.asyncio
+async def test_mark_backfill_completed_sets_active_and_clears_error(db_session):
+    state = TelegramChannelCollectionState(
+        telegram_channel_id=1,
+        status="PENDING_BACKFILL",
+        last_error_message="old error",
+        last_error_at=datetime.now(timezone.utc),
+    )
+    db_session.add(state)
+    await db_session.commit()
+
+    await mark_backfill_completed(db_session, channel_id=1)
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert saved.status == "ACTIVE"
+    assert saved.last_backfill_at is not None
+    assert saved.last_error_message is None
+    assert saved.last_error_at is None
+
+
+@pytest.mark.asyncio
+async def test_mark_backfill_failed_sets_error_and_message(db_session):
+    await mark_backfill_failed(db_session, channel_id=1, error_message="forced failure")
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert saved.status == "ERROR"
+    assert saved.last_error_message == "forced failure"
+    assert saved.last_error_at is not None
+
+
+@pytest.mark.asyncio
+async def test_mark_backfill_deferred_keeps_pending_status(db_session):
+    await mark_backfill_deferred(
+        db_session,
+        channel_id=1,
+        reason="single_flood_wait_too_long (wait_seconds=420, retry_count=1, total_wait_seconds=420)",
+    )
+    await db_session.commit()
+
+    saved = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert saved.status == "PENDING_BACKFILL"
+    assert "single_flood_wait_too_long" in saved.last_error_message
+    assert saved.last_error_at is not None
+
+
+@pytest.mark.asyncio
+async def test_perform_backfill_for_channel_processes_recent_messages_only():
+    now = datetime.now(timezone.utc)
+
+    messages = [
+        make_message(1, now - timedelta(hours=1), "recent-1"),
+        make_message(2, now - timedelta(hours=5), "recent-2"),
+        make_message(3, now - timedelta(days=1), "recent-3"),
+    ]
+    collector = FakeCollector(messages)
+
+    channel = SimpleNamespace(
+        id=10,
+        tg_channel_id="1001",
+        title="Test Channel",
+    )
+
+    called = []
+
+    async def fake_persist(db, history_message, telegram_channel_id):
+        called.append(
+            {
+                "message_id": history_message.id,
+                "channel_id": telegram_channel_id,
+            }
+        )
+        return SimpleNamespace(action="created", checkpoint_candidate=history_message.id)
+
+    processed_count = await perform_backfill_for_channel(
+        db=object(),
+        collector=collector,
+        channel=channel,
+        persist_func=fake_persist,
+        days=3,
+        limit=1000,
+    )
+
+    assert processed_count == 3
+    assert [x["message_id"] for x in called] == [1, 2, 3]
+    assert all(x["channel_id"] == 10 for x in called)
+
+    assert collector.called_with == {
+        "entity": "1001",
+        "limit": 1000,
+        "days": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_perform_backfill_for_channel_stops_when_message_is_older_than_cutoff():
+    now = datetime.now(timezone.utc)
+
+    messages = [
+        make_message(1, now - timedelta(hours=2), "recent"),
+        make_message(2, now - timedelta(days=4), "too-old"),
+        make_message(3, now - timedelta(hours=1), "should-not-be-processed"),
+    ]
+    collector = FakeCollector(messages)
+
+    channel = SimpleNamespace(
+        id=20,
+        tg_channel_id="2001",
+        title="Old Cutoff Channel",
+    )
+
+    called_ids = []
+
+    async def fake_persist(db, history_message, telegram_channel_id):
+        called_ids.append(history_message.id)
+        return SimpleNamespace(action="created", checkpoint_candidate=history_message.id)
+
+    processed_count = await perform_backfill_for_channel(
+        db=object(),
+        collector=collector,
+        channel=channel,
+        persist_func=fake_persist,
+        days=3,
+        limit=1000,
+    )
+
+    assert processed_count == 1
+    assert called_ids == [1]
+
+
+@pytest.mark.asyncio
+async def test_perform_backfill_for_channel_handles_naive_datetime():
+    now_naive = datetime.utcnow()
+
+    messages = [
+        make_message(1, now_naive - timedelta(hours=1), "naive-recent"),
+        make_message(2, now_naive - timedelta(days=5), "naive-old"),
+    ]
+    collector = FakeCollector(messages)
+
+    channel = SimpleNamespace(
+        id=30,
+        tg_channel_id="3001",
+        title="Naive Datetime Channel",
+    )
+
+    called_ids = []
+
+    async def fake_persist(db, history_message, telegram_channel_id):
+        called_ids.append(history_message.id)
+        return SimpleNamespace(action="created", checkpoint_candidate=history_message.id)
+
+    processed_count = await perform_backfill_for_channel(
+        db=object(),
+        collector=collector,
+        channel=channel,
+        persist_func=fake_persist,
+        days=3,
+        limit=1000,
+    )
+
+    assert processed_count == 1
+    assert called_ids == [1]
+```
+
+실행은 이 순서로 보시면 됩니다.
+
+```bash
+pytest tests/test_startup_tasks.py -q
+```
+
+가장 먼저 깨질 가능성이 큰 건 보통 두 가지입니다.
+하나는 상태 테이블 키 필드명이 `telegram_channel_id`가 아닐 때, 다른 하나는 `mark_backfill_completed()`가 `last_error_at`까지 지우지 않는 정책일 때입니다. 그 경우 해당 assertion 한 줄만 정책에 맞게 조정하면 됩니다.

@@ -1,0 +1,317 @@
+좋습니다. 아래는 **지금까지 공유해주신 시그니처를 기준으로 정리한 `repository.py` 완성본 형태**입니다.
+
+전제는 3가지입니다.
+
+* 메시지 유니크 기준은 `(telegram_channel_id, tg_message_id)`
+* `TelegramChannelCollectionState`는 **내부 채널 PK(`channel_id`)** 기준으로 관리
+* payload 필드명은 `posted_at`, `collected_at` 기준
+  (`message_date`를 쓰고 있으면 그 부분만 바꾸면 됩니다)
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Optional
+
+from loguru import logger
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.infra.db.models import TelegramMessage, TelegramChannelCollectionState
+from src.infra.telegram.schemas import (
+    ChannelCollectionStatus,
+    TelegramMessagePayload,
+    UpsertResult,
+)
+
+
+def _normalize_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def get_or_create_collection_state(
+    db: AsyncSession,
+    channel_id: int,
+    default_status: str = ChannelCollectionStatus.PAUSED.value,
+) -> TelegramChannelCollectionState:
+    result = await db.execute(
+        select(TelegramChannelCollectionState).where(
+            TelegramChannelCollectionState.channel_id == channel_id
+        )
+    )
+    state = result.scalar_one_or_none()
+
+    if state is None:
+        state = TelegramChannelCollectionState(
+            channel_id=channel_id,
+            status=default_status,
+            last_collected_message_id=None,
+            last_collected_at=None,
+            last_backfill_at=None,
+            last_error_message=None,
+            last_error_at=None,
+        )
+        db.add(state)
+        await db.flush()
+
+    return state
+
+
+async def set_channel_collection_status(
+    db: AsyncSession,
+    channel_id: int,
+    new_status: str,
+    last_error_message: Optional[str] = None,
+) -> TelegramChannelCollectionState:
+    state = await get_or_create_collection_state(db, channel_id=channel_id)
+
+    state.status = new_status
+
+    if last_error_message:
+        state.last_error_message = last_error_message
+        state.last_error_at = datetime.now(timezone.utc)
+    elif new_status != ChannelCollectionStatus.ERROR.value:
+        state.last_error_message = None
+
+    await db.flush()
+    return state
+
+
+async def upsert_telegram_message(
+    db: AsyncSession,
+    payload: TelegramMessagePayload,
+) -> UpsertResult:
+    stmt = select(TelegramMessage).where(
+        TelegramMessage.telegram_channel_id == payload.telegram_channel_id,
+        TelegramMessage.tg_message_id == payload.tg_message_id,
+    )
+
+    try:
+        result = await db.execute(stmt)
+        msg = result.scalar_one_or_none()
+
+        if msg:
+            is_updated = False
+
+            msg_edited_at = _normalize_utc(msg.edited_at)
+            payload_edited_at = _normalize_utc(payload.edited_at)
+
+            # 1) 본문/편집 기반 갱신
+            if payload_edited_at and (not msg_edited_at or msg_edited_at < payload_edited_at):
+                if msg.message_text_raw != payload.message_text_raw:
+                    msg.message_text_raw = payload.message_text_raw
+                    is_updated = True
+
+                if msg.edited_at != payload.edited_at:
+                    msg.edited_at = payload.edited_at
+                    is_updated = True
+
+                if msg.raw_payload_json != payload.raw_payload_json:
+                    msg.raw_payload_json = payload.raw_payload_json
+                    is_updated = True
+
+            # 2) 메타데이터 보강(null -> 값, 값 차이 갱신)
+            if payload.sender_id is not None and msg.sender_id != payload.sender_id:
+                msg.sender_id = payload.sender_id
+                is_updated = True
+
+            if (
+                payload.reply_to_message_id is not None
+                and msg.reply_to_message_id != payload.reply_to_message_id
+            ):
+                msg.reply_to_message_id = payload.reply_to_message_id
+                is_updated = True
+
+            if payload.grouped_id is not None and msg.grouped_id != payload.grouped_id:
+                msg.grouped_id = payload.grouped_id
+                is_updated = True
+
+            if payload.views is not None and msg.views != payload.views:
+                msg.views = payload.views
+                is_updated = True
+
+            if payload.forwards is not None and msg.forwards != payload.forwards:
+                msg.forwards = payload.forwards
+                is_updated = True
+
+            # posted_at은 원본 작성시각이므로 기존에 없을 때만 보강
+            if payload.posted_at is not None and msg.posted_at is None:
+                msg.posted_at = payload.posted_at
+                is_updated = True
+
+            # collected_at은 더 최신 수집시각이면 갱신
+            msg_collected_at = _normalize_utc(msg.collected_at)
+            payload_collected_at = _normalize_utc(payload.collected_at)
+            if payload_collected_at is not None and (
+                msg_collected_at is None or payload_collected_at > msg_collected_at
+            ):
+                msg.collected_at = payload.collected_at
+                is_updated = True
+
+            # raw payload는 편집이 아니어도 더 풍부한 정보가 들어오면 갱신 가능
+            if (
+                payload.raw_payload_json is not None
+                and msg.raw_payload_json != payload.raw_payload_json
+            ):
+                msg.raw_payload_json = payload.raw_payload_json
+                is_updated = True
+
+            if payload.is_deleted and not msg.is_deleted:
+                msg.is_deleted = True
+                is_updated = True
+
+            if is_updated:
+                await db.flush()
+
+            return UpsertResult(
+                action="updated" if is_updated else "unchanged",
+                telegram_channel_id=payload.telegram_channel_id,
+                tg_message_id=payload.tg_message_id,
+                checkpoint_candidate=payload.tg_message_id,
+            )
+
+        # 신규 insert
+        new_msg = TelegramMessage(
+            telegram_channel_id=payload.telegram_channel_id,
+            tg_message_id=payload.tg_message_id,
+            sender_id=payload.sender_id,
+            message_text_raw=payload.message_text_raw,
+            reply_to_message_id=payload.reply_to_message_id,
+            views=payload.views,
+            forwards=payload.forwards,
+            grouped_id=payload.grouped_id,
+            edited_at=payload.edited_at,
+            is_deleted=payload.is_deleted,
+            posted_at=payload.posted_at,
+            collected_at=payload.collected_at,
+            raw_payload_json=payload.raw_payload_json,
+            has_media=False,  # 추후 translator에서 계산되면 교체 가능
+        )
+        db.add(new_msg)
+        await db.flush()
+
+        return UpsertResult(
+            action="created",
+            telegram_channel_id=payload.telegram_channel_id,
+            tg_message_id=payload.tg_message_id,
+            checkpoint_candidate=payload.tg_message_id,
+        )
+
+    except IntegrityError as e:
+        await db.rollback()
+        logger.warning(
+            "upsert_telegram_message integrity 충돌 "
+            f"channel_id={payload.telegram_channel_id} "
+            f"tg_message_id={payload.tg_message_id} error={e}"
+        )
+
+        # 경쟁 상황에서 이미 다른 트랜잭션이 넣었을 수 있으므로 재조회 시도
+        try:
+            result = await db.execute(stmt)
+            existing = result.scalar_one_or_none()
+            if existing is not None:
+                return UpsertResult(
+                    action="unchanged",
+                    telegram_channel_id=payload.telegram_channel_id,
+                    tg_message_id=payload.tg_message_id,
+                    checkpoint_candidate=payload.tg_message_id,
+                )
+        except Exception as requery_error:
+            logger.error(
+                "integrity 충돌 후 재조회 실패 "
+                f"channel_id={payload.telegram_channel_id} "
+                f"tg_message_id={payload.tg_message_id} error={requery_error}"
+            )
+
+        return UpsertResult(
+            action="failed",
+            telegram_channel_id=payload.telegram_channel_id,
+            tg_message_id=payload.tg_message_id,
+            checkpoint_candidate=None,
+            error_message=str(e),
+        )
+
+    except Exception as e:
+        await db.rollback()
+        logger.error(
+            "upsert_telegram_message 실패 "
+            f"channel_id={payload.telegram_channel_id} "
+            f"tg_message_id={payload.tg_message_id} error={e}"
+        )
+        return UpsertResult(
+            action="failed",
+            telegram_channel_id=payload.telegram_channel_id,
+            tg_message_id=payload.tg_message_id,
+            checkpoint_candidate=None,
+            error_message=str(e),
+        )
+
+
+async def update_channel_checkpoint(
+    db: AsyncSession,
+    channel_id: int,
+    message_id: int,
+    *,
+    collected_at: Optional[datetime] = None,
+    is_backfill: bool = False,
+) -> TelegramChannelCollectionState:
+    now = collected_at or datetime.now(timezone.utc)
+
+    default_status = (
+        ChannelCollectionStatus.PENDING_BACKFILL.value
+        if is_backfill
+        else ChannelCollectionStatus.ACTIVE.value
+    )
+
+    state = await get_or_create_collection_state(
+        db=db,
+        channel_id=channel_id,
+        default_status=default_status,
+    )
+
+    if (
+        state.last_collected_message_id is None
+        or message_id > state.last_collected_message_id
+    ):
+        state.last_collected_message_id = message_id
+
+    state.last_collected_at = now
+
+    if is_backfill:
+        state.last_backfill_at = now
+    else:
+        # 실시간 수집 성공으로 ERROR 상태는 복구 가능
+        if state.status == ChannelCollectionStatus.ERROR.value:
+            state.status = ChannelCollectionStatus.ACTIVE.value
+
+    await db.flush()
+    return state
+
+
+async def find_channels_pending_backfill(db: AsyncSession) -> list[TelegramChannelCollectionState]:
+    result = await db.execute(
+        select(TelegramChannelCollectionState).where(
+            TelegramChannelCollectionState.status == ChannelCollectionStatus.PENDING_BACKFILL.value
+        )
+    )
+    return list(result.scalars().all())
+```
+
+### 이 버전에서 바로 좋아지는 점
+
+* `edited_at` 기반 본문 수정과 `sender_id / reply_to_message_id / grouped_id` 같은 **메타데이터 보강**이 분리됩니다.
+* `views / forwards / is_deleted / raw_payload_json / collected_at`도 차이가 있으면 갱신됩니다.
+* `db.flush()`를 넣어서 **유니크 충돌을 repository 단계에서 더 빨리 감지**할 수 있습니다.
+* `IntegrityError`와 일반 예외에서 `rollback()`이 들어가므로 세션이 덜 애매해집니다.
+* `update_channel_checkpoint()`는 `is_backfill=True/False`를 받을 수 있어서 STEP 2로 자연스럽게 이어집니다.
+
+### 적용 전에 확인할 것 3개
+
+1. 모델 필드명이 `posted_at`이 아니라 `message_date`면 그 부분만 바꾸세요.
+2. `ChannelCollectionStatus`가 Enum이 아니라 문자열 상수면 `.value`를 제거하세요.
+3. `UpsertResult`가 dataclass이고 `action`을 문자열로 받는 구조인지 확인하세요.

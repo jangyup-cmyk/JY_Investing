@@ -1,0 +1,566 @@
+SQLAlchemy ORM 모델 초안부터 작성
+좋습니다. 문서 기준으로 현재 프로젝트는 이미 `src/infra/db/models.py`에 ORM 엔티티를 두고, `Async SQLAlchemy + Alembic` 기반으로 운영 중이며, 실행 구조도 `run_web.py`와 `run_collector.py`의 2-프로세스 분리형입니다. 다음 로드맵도 Phase 3 전처리, Phase 4 LLM 요약/테마 분석으로 이어지므로, 지금은 그 흐름을 견디는 ORM 레이어를 먼저 추가하는 것이 맞습니다.   
+
+아래는 **기존 `Channel`, `Message`는 최대한 유지**하면서, 다음 단계에 필요한 최소 5개 테이블을 붙이는 방식의 **SQLAlchemy 2.x ORM 초안**입니다.
+
+---
+
+## 1) 먼저 추가할 최소 엔티티 5개
+
+* `MessageVersion`
+* `NormalizedMessage`
+* `MessageFeature`
+* `AnalysisJob`
+* `AnalysisResult`
+
+핵심 의도는 이렇습니다.
+
+* `Message`: 원문 원장
+* `MessageVersion`: 편집 히스토리
+* `NormalizedMessage`: 전처리 산출물
+* `MessageFeature`: 규칙 기반/경량 NLP 기반 피처
+* `AnalysisJob`: 내부 작업 큐
+* `AnalysisResult`: LLM 및 후속 분석 결과
+
+현재 문서에서 편집 메시지 반영, 배치 커밋, 재시작 resume, 세션 격리, 다음 단계 전처리/LLM 분석이 이미 명시되어 있어서 이 모델이 가장 자연스럽게 이어집니다.  
+
+---
+
+## 2) 권장 ORM 초안
+
+아래 코드는 **`src/infra/db/models.py`** 에 바로 옮겨갈 수 있는 형태로 정리한 골격입니다.
+기존 `Base` 선언이 이미 있다면 그걸 그대로 쓰면 됩니다.
+
+```python
+from __future__ import annotations
+
+import enum
+from datetime import datetime
+from typing import Optional, List
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    Index,
+    func,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from src.infra.db.base import Base
+
+
+# =========================
+# Common Mixins
+# =========================
+
+class TimestampMixin:
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+# =========================
+# Enums
+# =========================
+
+class JobType(str, enum.Enum):
+    NORMALIZE = "normalize"
+    EXTRACT_FEATURES = "extract_features"
+    SINGLE_MESSAGE_SUMMARY = "single_message_summary"
+    WINDOW_THEME_ANALYSIS = "window_theme_analysis"
+    AGENT_DEBATE = "agent_debate"
+    CONSENSUS = "consensus"
+
+
+class JobTargetType(str, enum.Enum):
+    MESSAGE = "message"
+    WINDOW = "window"
+    THEME_CLUSTER = "theme_cluster"
+
+
+class JobStatus(str, enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
+
+
+class ResultType(str, enum.Enum):
+    SUMMARY = "summary"
+    EVENT_CLASSIFICATION = "event_classification"
+    THEME_RELEVANCE = "theme_relevance"
+    RISK_FLAG = "risk_flag"
+
+
+# =========================
+# Existing reference note
+# =========================
+# Assumption:
+# - Channel model already exists
+# - Message model already exists
+# If existing Message model differs, adapt relationship names only.
+
+
+# =========================
+# MessageVersion
+# =========================
+
+class MessageVersion(Base, TimestampMixin):
+    __tablename__ = "message_versions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    raw_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    edit_date_utc: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    message = relationship("Message", back_populates="versions")
+
+    __table_args__ = (
+        UniqueConstraint("message_id", "version_no", name="uq_message_versions_message_version"),
+    )
+
+
+# =========================
+# NormalizedMessage
+# =========================
+
+class NormalizedMessage(Base, TimestampMixin):
+    __tablename__ = "normalized_messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("message_versions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    cleaning_version: Mapped[str] = mapped_column(String(50), nullable=False)
+    normalized_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    language_code: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    token_estimate: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    is_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    spam_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    is_duplicate_near: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    duplicate_group_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True, index=True)
+
+    quality_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    message = relationship("Message", back_populates="normalized_records")
+    version = relationship("MessageVersion")
+    features = relationship("MessageFeature", back_populates="normalized_message", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id",
+            "version_id",
+            "cleaning_version",
+            name="uq_normalized_messages_message_version_cleaning",
+        ),
+    )
+
+
+# =========================
+# MessageFeature
+# =========================
+
+class MessageFeature(Base, TimestampMixin):
+    __tablename__ = "message_features"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("message_versions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    normalized_message_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("normalized_messages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    feature_version: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    ticker_candidates_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    company_alias_hits_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    theme_candidates_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    keyword_hits_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    entity_spans_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    sentiment_rule_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    urgency_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    novelty_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    source_reliability_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    message = relationship("Message", back_populates="feature_records")
+    version = relationship("MessageVersion")
+    normalized_message = relationship("NormalizedMessage", back_populates="features")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id",
+            "version_id",
+            "feature_version",
+            name="uq_message_features_message_version_feature",
+        ),
+    )
+
+
+# =========================
+# AnalysisJob
+# =========================
+
+class AnalysisJob(Base, TimestampMixin):
+    __tablename__ = "analysis_jobs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    job_type: Mapped[JobType] = mapped_column(Enum(JobType), nullable=False, index=True)
+    target_type: Mapped[JobTargetType] = mapped_column(Enum(JobTargetType), nullable=False, index=True)
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+
+    status: Mapped[JobStatus] = mapped_column(
+        Enum(JobStatus),
+        nullable=False,
+        default=JobStatus.PENDING,
+        index=True,
+    )
+
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100, index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+
+    scheduled_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    worker_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    error_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    results = relationship("AnalysisResult", back_populates="job", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("job_type", "idempotency_key", name="uq_analysis_jobs_type_idempotency"),
+        Index(
+            "ix_analysis_jobs_fetch",
+            "status",
+            "priority",
+            "scheduled_at",
+        ),
+    )
+
+
+# =========================
+# AnalysisResult
+# =========================
+
+class AnalysisResult(Base, TimestampMixin):
+    __tablename__ = "analysis_results"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("analysis_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    target_type: Mapped[JobTargetType] = mapped_column(Enum(JobTargetType), nullable=False, index=True)
+    target_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+
+    result_type: Mapped[ResultType] = mapped_column(Enum(ResultType), nullable=False, index=True)
+
+    model_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    model_version: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    input_version: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cost_input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cost_output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    result_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    job = relationship("AnalysisJob", back_populates="results")
+
+    __table_args__ = (
+        Index("ix_analysis_results_target", "target_type", "target_id"),
+    )
+```
+
+---
+
+## 3) 기존 `Message` 모델에 최소한으로 붙일 relationship
+
+기존 `Message`가 있다면 아래 정도만 추가하면 됩니다.
+
+```python
+class Message(Base, TimestampMixin):
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    channel_id: Mapped[int] = mapped_column(ForeignKey("channels.id"), nullable=False, index=True)
+    tg_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tg_date_utc: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    message_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    edit_date_utc: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    raw_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    versions = relationship("MessageVersion", back_populates="message", cascade="all, delete-orphan")
+    normalized_records = relationship("NormalizedMessage", back_populates="message", cascade="all, delete-orphan")
+    feature_records = relationship("MessageFeature", back_populates="message", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("channel_id", "tg_message_id", name="uq_messages_channel_tg_message"),
+    )
+```
+
+여기서 중요한 점은 `messages.message_text`는 **최신 원문 스냅샷**, `message_versions`는 **버전 이력**으로 쓰는 것입니다. 이것이 현재 문서의 “원본 편집 메시지 실시간 반영” 요구와 가장 잘 맞습니다. 
+
+---
+
+## 4) 지금 구조에 맞는 job 생성 규칙
+
+현재는 Telethon 이벤트를 받아 DB에 바로 `upsert` 하는 구조입니다. 이후에는 수집 직후 `analysis_jobs`를 같이 생성하면 됩니다. 문서상 현재 구조가 바로 그 확장 지점입니다. 
+
+예를 들면:
+
+### 새 메시지 수집 시
+
+1. `messages` upsert
+2. `message_versions` 현재 버전 추가
+3. `analysis_jobs`에 `normalize` 작업 1건 생성
+
+`idempotency_key` 예시:
+
+```python
+f"normalize:message:{message_id}:version:{version_id}:v1"
+```
+
+### normalize 완료 시
+
+1. `normalized_messages` insert
+2. `analysis_jobs`에 `extract_features` 생성
+
+### feature 완료 시
+
+1. `message_features` insert
+2. 조건이 맞으면 `single_message_summary` 또는 `window_theme_analysis` 생성
+
+이렇게 해야 나중에 RabbitMQ를 붙여도 **DB가 작업 원장** 역할을 계속 유지할 수 있습니다.
+
+---
+
+## 5) 워커에서 job claim 할 때의 핵심 패턴
+
+현재 문서에서 API는 `Depends(get_db)`로 안정화되었고, 워커는 독립 프로세스라 별도 세션 관리가 이미 전제돼 있습니다. 따라서 다음 단계는 “세션을 통일”하기보다 **작업 claim/save 패턴을 명시적으로 만드는 것**입니다.  
+
+권장 패턴은 아래입니다.
+
+```python
+async def claim_next_job(session: AsyncSession, worker_name: str) -> AnalysisJob | None:
+    now = datetime.now(timezone.utc)
+
+    stmt = (
+        select(AnalysisJob)
+        .where(
+            AnalysisJob.status == JobStatus.PENDING,
+            AnalysisJob.scheduled_at <= now,
+        )
+        .order_by(AnalysisJob.priority.asc(), AnalysisJob.scheduled_at.asc(), AnalysisJob.id.asc())
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+
+    result = await session.execute(stmt)
+    job = result.scalar_one_or_none()
+    if not job:
+        return None
+
+    job.status = JobStatus.RUNNING
+    job.worker_name = worker_name
+    job.started_at = now
+    job.last_heartbeat_at = now
+    job.lease_expires_at = now + timedelta(minutes=5)
+    job.attempt_count += 1
+
+    await session.commit()
+    return job
+```
+
+다만 **SQLite에서는 `FOR UPDATE SKIP LOCKED`가 사실상 기대대로 동작하지 않습니다.** 그래서 지금 DB가 `aiosqlite`라면, 다중 worker를 크게 늘리기 전까지는 `analysis_jobs` 소비 워커를 1개로 두는 게 안전합니다. 현재 문서도 SQLite 기반 비동기 ORM 전제를 갖고 있으므로, 이 제한은 실무적으로 중요합니다. 
+
+---
+
+## 6) SQLite 단계에서 꼭 넣어야 할 보수적 규칙
+
+지금 구조는 FastAPI + Worker 분리, batch commit, savepoint, resume까지 이미 잘 설계돼 있습니다. 그래서 다음 단계는 성능 욕심보다 **충돌 회피 규칙**이 더 중요합니다.  
+
+권장 규칙:
+
+* `analysis_jobs` 소비 워커는 우선 1개
+* normalize/feature/LLM 워커를 한 프로세스 안의 단계별 루프로 시작
+* 긴 LLM 호출 전에는 세션 닫기
+* 결과 저장 시에만 새 세션 열기
+* 메시지 수집 경로와 분석 경로의 커밋 단위를 분리
+
+즉, 지금은 “분석 파이프라인 분산”보다 “안전한 직렬화”가 우선입니다.
+
+---
+
+## 7) Alembic 적용 순서
+
+권장 마이그레이션 순서는 이렇습니다.
+
+### 1차
+
+* `message_versions`
+* `normalized_messages`
+* `message_features`
+
+### 2차
+
+* `analysis_jobs`
+* `analysis_results`
+
+이 순서가 좋은 이유는,
+큐 없이도 먼저 전처리 구조를 붙일 수 있고, 그 다음 분석 작업 원장을 붙일 수 있기 때문입니다. 현재 문서의 로드맵도 정확히 Phase 3 → Phase 4 순서라 이 순서가 맞습니다. 
+
+예시:
+
+```bash
+alembic revision --autogenerate -m "add preprocessing tables"
+alembic upgrade head
+
+alembic revision --autogenerate -m "add analysis job tables"
+alembic upgrade head
+```
+
+---
+
+## 8) 구현 우선순위
+
+바로 코드로 옮길 때는 이 순서가 가장 좋습니다.
+
+### 우선 1
+
+`MessageVersion`, `NormalizedMessage`, `MessageFeature` 추가
+
+### 우선 2
+
+수집 직후 `normalize` job 생성
+
+### 우선 3
+
+DB polling 기반 `preprocess_worker.py` 추가
+
+### 우선 4
+
+`AnalysisJob`, `AnalysisResult` 붙이고 단일 메시지 요약 연결
+
+이 순서면 지금 Phase 2 안정성을 해치지 않고, 문서에 적힌 다음 단계로 자연스럽게 진입할 수 있습니다. 
+
+---
+
+## 9) 지금 가장 자연스러운 다음 파일
+
+바로 이어서 만들 파일은 아래 3개입니다.
+
+* `src/infra/db/models.py` 수정
+* `src/workers/preprocess_worker.py` 신설
+* `src/services/analysis_job_service.py` 신설
+
+역할은 이렇게 나누면 됩니다.
+
+### `analysis_job_service.py`
+
+* job enqueue
+* job claim
+* job success/fail 처리
+
+### `preprocess_worker.py`
+
+* pending `normalize` job polling
+* normalize 실행
+* 다음 `extract_features` job 생성
+
+### `models.py`
+
+* 엔티티 선언만 유지
+
+이렇게 해야 DDD/계층 분리도 현재 README 구조와 맞습니다. 
+
+---
+
+## 10) 제 추천
+
+지금은 ORM부터 한 번에 크게 늘리기보다,
+**이번 턴에서는 `message_versions`, `normalized_messages`, `analysis_jobs`까지만 먼저 넣는 최소안**이 가장 좋습니다.
+
+이 세 개만 있어도:
+
+* 편집 이력 보존
+* 전처리 결과 분리
+* 내부 큐 기반 비동기 작업화
+
+가 바로 가능해집니다.
+
+다음 답변에서는 바로 이어서 **`preprocess_worker.py` 코드 골격**을 현재 프로젝트 구조에 맞춰 작성하겠습니다.

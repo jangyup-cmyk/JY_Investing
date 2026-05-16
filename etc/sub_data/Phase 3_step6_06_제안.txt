@@ -1,0 +1,781 @@
+좋습니다.
+그럼 이번에는 바로 **붙여 넣어 구현을 시작할 수 있는 코드 뼈대**로 내려가겠습니다.
+
+이번 답변에서는 아래 6개를 제시하겠습니다.
+
+1. `domain/constants.py`
+2. `repositories/analysis_job_repository.py`
+3. `services/analysis_job_service.py`
+4. `workers/preprocess_worker.py`
+5. `workers/scheduler_worker.py`
+6. `run_worker.py`
+
+현재 코드베이스와 이름이 조금 다를 수 있으니, **핵심 로직과 책임 분리**를 그대로 가져가고 import 경로만 맞추면 됩니다.
+
+---
+
+## 1. `src/domain/constants.py`
+
+job type / status 문자열을 중앙집중화합니다.
+
+```python
+from enum import Enum
+
+
+class JobType(str, Enum):
+    NORMALIZE = "NORMALIZE"
+    SINGLE_MESSAGE_SUMMARY = "SINGLE_MESSAGE_SUMMARY"
+
+
+class JobStatus(str, Enum):
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    RETRY_WAIT = "RETRY_WAIT"
+    CANCELLED = "CANCELLED"
+
+
+class MessageStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    DELETED = "DELETED"
+    SKIPPED = "SKIPPED"
+```
+
+이 파일을 먼저 만들어두면 이후 worker/service/repository에서 상태 문자열이 흩어지지 않습니다.
+
+---
+
+## 2. `src/repositories/analysis_job_repository.py`
+
+여기가 핵심입니다.
+특히 `claim_next_job()`은 멀티워커 환경에서 **중복 claim 방지**를 위해 가장 중요합니다.
+
+아래 코드는 SQLAlchemy ORM 기준 초안입니다.
+
+```python
+from __future__ import annotations
+
+from datetime import datetime
+from typing import List, Optional
+
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import Session
+
+from src.db.models.analysis_job import AnalysisJob
+from src.domain.constants import JobStatus
+
+
+class AnalysisJobRepository:
+    def enqueue_job(
+        self,
+        session: Session,
+        *,
+        job_type: str,
+        message_id: int,
+        message_version_id: int,
+        payload_json: Optional[dict] = None,
+        priority: int = 100,
+        max_retries: int = 3,
+        available_at: Optional[datetime] = None,
+        now: Optional[datetime] = None,
+    ) -> AnalysisJob:
+        now = now or datetime.utcnow()
+        available_at = available_at or now
+
+        job = AnalysisJob(
+            job_type=job_type,
+            message_id=message_id,
+            message_version_id=message_version_id,
+            status=JobStatus.PENDING.value,
+            priority=priority,
+            payload_json=payload_json,
+            retry_count=0,
+            max_retries=max_retries,
+            available_at=available_at,
+            claimed_at=None,
+            heartbeat_at=None,
+            finished_at=None,
+            worker_id=None,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(job)
+        session.flush()
+        return job
+
+    def claim_next_job(
+        self,
+        session: Session,
+        *,
+        job_type: str,
+        worker_id: str,
+        now: datetime,
+    ) -> Optional[AnalysisJob]:
+        """
+        다음 처리 가능한 job 1건을 원자적으로 claim합니다.
+
+        - PENDING 또는 RETRY_WAIT
+        - available_at <= now
+        - 우선순위/생성순 기준으로 1건
+        - SKIP LOCKED 사용으로 병렬 워커 충돌 최소화
+        """
+        stmt = (
+            select(AnalysisJob)
+            .where(
+                AnalysisJob.job_type == job_type,
+                AnalysisJob.status.in_(
+                    [JobStatus.PENDING.value, JobStatus.RETRY_WAIT.value]
+                ),
+                AnalysisJob.available_at <= now,
+            )
+            .order_by(AnalysisJob.priority.asc(), AnalysisJob.id.asc())
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+
+        job = session.execute(stmt).scalars().first()
+        if job is None:
+            return None
+
+        job.status = JobStatus.IN_PROGRESS.value
+        job.claimed_at = now
+        job.heartbeat_at = now
+        job.worker_id = worker_id
+        job.updated_at = now
+        session.flush()
+        return job
+
+    def mark_succeeded(
+        self,
+        session: Session,
+        *,
+        job: AnalysisJob,
+        now: datetime,
+    ) -> None:
+        job.status = JobStatus.SUCCEEDED.value
+        job.finished_at = now
+        job.updated_at = now
+        session.flush()
+
+    def mark_retry_wait(
+        self,
+        session: Session,
+        *,
+        job: AnalysisJob,
+        now: datetime,
+        next_available_at: datetime,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        job.status = JobStatus.RETRY_WAIT.value
+        job.retry_count += 1
+        job.available_at = next_available_at
+        job.error_code = error_code
+        job.error_message = error_message
+        job.updated_at = now
+        session.flush()
+
+    def mark_failed(
+        self,
+        session: Session,
+        *,
+        job: AnalysisJob,
+        now: datetime,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        job.status = JobStatus.FAILED.value
+        job.finished_at = now
+        job.error_code = error_code
+        job.error_message = error_message
+        job.updated_at = now
+        session.flush()
+
+    def touch_heartbeat(
+        self,
+        session: Session,
+        *,
+        job: AnalysisJob,
+        now: datetime,
+    ) -> None:
+        job.heartbeat_at = now
+        job.updated_at = now
+        session.flush()
+
+    def find_stuck_jobs(
+        self,
+        session: Session,
+        *,
+        timeout_before: datetime,
+        limit: int = 100,
+    ) -> List[AnalysisJob]:
+        stmt = (
+            select(AnalysisJob)
+            .where(
+                AnalysisJob.status == JobStatus.IN_PROGRESS.value,
+                or_(
+                    and_(
+                        AnalysisJob.heartbeat_at.is_(None),
+                        AnalysisJob.claimed_at.is_not(None),
+                        AnalysisJob.claimed_at < timeout_before,
+                    ),
+                    AnalysisJob.heartbeat_at < timeout_before,
+                ),
+            )
+            .order_by(AnalysisJob.claimed_at.asc(), AnalysisJob.id.asc())
+            .limit(limit)
+        )
+        return list(session.execute(stmt).scalars().all())
+
+    def get_by_id(self, session: Session, job_id: int) -> Optional[AnalysisJob]:
+        return session.get(AnalysisJob, job_id)
+```
+
+### 이 파일의 핵심 포인트
+
+* `PENDING`뿐 아니라 `RETRY_WAIT`도 claim 대상에 포함
+* `available_at <= now` 조건 필수
+* `with_for_update(skip_locked=True)`로 중복 claim 방지
+* `mark_*()`는 상태 전이를 한 군데에 모음
+
+---
+
+## 3. `src/services/analysis_job_service.py`
+
+상태 전이 정책을 서비스 계층에 고정합니다.
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+
+class AnalysisJobService:
+    def __init__(self, job_repository):
+        self.job_repository = job_repository
+
+    def enqueue_job(
+        self,
+        session,
+        *,
+        job_type: str,
+        message_id: int,
+        message_version_id: int,
+        payload_json: dict | None = None,
+        priority: int = 100,
+        max_retries: int = 3,
+    ):
+        now = datetime.utcnow()
+        return self.job_repository.enqueue_job(
+            session,
+            job_type=job_type,
+            message_id=message_id,
+            message_version_id=message_version_id,
+            payload_json=payload_json,
+            priority=priority,
+            max_retries=max_retries,
+            now=now,
+        )
+
+    def claim_next_job(self, session, *, job_type: str, worker_id: str):
+        now = datetime.utcnow()
+        return self.job_repository.claim_next_job(
+            session,
+            job_type=job_type,
+            worker_id=worker_id,
+            now=now,
+        )
+
+    def mark_job_succeeded(self, session, *, job) -> None:
+        now = datetime.utcnow()
+        self.job_repository.mark_succeeded(session, job=job, now=now)
+
+    def mark_job_failed(
+        self,
+        session,
+        *,
+        job,
+        error_code: str,
+        error_message: str,
+        retryable: bool,
+    ) -> None:
+        now = datetime.utcnow()
+
+        if retryable and (job.retry_count + 1) < job.max_retries:
+            next_available_at = now + self._compute_backoff(job.retry_count + 1)
+            self.job_repository.mark_retry_wait(
+                session,
+                job=job,
+                now=now,
+                next_available_at=next_available_at,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            return
+
+        self.job_repository.mark_failed(
+            session,
+            job=job,
+            now=now,
+            error_code=error_code,
+            error_message=error_message,
+        )
+
+    def touch_heartbeat(self, session, *, job) -> None:
+        now = datetime.utcnow()
+        self.job_repository.touch_heartbeat(session, job=job, now=now)
+
+    @staticmethod
+    def _compute_backoff(retry_count: int) -> timedelta:
+        """
+        단순 고정형 backoff.
+        운영 중 필요하면 지수형으로 바꾸면 됩니다.
+        """
+        if retry_count <= 1:
+            return timedelta(minutes=1)
+        if retry_count == 2:
+            return timedelta(minutes=5)
+        if retry_count == 3:
+            return timedelta(minutes=15)
+        return timedelta(minutes=30)
+```
+
+### 이 파일의 역할
+
+* worker가 retry 정책을 직접 계산하지 않게 함
+* 모든 worker가 동일한 실패 정책을 따르게 함
+
+---
+
+## 4. `src/workers/preprocess_worker.py`
+
+이제 `NORMALIZE` job만 소비하는 worker입니다.
+
+```python
+from __future__ import annotations
+
+import logging
+import socket
+import time
+
+from src.domain.constants import JobType
+
+logger = logging.getLogger(__name__)
+
+
+class PreprocessWorker:
+    def __init__(
+        self,
+        session_factory,
+        job_service,
+        preprocess_service,
+        poll_interval: float = 1.0,
+    ):
+        self.session_factory = session_factory
+        self.job_service = job_service
+        self.preprocess_service = preprocess_service
+        self.poll_interval = poll_interval
+        self.worker_id = f"preprocess:{socket.gethostname()}"
+
+    def run_forever(self) -> None:
+        while True:
+            processed = self.run_once()
+            if not processed:
+                time.sleep(self.poll_interval)
+
+    def run_once(self) -> bool:
+        with self.session_factory() as session:
+            job = self.job_service.claim_next_job(
+                session,
+                job_type=JobType.NORMALIZE.value,
+                worker_id=self.worker_id,
+            )
+
+            if job is None:
+                session.commit()
+                return False
+
+            try:
+                preprocess_result_id = self.preprocess_service.run_normalize_job(
+                    session,
+                    job=job,
+                )
+                self.job_service.mark_job_succeeded(session, job=job)
+                session.commit()
+
+                logger.info(
+                    "normalize job succeeded job_id=%s message_id=%s preprocess_result_id=%s",
+                    job.id,
+                    job.message_id,
+                    preprocess_result_id,
+                )
+                return True
+
+            except Exception as exc:
+                self.job_service.mark_job_failed(
+                    session,
+                    job=job,
+                    error_code="NORMALIZE_ERROR",
+                    error_message=str(exc),
+                    retryable=True,
+                )
+                session.commit()
+
+                logger.exception(
+                    "normalize job failed job_id=%s message_id=%s",
+                    job.id,
+                    job.message_id,
+                )
+                return True
+```
+
+### 여기서 중요한 점
+
+* 메시지 목록을 직접 읽지 않습니다
+* 오직 `claim_next_job()` 결과만 처리합니다
+* 실패해도 반드시 상태 변경 후 `commit()`합니다
+
+---
+
+## 5. `src/services/preprocess_service.py`
+
+`NORMALIZE` 수행 + 다음 job 생성입니다.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from src.domain.constants import JobType
+
+
+@dataclass
+class NormalizeOutput:
+    normalized_text: str
+    cleaned_text: str
+    language_code: str | None
+    token_count: int
+    line_count: int
+    char_count: int
+    has_url: bool
+    has_ticker_hint: bool
+
+
+class PreprocessService:
+    PREPROCESS_VERSION = "v1"
+
+    def __init__(
+        self,
+        message_version_repository,
+        preprocess_result_repository,
+        job_service,
+    ):
+        self.message_version_repository = message_version_repository
+        self.preprocess_result_repository = preprocess_result_repository
+        self.job_service = job_service
+
+    def run_normalize_job(self, session, *, job):
+        message_version = self.message_version_repository.get_by_id(
+            session,
+            job.message_version_id,
+        )
+        if message_version is None:
+            raise ValueError(
+                f"message_version not found: message_version_id={job.message_version_id}"
+            )
+
+        output = self._normalize(message_version.raw_text or "")
+
+        preprocess_result = self.preprocess_result_repository.create_result(
+            session,
+            message_id=job.message_id,
+            message_version_id=message_version.id,
+            normalize_job_id=job.id,
+            normalized_text=output.normalized_text,
+            cleaned_text=output.cleaned_text,
+            language_code=output.language_code,
+            token_count=output.token_count,
+            line_count=output.line_count,
+            char_count=output.char_count,
+            has_url=output.has_url,
+            has_ticker_hint=output.has_ticker_hint,
+            preprocess_version=self.PREPROCESS_VERSION,
+        )
+
+        self.job_service.enqueue_job(
+            session,
+            job_type=JobType.SINGLE_MESSAGE_SUMMARY.value,
+            message_id=job.message_id,
+            message_version_id=message_version.id,
+            payload_json={"preprocess_result_id": preprocess_result.id},
+        )
+
+        return preprocess_result.id
+
+    def _normalize(self, raw_text: str) -> NormalizeOutput:
+        cleaned = raw_text.replace("\u200b", " ").strip()
+        normalized = " ".join(cleaned.split())
+
+        has_url = ("http://" in normalized) or ("https://" in normalized)
+        has_ticker_hint = any(token.startswith("$") for token in normalized.split())
+
+        return NormalizeOutput(
+            normalized_text=normalized,
+            cleaned_text=cleaned,
+            language_code=None,
+            token_count=len(normalized.split()) if normalized else 0,
+            line_count=len(cleaned.splitlines()) if cleaned else 0,
+            char_count=len(normalized),
+            has_url=has_url,
+            has_ticker_hint=has_ticker_hint,
+        )
+```
+
+### 핵심 포인트
+
+* `message_version_id` 기준으로 읽습니다
+* `messages.raw_text`를 다시 읽지 않습니다
+* preprocess가 끝나면 summary job을 enqueue합니다
+
+---
+
+## 6. `src/workers/scheduler_worker.py`
+
+stuck job 복구 전용 worker입니다.
+
+```python
+from __future__ import annotations
+
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+
+class SchedulerWorker:
+    def __init__(
+        self,
+        session_factory,
+        scheduler_service,
+        poll_interval: float = 30.0,
+    ):
+        self.session_factory = session_factory
+        self.scheduler_service = scheduler_service
+        self.poll_interval = poll_interval
+
+    def run_forever(self) -> None:
+        while True:
+            self.run_once()
+            time.sleep(self.poll_interval)
+
+    def run_once(self):
+        with self.session_factory() as session:
+            stats = self.scheduler_service.recover_stuck_jobs(
+                session,
+                timeout_minutes=10,
+            )
+            session.commit()
+
+            logger.info(
+                "scheduler recovery finished recovered_count=%s failed_count=%s",
+                stats.recovered_count,
+                stats.failed_count,
+            )
+            return stats
+```
+
+---
+
+## 7. `src/services/scheduler_service.py`
+
+실제 stuck 판정과 복구 정책입니다.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+
+@dataclass
+class RecoveryStats:
+    recovered_count: int
+    failed_count: int
+
+
+class SchedulerService:
+    def __init__(self, job_repository):
+        self.job_repository = job_repository
+
+    def recover_stuck_jobs(self, session, *, timeout_minutes: int = 10) -> RecoveryStats:
+        now = datetime.utcnow()
+        timeout_before = now - timedelta(minutes=timeout_minutes)
+
+        stuck_jobs = self.job_repository.find_stuck_jobs(
+            session,
+            timeout_before=timeout_before,
+        )
+
+        recovered_count = 0
+        failed_count = 0
+
+        for job in stuck_jobs:
+            if (job.retry_count + 1) < job.max_retries:
+                self.job_repository.mark_retry_wait(
+                    session,
+                    job=job,
+                    now=now,
+                    next_available_at=now + timedelta(minutes=1),
+                    error_code="STUCK_TIMEOUT",
+                    error_message="Job exceeded heartbeat timeout",
+                )
+                recovered_count += 1
+            else:
+                self.job_repository.mark_failed(
+                    session,
+                    job=job,
+                    now=now,
+                    error_code="STUCK_MAX_RETRIES_EXCEEDED",
+                    error_message="Job exceeded heartbeat timeout and max retries",
+                )
+                failed_count += 1
+
+        return RecoveryStats(
+            recovered_count=recovered_count,
+            failed_count=failed_count,
+        )
+```
+
+---
+
+## 8. `src/run_worker.py`
+
+운영과 테스트를 단순화하는 통합 진입점입니다.
+
+```python
+from __future__ import annotations
+
+import argparse
+
+from src.bootstrap import build_container
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--worker",
+        required=True,
+        choices=["preprocess", "inference", "scheduler"],
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run only one iteration instead of forever loop",
+    )
+    args = parser.parse_args()
+
+    container = build_container()
+
+    if args.worker == "preprocess":
+        worker = container.preprocess_worker()
+    elif args.worker == "inference":
+        worker = container.inference_worker()
+    elif args.worker == "scheduler":
+        worker = container.scheduler_worker()
+    else:
+        raise ValueError(f"Unsupported worker type: {args.worker}")
+
+    if args.once:
+        worker.run_once()
+    else:
+        worker.run_forever()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### `build_container()`에서 최소한 제공해야 할 것
+
+* `session_factory`
+* `analysis_job_repository`
+* `analysis_job_service`
+* `preprocess_service`
+* `scheduler_service`
+* `preprocess_worker`
+* `scheduler_worker`
+* `inference_worker`
+
+---
+
+## 9. 바로 다음 패치 포인트
+
+이제 실제 코드베이스에서 가장 먼저 손대야 하는 순서는 아래가 맞습니다.
+
+### 1단계
+
+`constants.py` 추가
+
+### 2단계
+
+`analysis_job_repository.py` 추가 또는 보강
+특히 `claim_next_job()`
+
+### 3단계
+
+`analysis_job_service.py` 추가
+
+### 4단계
+
+`preprocess_service.py`와 `preprocess_worker.py` 연결
+
+### 5단계
+
+`scheduler_service.py`와 `scheduler_worker.py` 연결
+
+### 6단계
+
+`run_worker.py` 통합
+
+---
+
+## 10. 바로 확인할 테스트 3개
+
+이번 코드가 들어가면 최소 아래 3개부터 확인하면 됩니다.
+
+### A. preprocess worker 정상 처리
+
+* `NORMALIZE` job 1건 생성
+* `run_once()` 실행
+* preprocess result 생성
+* summary job 생성
+* 기존 job `SUCCEEDED`
+
+### B. scheduler가 stuck job 복구
+
+* `IN_PROGRESS`, `heartbeat_at` 오래된 job 생성
+* `scheduler.run_once()` 실행
+* `RETRY_WAIT` 또는 `FAILED` 전환 확인
+
+### C. `run_worker.py --worker preprocess --once`
+
+* 라우팅 정상 동작 확인
+
+---
+
+## 11. 지금 단계에서 가장 주의할 점
+
+가장 많이 틀리는 부분은 두 가지입니다.
+
+첫째, `collector_worker`에서 아직도 전처리/추론을 직접 부르는 코드가 남아 있는 경우입니다.
+그 코드는 제거하고 `persist_message()`만 호출하도록 바꿔야 합니다.
+
+둘째, worker가 `messages.raw_text`를 직접 읽는 경우입니다.
+이제부터는 반드시 `message_version_id` 또는 `preprocess_result_id` 기준으로 처리해야 합니다.
+
+---
+
+다음 단계로는 **`inference_worker.py` + `inference_service.py` + `run_worker` smoke test + `scheduler_worker` 테스트 2~3개 초안**까지 이어서 바로 정리하는 것이 가장 자연스럽습니다.

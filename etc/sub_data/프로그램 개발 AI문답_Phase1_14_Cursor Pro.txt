@@ -1,0 +1,324 @@
+---------------------------------------------------------------------------------------------------------------------------------------------------
+[사용자 요청사항_14]
+다음으로는 **워커 분리형 기준으로 Cursor Pro 프롬프트를 수정본으로 다시 정리하는 단계**가 맞습니다.
+---------------------------------------------------------------------------------------------------------------------------------------------------
+
+# Cursor Pro용 수정 프롬프트
+
+## 목적
+
+* **워커 분리형 Phase 1 실제 구현**
+* 웹 서버와 Collector Worker가 **같은 공통 기반**을 공유하게 만들기
+* 최소 실행 가능 상태까지 코드 생성
+
+```text
+프로젝트명: 텔레그램 테마연동 자동매매 프로그램
+
+현재 작업 범위:
+전체 프로젝트가 아니라 오직 "Phase 1. 기반 구축"만 구현한다.
+
+개발 환경:
+- OS: Windows
+- Python 3.11.9 64bit
+- 가상환경: .venv
+- IDE: VS Code
+- 루트폴더: D:\telegram_trading
+
+프로젝트 목표 요약:
+텔레그램 정보를 수집하여 AI 에이전트가 분석하고,
+5개 이상의 AI 에이전트가 상호 토론을 통해 신뢰성 있는 테마를 발굴한 뒤,
+발굴된 테마를 자동매매에 활용하는 시스템을 만들 예정이다.
+
+중요한 구조 전제:
+- 웹 서버와 텔레그램 수집 워커는 분리한다.
+- 웹 서버는 관리/API/상태조회 역할만 담당한다.
+- Collector Worker는 향후 채널 업데이트, 자동복원, 메시지 수집을 담당한다.
+- 지금은 Phase 1이므로 텔레그램 상세 수집 로직까지 구현하지 말고,
+  Collector Worker의 실행 가능한 최소 뼈대까지만 만든다.
+
+규모 전제:
+- 채널 수 약 150개, 향후 증가 가능
+- 공시채널 1개는 하루 약 15,000건
+- 기타 채널은 대체로 하루 500건 이하
+- 따라서 FastAPI + PostgreSQL + 단일 Collector Worker 구조로 시작한다.
+- Kafka, Redis Queue, 마이크로서비스 등 과설계는 지금 하지 않는다.
+
+Phase 1 구현 범위:
+1. requirements.txt 작성
+2. .env.example 작성
+3. config/settings.py 구현
+4. src/common/logger.py 구현
+5. src/common/exceptions.py 구현
+6. src/common/responses.py 구현
+7. src/infra/db/base.py 구현
+8. src/infra/db/session.py 구현
+9. src/infra/db/models.py 구현
+10. src/web/app.py 구현
+11. src/web/routes/health.py 구현
+12. src/workers/collector_worker.py 구현
+13. src/workers/startup_tasks.py 구현
+14. run_web.py 구현
+15. run_collector.py 구현
+16. 최소 실행 가능한 FastAPI 앱 상태 맞추기
+17. 최소 실행 가능한 Collector Worker 상태 맞추기
+18. /health, /ready 동작 가능하게 하기
+
+기술 기준:
+- FastAPI
+- Uvicorn
+- SQLAlchemy
+- Alembic은 지금 즉시 깊게 구현하지 않아도 되지만 추후 붙이기 쉽게 구조를 잡을 것
+- pydantic-settings 기반 설정 로더
+- python-dotenv
+- PostgreSQL 기준 DB 연결 구조
+- pytest 기본 준비 가능 구조
+- Telethon, 한국투자증권 API는 "향후 확장 예정" 수준으로만 반영하고 지금 구현하지 말 것
+
+중요 제약:
+- Phase 2 텔레그램 수집 상세 구현 금지
+- 자동복원, 채널업데이트, 메시지수집의 상세 비즈니스 로직 구현 금지
+- 그러나 Collector Worker 구조와 startup task 호출 위치는 만들어둘 것
+- 불필요한 과설계 금지
+- placeholder만 남기는 것도 금지
+- "지금 당장 실행 가능한 최소 골격"을 목표로 할 것
+- 파일 간 책임을 명확히 분리할 것
+- 환경변수는 반드시 settings 객체를 통해 읽게 할 것
+- API 응답 형식은 성공/실패 공통 포맷으로 통일할 것
+- 예외 처리도 공통 구조로 설계할 것
+- 로그는 콘솔 + 파일 모두 남기게 할 것
+- 웹 서버와 워커는 같은 settings/logger/db 구조를 공유하게 할 것
+- /ready 에서는 DB 연결 상태를 확인할 수 있게 할 것
+- Worker 시작 시에도 DB 연결 및 설정 로드 여부를 로그로 확인할 수 있게 할 것
+- import 경로가 실제 실행 가능한 형태로 맞아야 함
+
+원하는 결과:
+- 위 파일들을 실제 생성/수정 가능한 수준의 코드로 작성
+- 웹 서버와 워커가 각각 독립 실행 가능해야 함
+- run_web.py 실행 시 FastAPI 앱이 뜨고 /health, /ready 응답 가능해야 함
+- run_collector.py 실행 시 Collector Worker 시작 로그가 정상 출력되어야 함
+- DB 접속 실패 시 웹/API와 워커 모두 일관된 예외 구조 또는 로그 구조를 유지해야 함
+
+반드시 아래 순서로 작업해줘:
+
+1. 먼저 최종 파일 트리를 제시
+2. 각 파일의 역할을 1~3줄로 설명
+3. 각 파일의 전체 초안 코드를 제시
+4. 마지막에 Windows 기준 실행 순서를 제시
+5. 마지막에 예상 점검 포인트를 체크리스트로 제시
+
+필수 파일 목록:
+- requirements.txt
+- .env.example
+- config/settings.py
+- src/common/logger.py
+- src/common/exceptions.py
+- src/common/responses.py
+- src/infra/db/base.py
+- src/infra/db/session.py
+- src/infra/db/models.py
+- src/web/app.py
+- src/web/routes/health.py
+- src/workers/collector_worker.py
+- src/workers/startup_tasks.py
+- run_web.py
+- run_collector.py
+
+반드시 지켜야 할 구현 방향:
+
+[1] requirements.txt
+최소 패키지만 넣되, 아래 범주는 반영
+- fastapi
+- uvicorn[standard]
+- sqlalchemy
+- alembic
+- pydantic-settings
+- python-dotenv
+- psycopg[binary]
+- telethon
+- httpx
+- pytest
+
+[2] .env.example
+아래 성격의 환경변수 포함
+- 앱 설정
+- DB 설정
+- 로그 설정
+- 텔레그램 예약 설정
+- collector 설정
+- 한국투자증권 예약 설정
+
+[3] settings.py
+아래 구조를 권장
+- AppSettings
+- DBSettings
+- LogSettings
+- TelegramSettings
+- CollectorSettings
+- BrokerSettings
+- Settings
+그리고 get_settings() 또는 singleton 형태로 어디서든 쉽게 불러오게 할 것
+
+[4] logger.py
+- 콘솔 + 파일 핸들러
+- logs 디렉토리 자동 생성 고려
+- app.log / collector.log / error.log 구조 고려
+- 웹 서버용 logger와 워커용 logger를 구분해서 얻어올 수 있는 형태
+- 너무 복잡한 커스텀 로거 금지
+
+[5] exceptions.py
+최소 아래 예외 구조 포함
+- AppException
+- DatabaseException
+- ExternalAPIException
+- ValidationAppException
+- NotFoundException
+각 예외는 status_code, message, error_code를 가질 수 있게 설계
+
+[6] responses.py
+성공/실패 JSON 응답 helper 작성
+예:
+{
+  "success": true,
+  "message": "...",
+  "data": ...
+}
+{
+  "success": false,
+  "message": "...",
+  "error_code": "...",
+  "data": null
+}
+
+[7] DB 관련
+- base.py: DeclarativeBase 또는 Base 정의
+- session.py: DATABASE_URL 생성, engine, SessionLocal, get_db()
+- models.py: Phase 1 최소 모델 2~3개
+  권장:
+  - SystemLog
+  - TelegramAccount
+  - TelegramRuntimeSetting
+- 향후 telegram_channels, telegram_messages 확장 가능하도록 작성
+
+[8] app.py
+- FastAPI 앱 생성
+- 앱 제목/버전 설정
+- 예외 핸들러 등록
+- health 라우터 등록
+- startup 로그 남기기
+- 너무 많은 라우터 미리 만들지 말 것
+
+[9] health.py
+최소 2개 엔드포인트:
+- GET /health
+- GET /ready
+둘 다 공통 응답 포맷 사용
+/ready 에서는 DB 연결 확인 포함
+
+[10] collector_worker.py
+- Worker 클래스 또는 실행 함수 형태
+- 설정 로드
+- DB 연결 점검
+- startup_tasks 호출
+- 주기 루프는 아직 단순한 형태여도 됨
+- 텔레그램 실제 수집은 아직 넣지 말 것
+
+[11] startup_tasks.py
+- load runtime settings placeholder
+- startup log
+- future hooks for channel sync / restore / auto start
+- 지금 단계에서는 구조만 실행되게 할 것
+
+[12] run_web.py
+- uvicorn 실행 진입점
+- host, port는 settings 기반
+- reload는 debug 값 고려 가능
+
+[13] run_collector.py
+- collector worker 실행 진입점
+- 시작 로그 명확히 출력
+- KeyboardInterrupt 등 종료 처리 고려
+
+출력 형식:
+- 한국어
+- 코드블록 적극 사용
+- 각 파일은 "파일 경로"를 먼저 쓰고 그 아래 전체 코드 제시
+- 설명보다 실행 가능한 결과물 중심
+- 마지막에는 "생성 후 실행 순서"와 "오류 점검 포인트"를 정리
+```
+
+---
+
+# 3) Cursor 보조 지시문
+
+메인 프롬프트 뒤에 이걸 붙이면 결과가 더 안정적입니다.
+
+```text
+추가 지시:
+- Windows 경로 기준으로 생각할 것
+- Python 3.11 문법 기준으로 작성할 것
+- pydantic v2 / pydantic-settings v2 기준으로 작성할 것
+- SQLAlchemy 2.x 기준으로 작성할 것
+- 상대 import / 절대 import 충돌 없게 맞출 것
+- 코드가 길어져도 생략하지 말고 각 파일을 끝까지 작성할 것
+- placeholder만 적지 말고 실제 실행 가능한 최소 코드로 작성할 것
+- 다만 아직 쓰지 않는 텔레그램 상세 수집 로직은 넣지 말 것
+- worker는 실행 가능해야 하지만 실제 수집 loop는 단순한 시작 구조만 갖추면 된다
+```
+
+---
+
+# 4) Cursor 2단계 분할 버전
+
+한 번에 길면 이렇게 나눠서 넣으면 됩니다.
+
+## 1차
+
+```text
+위 조건을 기준으로 먼저 아래만 작성해줘.
+- 최종 파일 트리
+- requirements.txt
+- .env.example
+- config/settings.py
+- src/common/logger.py
+- src/common/exceptions.py
+- src/common/responses.py
+- src/infra/db/base.py
+- src/infra/db/session.py
+- src/infra/db/models.py
+
+조건:
+- 워커 분리형 구조 반영
+- 실제 실행 가능한 코드
+- 파일별 전체 코드 제시
+- 설명은 짧게
+```
+
+## 2차
+
+```text
+이제 이어서 아래 파일들을 작성해줘.
+- src/web/app.py
+- src/web/routes/health.py
+- src/workers/collector_worker.py
+- src/workers/startup_tasks.py
+- run_web.py
+- run_collector.py
+
+조건:
+- 1차에서 만든 settings/logger/exceptions/responses/db 구조와 정확히 연결되게 작성
+- /health, /ready 동작 가능해야 함
+- worker 실행 시 시작 로그와 DB 점검이 가능해야 함
+- 실행 명령어와 점검 포인트까지 같이 정리
+```
+
+---
+
+# 5) 추천 사용 순서
+
+1. **Antigravity**에 수정 프롬프트 입력
+2. 설계안 확인
+3. **Cursor Pro**에 수정 프롬프트 입력
+4. 코드 생성
+5. 실행 후 오류가 나면 점검 프롬프트로 수정
+
+이 흐름이 가장 안정적입니다.

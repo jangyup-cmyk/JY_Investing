@@ -1,0 +1,482 @@
+좋습니다. 실제 모델명과 세션 구조에 맞춘 **`preprocess_worker.py` / `inference_worker.py` 최종본**입니다.
+
+전제는 두 가지입니다.
+`session.py`에는 `AsyncSessionLocal()` alias가 이미 있고, 워커는 그 세션 팩토리를 그대로 쓰면 됩니다. 또한 실제 모델명은 `TelegramMessage`, `NormalizedTelegramMessage`, `TelegramMessageFeature`, `AnalysisJob`, `AnalysisResult`이며, `AnalysisJob`은 `telegram_message_id`, `message_version_id`, `job_type`, `status`, `priority`, `payload_json` 등을 직접 갖고 있습니다. `collector_worker.py`도 이미 `persist_message()` 안에서 `normalize` job을 enqueue하는 구조입니다. 
+
+아래 코드는 **현재 업로드된 실제 모델 필드**에 맞춰 조정했습니다. 특히 `TelegramMessageFeature`에는 지금 `entity_spans_json`, `source_reliability_score`가 없고, `AnalysisResult`에는 `input_version` 컬럼이 없으므로 그 필드는 쓰지 않았습니다. 또한 실제 `AnalysisJob.status`, `job_type`, `target_type`은 문자열 컬럼이라 서비스에서 `.value`로 저장된다는 전제로 비교도 Enum value 기준으로 맞췄습니다.
+
+## `src/workers/preprocess_worker.py`
+
+```python
+from __future__ import annotations
+
+import hashlib
+import re
+
+from sqlalchemy import select
+
+from src.common.logger import logger
+from src.infra.db.models import (
+    AnalysisJob,
+    JobStatus,
+    JobTargetType,
+    JobType,
+    TelegramMessage,
+    TelegramMessageFeature,
+    MessageVersion,
+    NormalizedTelegramMessage,
+)
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+from src.workers.base_worker import BaseWorker
+
+
+class PreprocessWorker(BaseWorker):
+    async def run_once(self) -> bool:
+        async with AsyncSessionLocal() as session:
+            job = await AnalysisJobService.claim_next_job(
+                session,
+                worker_name=self.worker_name,
+                allowed_job_types=[JobType.NORMALIZE, JobType.EXTRACT_FEATURES],
+            )
+
+        if not job:
+            return False
+
+        if job.job_type == JobType.NORMALIZE.value:
+            await self._handle_normalize(job.id)
+            return True
+
+        if job.job_type == JobType.EXTRACT_FEATURES.value:
+            await self._handle_extract_features(job.id)
+            return True
+
+        return False
+
+    async def _handle_normalize(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                payload = job.payload_json or {}
+                message = await session.get(TelegramMessage, job.telegram_message_id)
+                if message is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="MESSAGE_NOT_FOUND",
+                        error_message=f"telegram_message_id={job.telegram_message_id}",
+                    )
+                    return
+
+                version_id = payload.get("version_id") or job.message_version_id
+                if version_id:
+                    version = await session.get(MessageVersion, int(version_id))
+                else:
+                    version = await self._get_or_create_current_version(session, message)
+
+                if version is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="VERSION_NOT_FOUND",
+                        error_message=f"telegram_message_id={message.id}",
+                    )
+                    return
+
+                cleaning_version = payload.get("cleaning_version", "v1")
+
+                existing = await session.scalar(
+                    select(NormalizedTelegramMessage).where(
+                        NormalizedTelegramMessage.telegram_message_id == message.id,
+                        NormalizedTelegramMessage.message_version_id == version.id,
+                        NormalizedTelegramMessage.cleaning_version == cleaning_version,
+                    )
+                )
+
+                raw_text = version.message_text or message.message_text_raw or ""
+                normalized_text = self._normalize_text(raw_text)
+                duplicate_key = self._hash(normalized_text[:200]) if normalized_text else None
+                is_spam = self._is_spam(normalized_text)
+
+                if existing is None:
+                    normalized = NormalizedTelegramMessage(
+                        telegram_message_id=message.id,
+                        message_version_id=version.id,
+                        cleaning_version=cleaning_version,
+                        normalized_text=normalized_text,
+                        language_code="ko",
+                        token_estimate=max(1, len(normalized_text) // 4) if normalized_text else 0,
+                        is_spam=is_spam,
+                        spam_reason="spam_keyword" if is_spam else None,
+                        is_duplicate_near=False,
+                        duplicate_group_key=duplicate_key,
+                        quality_score=0.1 if is_spam else 0.8,
+                    )
+                    session.add(normalized)
+                    await session.flush()
+                else:
+                    normalized = existing
+
+                # 원본 메시지에도 최신 normalized text 반영
+                message.message_text_normalized = normalized.normalized_text
+
+                await AnalysisJobService.enqueue_job(
+                    session,
+                    job_type=JobType.EXTRACT_FEATURES,
+                    target_type=JobTargetType.MESSAGE,
+                    target_id=message.id,
+                    telegram_message_id=message.id,
+                    message_version_id=version.id,
+                    idempotency_key=f"extract_features:message:{message.id}:version:{version.id}:fv1",
+                    payload_json={
+                        "message_id": message.id,
+                        "version_id": version.id,
+                        "normalized_message_id": normalized.id,
+                    },
+                    priority=job.priority,
+                    max_attempts=3,
+                )
+
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="NORMALIZE_ERROR",
+                    error_message=str(e),
+                )
+            logger.exception(f"[{self.worker_name}] normalize failed: {e}")
+
+    async def _handle_extract_features(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                payload = job.payload_json or {}
+                message_id = int(payload["message_id"])
+                version_id = int(payload["version_id"])
+                normalized_message_id = int(payload["normalized_message_id"])
+
+                normalized = await session.get(NormalizedTelegramMessage, normalized_message_id)
+                if normalized is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="NORMALIZED_MESSAGE_NOT_FOUND",
+                        error_message=f"normalized_message_id={normalized_message_id}",
+                    )
+                    return
+
+                existing = await session.scalar(
+                    select(TelegramMessageFeature).where(
+                        TelegramMessageFeature.telegram_message_id == message_id,
+                        TelegramMessageFeature.message_version_id == version_id,
+                        TelegramMessageFeature.feature_version == "v1",
+                    )
+                )
+
+                text = normalized.normalized_text or ""
+                ticker_candidates = self._extract_tickers(text)
+                keyword_hits = self._extract_keywords(text)
+                theme_candidates = self._map_themes(keyword_hits)
+
+                if existing is None:
+                    feature = TelegramMessageFeature(
+                        telegram_message_id=message_id,
+                        message_version_id=version_id,
+                        normalized_message_id=normalized_message_id,
+                        feature_version="v1",
+                        ticker_candidates_json=ticker_candidates,
+                        company_alias_hits_json=None,
+                        theme_candidates_json=theme_candidates,
+                        keyword_hits_json=keyword_hits,
+                        sentiment_rule_score=self._score_sentiment(text),
+                        urgency_score=self._score_urgency(text),
+                        novelty_score=0.5,
+                    )
+                    session.add(feature)
+                    await session.flush()
+                else:
+                    feature = existing
+
+                await AnalysisJobService.enqueue_job(
+                    session,
+                    job_type=JobType.SINGLE_MESSAGE_SUMMARY,
+                    target_type=JobTargetType.MESSAGE,
+                    target_id=message_id,
+                    telegram_message_id=message_id,
+                    message_version_id=version_id,
+                    idempotency_key=f"single_message_summary:message:{message_id}:version:{version_id}:sv1",
+                    payload_json={
+                        "message_id": message_id,
+                        "version_id": version_id,
+                        "normalized_message_id": normalized_message_id,
+                        "feature_id": feature.id,
+                    },
+                    priority=job.priority,
+                    max_attempts=3,
+                )
+
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="EXTRACT_FEATURES_ERROR",
+                    error_message=str(e),
+                )
+            logger.exception(f"[{self.worker_name}] extract_features failed: {e}")
+
+    async def _get_or_create_current_version(
+        self,
+        session,
+        message: TelegramMessage,
+    ) -> MessageVersion:
+        current = await session.scalar(
+            select(MessageVersion).where(
+                MessageVersion.telegram_message_id == message.id,
+                MessageVersion.is_current.is_(True),
+            )
+        )
+        if current:
+            return current
+
+        version = MessageVersion(
+            telegram_message_id=message.id,
+            version_no=1,
+            message_text=message.message_text_raw,
+            raw_hash=self._hash(message.message_text_raw or ""),
+            edit_date_utc=message.edited_at,
+            is_current=True,
+        )
+        session.add(version)
+        await session.flush()
+        return version
+
+    def _normalize_text(self, text: str) -> str:
+        text = re.sub(r"https?://\S+", " ", text)
+        text = re.sub(r"t\.me/\S+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _is_spam(self, text: str) -> bool:
+        spam_keywords = ["무료입장", "오픈채팅", "문의주세요", "수익인증", "입장코드"]
+        return any(k in text for k in spam_keywords)
+
+    def _extract_tickers(self, text: str) -> dict:
+        codes = re.findall(r"\b\d{6}\b", text)
+        uniq = list(dict.fromkeys(codes))
+        return {"tickers": [{"symbol": c, "confidence": 0.75} for c in uniq]}
+
+    def _extract_keywords(self, text: str) -> dict:
+        keywords = ["수주", "실적", "상한가", "급등", "승인", "계약", "반도체", "2차전지", "로봇", "바이오", "정책"]
+        hits = [kw for kw in keywords if kw in text]
+        return {"keywords": hits}
+
+    def _map_themes(self, keyword_hits: dict) -> dict:
+        mapping = {
+            "반도체": "반도체",
+            "2차전지": "2차전지",
+            "로봇": "로봇",
+            "바이오": "바이오",
+            "정책": "정책수혜",
+        }
+        themes = []
+        for kw in keyword_hits.get("keywords", []):
+            if kw in mapping:
+                themes.append({"theme": mapping[kw], "confidence": 0.7})
+        return {"themes": themes}
+
+    def _score_sentiment(self, text: str) -> float:
+        score = 0.0
+        for kw in ["수주", "실적", "승인", "계약", "확대", "급등"]:
+            if kw in text:
+                score += 0.2
+        for kw in ["악재", "하락", "취소", "적자", "경고"]:
+            if kw in text:
+                score -= 0.2
+        return max(-1.0, min(1.0, score))
+
+    def _score_urgency(self, text: str) -> float:
+        score = 0.0
+        for kw in ["속보", "긴급", "방금", "단독", "급등", "상한가"]:
+            if kw in text:
+                score += 0.2
+        return max(0.0, min(1.0, score))
+
+    def _hash(self, value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+```
+
+## `src/workers/inference_worker.py`
+
+```python
+from __future__ import annotations
+
+from src.common.logger import logger
+from src.infra.db.models import (
+    AnalysisJob,
+    AnalysisResult,
+    JobTargetType,
+    JobType,
+    ResultType,
+    TelegramMessageFeature,
+    NormalizedTelegramMessage,
+)
+from src.infra.db.session import AsyncSessionLocal
+from src.services.analysis_job_service import AnalysisJobService
+from src.workers.base_worker import BaseWorker
+
+
+class InferenceWorker(BaseWorker):
+    def __init__(self, worker_name: str, poll_interval: float = 2.0, job_types: list[str] | None = None):
+        super().__init__(worker_name, poll_interval)
+        self.job_types = self._resolve_job_types(job_types)
+
+    async def run_once(self) -> bool:
+        async with AsyncSessionLocal() as session:
+            job = await AnalysisJobService.claim_next_job(
+                session,
+                worker_name=self.worker_name,
+                allowed_job_types=self.job_types,
+            )
+
+        if not job:
+            return False
+
+        if job.job_type == JobType.SINGLE_MESSAGE_SUMMARY.value:
+            await self._handle_single_message_summary(job.id)
+            return True
+
+        if job.job_type == JobType.WINDOW_THEME_ANALYSIS.value:
+            await self._handle_window_theme_analysis(job.id)
+            return True
+
+        return False
+
+    async def _handle_single_message_summary(self, job_id: int) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                job = await session.get(AnalysisJob, job_id)
+                if job is None:
+                    return
+
+                payload = job.payload_json or {}
+                target_id = job.target_id or job.telegram_message_id
+
+                normalized = await session.get(
+                    NormalizedTelegramMessage,
+                    int(payload["normalized_message_id"]),
+                )
+                feature = await session.get(
+                    TelegramMessageFeature,
+                    int(payload["feature_id"]),
+                )
+
+                if normalized is None or feature is None:
+                    await AnalysisJobService.mark_failed(
+                        session,
+                        job_id=job_id,
+                        error_code="INFERENCE_INPUT_NOT_FOUND",
+                        error_message=f"payload={payload}",
+                    )
+                    return
+
+                prompt_input = {
+                    "normalized_text": normalized.normalized_text,
+                    "ticker_candidates": feature.ticker_candidates_json,
+                    "theme_candidates": feature.theme_candidates_json,
+                    "keyword_hits": feature.keyword_hits_json,
+                }
+
+            # LLM 호출은 세션 밖에서
+            result_json = await self._fake_llm_summarize(prompt_input)
+
+            async with AsyncSessionLocal() as session:
+                session.add(
+                    AnalysisResult(
+                        job_id=job_id,
+                        target_type=JobTargetType.MESSAGE.value,
+                        target_id=target_id,
+                        result_type=ResultType.SUMMARY.value,
+                        model_name=job.target_model,
+                        model_version="placeholder",
+                        prompt_version=job.prompt_version,
+                        confidence=result_json.get("confidence"),
+                        latency_ms=result_json.get("latency_ms"),
+                        cost_input_tokens=result_json.get("input_tokens"),
+                        cost_output_tokens=result_json.get("output_tokens"),
+                        result_json=result_json,
+                    )
+                )
+                await session.commit()
+                await AnalysisJobService.mark_done(session, job_id=job_id)
+
+        except Exception as e:
+            async with AsyncSessionLocal() as session:
+                await AnalysisJobService.mark_failed(
+                    session,
+                    job_id=job_id,
+                    error_code="INFERENCE_ERROR",
+                    error_message=str(e),
+                )
+            logger.exception(f"[{self.worker_name}] single_message_summary failed: {e}")
+
+    async def _handle_window_theme_analysis(self, job_id: int) -> None:
+        async with AsyncSessionLocal() as session:
+            await AnalysisJobService.mark_done(session, job_id=job_id)
+
+    async def _fake_llm_summarize(self, prompt_input: dict) -> dict:
+        text = prompt_input.get("normalized_text") or ""
+        preview = text[:160]
+
+        return {
+            "summary": preview,
+            "event_type": "unknown",
+            "confidence": 0.62,
+            "input_tokens": max(1, len(text) // 4),
+            "output_tokens": 60,
+            "latency_ms": 350,
+            "evidence": {
+                "tickers": prompt_input.get("ticker_candidates"),
+                "themes": prompt_input.get("theme_candidates"),
+            },
+        }
+
+    def _resolve_job_types(self, job_types: list[str] | None) -> list[JobType]:
+        if not job_types:
+            return [JobType.SINGLE_MESSAGE_SUMMARY, JobType.WINDOW_THEME_ANALYSIS]
+        return [JobType(item) for item in job_types]
+```
+
+## 같이 꼭 반영할 것
+
+지금 모델에는 `TelegramMessage.normalized`가 `uselist=False`인데, `NormalizedTelegramMessage`는 `(telegram_message_id, message_version_id, cleaning_version)` 조합으로 여러 행을 가질 수 있는 구조라 one-to-many가 맞습니다. 또 `NormalizedTelegramMessage.features`는 `back_populates="normalized_message"`를 기대하지만 `TelegramMessageFeature` 쪽 대응 relationship이 빠져 있습니다. 이 두 군데는 앞서 드린 `models.py` diff를 먼저 반영하는 편이 안전합니다.
+
+그리고 `collector_worker.py`의 job priority는 지금 백필이 `1`, 실시간이 `100`이라서, `claim_next_job()`이 오름차순으로 job을 가져오면 백필이 실시간보다 먼저 처리됩니다. 실시간을 우선할 생각이라면 이 줄은 `priority=100 if is_backfill else 1`로 바꿔야 합니다. 
+
+## 적용 순서
+
+먼저 `models.py` 보정과 `analysis_job_service.py`를 반영하고, 그 다음 `collector_worker.py` priority 1줄을 수정한 뒤 이 두 워커 파일을 넣는 순서가 안전합니다. 그 다음 테스트는 아래 순서로 돌리면 됩니다.
+
+```bash
+python -m pytest tests/services/test_analysis_job_service.py -vv
+python -m pytest tests/workers/test_collector_persist.py -vv
+python -m pytest tests/workers/test_preprocess_worker.py -vv
+python -m pytest tests/workers/test_inference_worker.py -vv
+```
+
+`startup_tasks.py`는 이미 `persist_func`를 받아 백필 중 버퍼를 모아 짧은 `session_scope()`로 저장하는 구조라, 지금 워커 흐름과 잘 맞습니다.
+
+원하시면 다음으로는 이 코드에 맞춘 **`run_worker.py` 최종본**과 **`scheduler_worker.py` 최소 구현**까지 이어서 정리하겠습니다.

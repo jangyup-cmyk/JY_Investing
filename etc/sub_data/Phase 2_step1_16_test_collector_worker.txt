@@ -1,0 +1,183 @@
+좋습니다.
+현재 `collector_worker.py` 구조에 맞춘 **`tests/test_collector_worker.py` 완성본**을 바로 붙여넣을 수 있게 정리했습니다.
+
+핵심은 3개입니다.
+
+* `created`면 checkpoint 갱신
+* `unchanged`여도 현재 정책대로 checkpoint 갱신
+* repository가 예외를 raise하면 checkpoint는 건드리지 않고 예외는 그대로 전달
+
+```python
+import pytest
+import pytest_asyncio
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+from src.infra.db.models import (
+    Base,
+    TelegramChannel,
+    TelegramChannelCollectionState,
+)
+from src.infra.telegram.schemas import TelegramMessagePayload
+from src.workers.collector_worker import persist_message_payload
+
+
+@pytest_asyncio.fixture
+async def db_session():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with Session() as session:
+        # update_channel_checkpoint()가 telegram_channel_id=1 기준으로 상태를 만들 수 있도록
+        # 테스트용 채널을 하나 생성
+        channel = TelegramChannel(
+            telegram_account_id=1,
+            tg_channel_id="1001",
+            title="Worker Test Channel",
+            username="worker_test",
+            channel_type="CHANNEL",
+            status="SYNCED",
+            is_collecting=True,
+            last_synced_at=datetime.now(timezone.utc),
+        )
+        session.add(channel)
+        await session.commit()
+
+        yield session
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+
+def make_payload(message_id: int = 100) -> TelegramMessagePayload:
+    now = datetime.now(timezone.utc)
+    return TelegramMessagePayload(
+        telegram_channel_id=1,
+        tg_message_id=message_id,
+        sender_id=None,
+        message_text_raw=f"msg-{message_id}",
+        reply_to_message_id=None,
+        views=None,
+        forwards=None,
+        grouped_id=None,
+        edited_at=None,
+        is_deleted=False,
+        posted_at=now,
+        collected_at=now,
+        raw_payload_json={"text": f"msg-{message_id}"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_updates_checkpoint_on_created(db_session, monkeypatch):
+    payload = make_payload(101)
+
+    class DummyResult:
+        action = "created"
+        checkpoint_candidate = 101
+
+    async def fake_upsert(db, payload):
+        return DummyResult()
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        fake_upsert,
+    )
+
+    result = await persist_message_payload(db_session, payload)
+    await db_session.commit()
+
+    assert result.action == "created"
+
+    state = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert state.last_collected_message_id == 101
+    assert state.status == "ACTIVE"
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_updates_checkpoint_on_unchanged(db_session, monkeypatch):
+    payload = make_payload(123)
+
+    class DummyResult:
+        action = "unchanged"
+        checkpoint_candidate = 123
+
+    async def fake_upsert(db, payload):
+        return DummyResult()
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        fake_upsert,
+    )
+
+    result = await persist_message_payload(db_session, payload)
+    await db_session.commit()
+
+    assert result.action == "unchanged"
+
+    state = (
+        await db_session.execute(
+            select(TelegramChannelCollectionState).where(
+                TelegramChannelCollectionState.telegram_channel_id == 1
+            )
+        )
+    ).scalar_one()
+
+    assert state.last_collected_message_id == 123
+
+
+@pytest.mark.asyncio
+async def test_persist_message_payload_does_not_touch_checkpoint_when_upsert_raises(
+    db_session, monkeypatch
+):
+    payload = make_payload(999)
+
+    async def broken_upsert(db, payload):
+        raise RuntimeError("forced failure from repository")
+
+    monkeypatch.setattr(
+        "src.workers.collector_worker.upsert_telegram_message",
+        broken_upsert,
+    )
+
+    with pytest.raises(RuntimeError, match="forced failure from repository"):
+        await persist_message_payload(db_session, payload)
+
+    # checkpoint row가 생성되지 않아야 함
+    state_rows = (
+        await db_session.execute(select(TelegramChannelCollectionState))
+    ).scalars().all()
+
+    assert state_rows == []
+```
+
+### 이 파일이 잠그는 규약
+
+1. `persist_message_payload()`는 repository 결과가 `created`면 checkpoint를 올린다
+2. 현재 설계대로 `unchanged`여도 checkpoint를 올린다
+3. repository가 일반 예외를 `raise`하면 worker wrapper도 그대로 예외를 올리고, checkpoint는 건드리지 않는다
+
+### 한 가지 주의
+
+이 테스트는 **`persist_message_payload()` 단위 테스트**입니다.
+즉 `rollback()`까지 직접 검증하지는 않습니다. 현재 rollback 책임은 `_handle_new_message()`에 있기 때문입니다.
+
+그래서 다음으로 가장 자연스러운 후속 테스트는:
+
+* **`CollectorWorker._handle_new_message()`에서 예외 발생 시 `db.rollback()` 호출 검증**
+
+입니다.
+

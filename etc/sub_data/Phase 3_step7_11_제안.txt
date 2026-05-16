@@ -1,0 +1,610 @@
+좋습니다. 기존 테이블이 이미 있는 상황을 기준으로, **가장 안전한 1차 보정형 migration 1개 + 데이터 정리용 SQL**을 바로 적용 가능한 형태로 정리하겠습니다.
+
+핵심 원칙은 이렇습니다.
+
+* **1차 migration**: 컬럼 보강, 결과 테이블 생성, 기본 인덱스 추가
+* **정리 SQL**: null/default 보정, 중복 점검/정리
+* **그 다음** unique 제약 강화
+
+즉, **중복 정리 전에 unique constraint를 서두르지 않는 방식**입니다.
+
+---
+
+## 1) 보정형 Alembic migration 초안
+
+파일 예시:
+
+```text
+alembic/versions/20260322_02_backfill_pipeline_schema.py
+```
+
+```python
+"""backfill pipeline schema for existing tables
+
+Revision ID: 20260322_02
+Revises: 20260322_01
+Create Date: 2026-03-22 15:10:00
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+revision = "20260322_02"
+down_revision = "20260322_01"
+branch_labels = None
+depends_on = None
+
+
+def _has_table(inspector, table_name: str) -> bool:
+    return table_name in inspector.get_table_names()
+
+
+def _get_columns(inspector, table_name: str) -> set[str]:
+    return {col["name"] for col in inspector.get_columns(table_name)}
+
+
+def _get_indexes(inspector, table_name: str) -> set[str]:
+    return {idx["name"] for idx in inspector.get_indexes(table_name)}
+
+
+def upgrade():
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+
+    tables = inspector.get_table_names()
+
+    # ------------------------------------------------------------------
+    # 1. messages 보강
+    # ------------------------------------------------------------------
+    if _has_table(inspector, "messages"):
+        message_cols = _get_columns(inspector, "messages")
+        message_indexes = _get_indexes(inspector, "messages")
+
+        with op.batch_alter_table("messages") as batch_op:
+            if "channel_id" not in message_cols:
+                batch_op.add_column(sa.Column("channel_id", sa.Integer(), nullable=True))
+            if "telegram_message_id" not in message_cols:
+                batch_op.add_column(sa.Column("telegram_message_id", sa.BigInteger(), nullable=True))
+            if "text" not in message_cols:
+                batch_op.add_column(sa.Column("text", sa.Text(), nullable=True))
+            if "sent_at" not in message_cols:
+                batch_op.add_column(sa.Column("sent_at", sa.DateTime(), nullable=True))
+            if "created_at" not in message_cols:
+                batch_op.add_column(sa.Column("created_at", sa.DateTime(), nullable=True))
+
+        if "ix_messages_channel_id" not in message_indexes:
+            op.create_index("ix_messages_channel_id", "messages", ["channel_id"])
+        if "ix_messages_sent_at" not in message_indexes:
+            op.create_index("ix_messages_sent_at", "messages", ["sent_at"])
+
+    # ------------------------------------------------------------------
+    # 2. analysis_jobs 보강
+    # ------------------------------------------------------------------
+    if _has_table(inspector, "analysis_jobs"):
+        job_cols = _get_columns(inspector, "analysis_jobs")
+        job_indexes = _get_indexes(inspector, "analysis_jobs")
+
+        with op.batch_alter_table("analysis_jobs") as batch_op:
+            if "message_id" not in job_cols:
+                batch_op.add_column(sa.Column("message_id", sa.Integer(), nullable=True))
+            if "job_type" not in job_cols:
+                batch_op.add_column(sa.Column("job_type", sa.String(length=50), nullable=True))
+            if "status" not in job_cols:
+                batch_op.add_column(sa.Column("status", sa.String(length=20), nullable=True))
+            if "payload" not in job_cols:
+                batch_op.add_column(sa.Column("payload", sa.JSON(), nullable=True))
+            if "attempt_count" not in job_cols:
+                batch_op.add_column(sa.Column("attempt_count", sa.Integer(), nullable=True))
+            if "max_attempts" not in job_cols:
+                batch_op.add_column(sa.Column("max_attempts", sa.Integer(), nullable=True))
+            if "last_error" not in job_cols:
+                batch_op.add_column(sa.Column("last_error", sa.Text(), nullable=True))
+            if "created_at" not in job_cols:
+                batch_op.add_column(sa.Column("created_at", sa.DateTime(), nullable=True))
+            if "started_at" not in job_cols:
+                batch_op.add_column(sa.Column("started_at", sa.DateTime(), nullable=True))
+            if "finished_at" not in job_cols:
+                batch_op.add_column(sa.Column("finished_at", sa.DateTime(), nullable=True))
+            if "heartbeat_at" not in job_cols:
+                batch_op.add_column(sa.Column("heartbeat_at", sa.DateTime(), nullable=True))
+
+        if "ix_analysis_jobs_message_id" not in job_indexes:
+            op.create_index("ix_analysis_jobs_message_id", "analysis_jobs", ["message_id"])
+        if "ix_analysis_jobs_job_type" not in job_indexes:
+            op.create_index("ix_analysis_jobs_job_type", "analysis_jobs", ["job_type"])
+        if "ix_analysis_jobs_status" not in job_indexes:
+            op.create_index("ix_analysis_jobs_status", "analysis_jobs", ["status"])
+        if "ix_analysis_jobs_job_type_status_created_at" not in job_indexes:
+            op.create_index(
+                "ix_analysis_jobs_job_type_status_created_at",
+                "analysis_jobs",
+                ["job_type", "status", "created_at"],
+            )
+
+    # ------------------------------------------------------------------
+    # 3. preprocessed_messages 생성(없을 때만)
+    # ------------------------------------------------------------------
+    if not _has_table(inspector, "preprocessed_messages"):
+        op.create_table(
+            "preprocessed_messages",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("message_id", sa.Integer(), nullable=False),
+            sa.Column("normalized_text", sa.Text(), nullable=False),
+            sa.Column("created_at", sa.DateTime(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(), nullable=False),
+            sa.ForeignKeyConstraint(
+                ["message_id"],
+                ["messages.id"],
+                name="fk_preprocessed_messages_message_id_messages",
+                ondelete="CASCADE",
+            ),
+        )
+        op.create_index(
+            "ix_preprocessed_messages_message_id",
+            "preprocessed_messages",
+            ["message_id"],
+        )
+
+    # ------------------------------------------------------------------
+    # 4. message_summaries 생성(없을 때만)
+    # ------------------------------------------------------------------
+    if not _has_table(inspector, "message_summaries"):
+        op.create_table(
+            "message_summaries",
+            sa.Column("id", sa.Integer(), primary_key=True),
+            sa.Column("message_id", sa.Integer(), nullable=False),
+            sa.Column("summary_text", sa.Text(), nullable=False),
+            sa.Column("created_at", sa.DateTime(), nullable=False),
+            sa.Column("updated_at", sa.DateTime(), nullable=False),
+            sa.ForeignKeyConstraint(
+                ["message_id"],
+                ["messages.id"],
+                name="fk_message_summaries_message_id_messages",
+                ondelete="CASCADE",
+            ),
+        )
+        op.create_index(
+            "ix_message_summaries_message_id",
+            "message_summaries",
+            ["message_id"],
+        )
+
+    # ------------------------------------------------------------------
+    # 5. 기본값 backfill (null 보정)
+    # ------------------------------------------------------------------
+    if _has_table(inspector, "analysis_jobs"):
+        op.execute("UPDATE analysis_jobs SET attempt_count = 0 WHERE attempt_count IS NULL")
+        op.execute("UPDATE analysis_jobs SET max_attempts = 3 WHERE max_attempts IS NULL")
+        op.execute("UPDATE analysis_jobs SET status = 'PENDING' WHERE status IS NULL")
+        op.execute("UPDATE analysis_jobs SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+
+    if _has_table(inspector, "messages"):
+        op.execute("UPDATE messages SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
+
+
+def downgrade():
+    # 기존 운영 데이터가 있는 보정형 migration 이므로
+    # 보수적으로 no-op 처리 권장
+    pass
+```
+
+---
+
+## 2) 이 migration의 의도
+
+이 1차 migration은 **안전하게 스키마를 수용 가능한 상태로 맞추는 것**이 목적입니다.
+
+아직 일부를 deliberately 미뤘습니다.
+
+* `messages(channel_id, telegram_message_id)` unique
+* `analysis_jobs(message_id, job_type)` unique
+* `preprocessed_messages(message_id)` unique
+* `message_summaries(message_id)` unique
+
+이 제약은 **중복 데이터 정리 후** 넣는 게 안전합니다.
+
+---
+
+## 3) 먼저 실행할 데이터 점검 SQL
+
+migration 적용 후 바로 아래 SQL을 돌려서 중복과 이상 상태를 확인하는 게 좋습니다.
+
+### 3-1. messages 중복 점검
+
+```sql
+SELECT channel_id, telegram_message_id, COUNT(*) AS cnt
+FROM messages
+GROUP BY channel_id, telegram_message_id
+HAVING COUNT(*) > 1;
+```
+
+### 3-2. analysis_jobs 중복 점검
+
+```sql
+SELECT message_id, job_type, COUNT(*) AS cnt
+FROM analysis_jobs
+GROUP BY message_id, job_type
+HAVING COUNT(*) > 1;
+```
+
+### 3-3. preprocessed_messages 중복 점검
+
+```sql
+SELECT message_id, COUNT(*) AS cnt
+FROM preprocessed_messages
+GROUP BY message_id
+HAVING COUNT(*) > 1;
+```
+
+### 3-4. message_summaries 중복 점검
+
+```sql
+SELECT message_id, COUNT(*) AS cnt
+FROM message_summaries
+GROUP BY message_id
+HAVING COUNT(*) > 1;
+```
+
+### 3-5. analysis_jobs 상태 분포 점검
+
+```sql
+SELECT status, COUNT(*) AS cnt
+FROM analysis_jobs
+GROUP BY status
+ORDER BY cnt DESC;
+```
+
+---
+
+## 4) null / 기본값 정리 SQL
+
+이미 migration 안에도 일부 들어 있지만, 수동 검증용으로 다시 따로 적어두겠습니다.
+
+### 4-1. analysis_jobs 기본값 보정
+
+```sql
+UPDATE analysis_jobs
+SET attempt_count = 0
+WHERE attempt_count IS NULL;
+
+UPDATE analysis_jobs
+SET max_attempts = 3
+WHERE max_attempts IS NULL;
+
+UPDATE analysis_jobs
+SET status = 'PENDING'
+WHERE status IS NULL;
+
+UPDATE analysis_jobs
+SET created_at = CURRENT_TIMESTAMP
+WHERE created_at IS NULL;
+```
+
+### 4-2. messages created_at 보정
+
+```sql
+UPDATE messages
+SET created_at = CURRENT_TIMESTAMP
+WHERE created_at IS NULL;
+```
+
+---
+
+## 5) status 값이 기존 체계와 다를 때 정리 SQL
+
+기존 코드에 따라 status 문자열이 다를 수 있습니다. 아래는 가장 흔한 매핑 예시입니다.
+
+```sql
+UPDATE analysis_jobs
+SET status = 'PENDING'
+WHERE status IN ('QUEUED', 'NEW', 'READY');
+
+UPDATE analysis_jobs
+SET status = 'RUNNING'
+WHERE status IN ('PROCESSING', 'IN_PROGRESS');
+
+UPDATE analysis_jobs
+SET status = 'DONE'
+WHERE status IN ('SUCCESS', 'COMPLETED');
+
+UPDATE analysis_jobs
+SET status = 'RETRY_PENDING'
+WHERE status IN ('RETRY', 'REQUEUED');
+
+UPDATE analysis_jobs
+SET status = 'FAILED'
+WHERE status IN ('ERROR');
+
+UPDATE analysis_jobs
+SET status = 'DEAD'
+WHERE status IN ('PERMANENT_FAILED', 'ABANDONED');
+```
+
+현재 실제 status 값이 다르면 이 부분만 맞춰서 쓰면 됩니다.
+
+---
+
+## 6) 중복 데이터 정리 SQL
+
+중복 제거 전에는 반드시 백업이 있어야 합니다.
+
+### 6-1. messages 중복 제거
+
+기준:
+
+* 같은 `(channel_id, telegram_message_id)` 에서
+* `created_at` 최신 row 우선
+* 같으면 `id` 큰 row 우선
+
+```sql
+WITH ranked AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (
+            PARTITION BY channel_id, telegram_message_id
+            ORDER BY created_at DESC, id DESC
+        ) AS rn
+    FROM messages
+)
+DELETE FROM messages
+WHERE id IN (
+    SELECT id
+    FROM ranked
+    WHERE rn > 1
+);
+```
+
+---
+
+### 6-2. analysis_jobs 중복 제거
+
+기준:
+
+* 같은 `(message_id, job_type)` 에서
+* `DONE` 우선
+* 그다음 `RUNNING`
+* 그다음 최신 `created_at`
+* 같으면 `id` 큰 row 우선
+
+```sql
+WITH ranked AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (
+            PARTITION BY message_id, job_type
+            ORDER BY
+                CASE status
+                    WHEN 'DONE' THEN 0
+                    WHEN 'RUNNING' THEN 1
+                    WHEN 'RETRY_PENDING' THEN 2
+                    WHEN 'PENDING' THEN 3
+                    WHEN 'FAILED' THEN 4
+                    WHEN 'DEAD' THEN 5
+                    ELSE 9
+                END,
+                created_at DESC,
+                id DESC
+        ) AS rn
+    FROM analysis_jobs
+)
+DELETE FROM analysis_jobs
+WHERE id IN (
+    SELECT id
+    FROM ranked
+    WHERE rn > 1
+);
+```
+
+---
+
+### 6-3. preprocessed_messages 중복 제거
+
+```sql
+WITH ranked AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (
+            PARTITION BY message_id
+            ORDER BY updated_at DESC, id DESC
+        ) AS rn
+    FROM preprocessed_messages
+)
+DELETE FROM preprocessed_messages
+WHERE id IN (
+    SELECT id
+    FROM ranked
+    WHERE rn > 1
+);
+```
+
+---
+
+### 6-4. message_summaries 중복 제거
+
+```sql
+WITH ranked AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (
+            PARTITION BY message_id
+            ORDER BY updated_at DESC, id DESC
+        ) AS rn
+    FROM message_summaries
+)
+DELETE FROM message_summaries
+WHERE id IN (
+    SELECT id
+    FROM ranked
+    WHERE rn > 1
+);
+```
+
+---
+
+## 7) 중복 제거 후 꼭 다시 확인할 SQL
+
+```sql
+SELECT channel_id, telegram_message_id, COUNT(*) AS cnt
+FROM messages
+GROUP BY channel_id, telegram_message_id
+HAVING COUNT(*) > 1;
+
+SELECT message_id, job_type, COUNT(*) AS cnt
+FROM analysis_jobs
+GROUP BY message_id, job_type
+HAVING COUNT(*) > 1;
+
+SELECT message_id, COUNT(*) AS cnt
+FROM preprocessed_messages
+GROUP BY message_id
+HAVING COUNT(*) > 1;
+
+SELECT message_id, COUNT(*) AS cnt
+FROM message_summaries
+GROUP BY message_id
+HAVING COUNT(*) > 1;
+```
+
+이 네 쿼리 결과가 모두 **0 row** 여야 다음 단계로 넘어가는 게 안전합니다.
+
+---
+
+## 8) 정리 후 넣을 unique 제약 강화 migration 초안
+
+이건 2차 migration 입니다. 여기서부터 제약을 강하게 겁니다.
+
+파일 예시:
+
+```text
+alembic/versions/20260322_03_add_pipeline_unique_constraints.py
+```
+
+```python
+"""add unique constraints for pipeline tables
+
+Revision ID: 20260322_03
+Revises: 20260322_02
+Create Date: 2026-03-22 15:30:00
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+revision = "20260322_03"
+down_revision = "20260322_02"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    with op.batch_alter_table("messages") as batch_op:
+        batch_op.create_unique_constraint(
+            "uq_messages_channel_msg",
+            ["channel_id", "telegram_message_id"],
+        )
+
+    with op.batch_alter_table("analysis_jobs") as batch_op:
+        batch_op.create_unique_constraint(
+            "uq_analysis_jobs_message_job_type",
+            ["message_id", "job_type"],
+        )
+
+    with op.batch_alter_table("preprocessed_messages") as batch_op:
+        batch_op.create_unique_constraint(
+            "uq_preprocessed_messages_message_id",
+            ["message_id"],
+        )
+
+    with op.batch_alter_table("message_summaries") as batch_op:
+        batch_op.create_unique_constraint(
+            "uq_message_summaries_message_id",
+            ["message_id"],
+        )
+
+
+def downgrade():
+    with op.batch_alter_table("message_summaries") as batch_op:
+        batch_op.drop_constraint("uq_message_summaries_message_id", type_="unique")
+
+    with op.batch_alter_table("preprocessed_messages") as batch_op:
+        batch_op.drop_constraint("uq_preprocessed_messages_message_id", type_="unique")
+
+    with op.batch_alter_table("analysis_jobs") as batch_op:
+        batch_op.drop_constraint("uq_analysis_jobs_message_job_type", type_="unique")
+
+    with op.batch_alter_table("messages") as batch_op:
+        batch_op.drop_constraint("uq_messages_channel_msg", type_="unique")
+```
+
+---
+
+## 9) 적용 순서
+
+가장 안전한 순서는 이렇습니다.
+
+### 1단계
+
+보정형 migration 적용
+
+```bash
+alembic upgrade 20260322_02
+```
+
+### 2단계
+
+정리 SQL 실행
+
+* null/default 보정
+* status 매핑
+* 중복 점검
+* 중복 제거
+* 중복 재확인
+
+### 3단계
+
+unique 제약 migration 적용
+
+```bash
+alembic upgrade 20260322_03
+```
+
+### 4단계
+
+통합 테스트 실행
+
+```bash
+pytest tests/integration/test_pipeline_flow.py -q
+pytest tests/workers/test_scheduler_worker.py -q
+```
+
+---
+
+## 10) 지금 바로 가장 먼저 볼 포인트
+
+이 단계에서 실제로 가장 먼저 확인해야 하는 건 딱 세 가지입니다.
+
+첫째, `analysis_jobs` 에 새 컬럼들이 잘 들어갔는가
+
+* `attempt_count`
+* `max_attempts`
+* `last_error`
+* `started_at`
+* `finished_at`
+* `heartbeat_at`
+
+둘째, 중복 데이터가 실제로 있는가
+특히 `analysis_jobs(message_id, job_type)` 중복이 많이 나오면, 그동안 job 생성이 idempotent 하지 않았다는 뜻입니다.
+
+셋째, unique 제약을 걸기 전에 중복이 완전히 정리됐는가
+이걸 확인하지 않고 2차 migration 을 적용하면 바로 실패합니다.
+
+---
+
+## 11) 한 줄 요약
+
+가장 실전적인 보정 절차는
+**1차 migration으로 스키마를 수용 가능한 상태로 만든 뒤, 데이터 정리 SQL로 중복과 null을 정리하고, 마지막 2차 migration으로 unique 제약을 잠그는 것**입니다.
+
+다음 단계는 현재 실제 모델 코드와 이 초안을 1:1로 대조해서, **부족한 필드만 체크리스트로 표시하는 갭 분석표**를 만드는 순서가 가장 자연스럽습니다.

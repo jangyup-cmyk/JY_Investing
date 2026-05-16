@@ -1,0 +1,326 @@
+Phase 2 착수 전 체크리스트 + 상세 기능명세 v1
+
+README 기준 현재 프로젝트는
+
+* **Phase 1 완료**
+* **Phase 2가 다음 단계**
+* 핵심 작업은 `Telethon 기반 실시간 이벤트 리스너`, `채널 동기화`, `메시지 DB 적재`
+* 구현 중심은 `src/workers`와 `src/infra/telegram`
+* 실행 구조는 **API 서버**와 **수집 워커**의 분리 운영
+  으로 정의되어 있습니다. 
+
+---
+
+# 1. Phase 2 착수 전 체크리스트
+
+## A. 반드시 확정할 정책
+
+1. **수집 대상 기준**
+
+   * 내 텔레그램 계정이 참여 중인 채널/그룹만 대상으로 할지
+   * 비공개 채널, 공개 채널, 그룹을 모두 포함할지
+   * 브로드캐스트 채널과 일반 그룹을 동일하게 처리할지
+
+2. **수집 활성화 기준**
+
+   * 동기화만 된 채널은 기본 `OFF`
+   * 사용자가 선택한 채널만 `ON`
+   * 워커는 `ON` 채널 메시지만 저장
+
+3. **과거 메시지 복원 범위**
+
+   * 첫 활성화 시 최근 N건 백필
+   * 워커 재기동 시 마지막 수집 지점부터 이어받기
+   * 편집된 메시지도 다시 반영할지
+
+4. **중복 방지 기준**
+
+   * 유니크 키: `channel_id + telegram_message_id`
+   * 저장 방식: insert가 아니라 upsert
+   * 편집 메시지는 update 허용
+
+5. **삭제/편집 정책**
+
+   * 텔레그램에서 수정된 메시지는 DB 반영
+   * 삭제 메시지는 soft delete 여부 결정
+   * 최소한 `is_deleted`, `edited_at` 정도는 고려
+
+---
+
+## B. DB 스키마에서 보강할 항목
+
+README상 `Account`, `Channel`, `Message` 모델이 이미 축으로 잡혀 있으므로, Phase 2에서는 Message/Channel 컬럼 설계를 먼저 단단히 해야 합니다. 
+
+### Channel 권장 컬럼
+
+* `id`
+* `telegram_channel_id`
+* `access_hash` 가능 시 저장
+* `title`
+* `username`
+* `channel_type` (`channel`, `group`, `supergroup` 등)
+* `is_active`
+* `is_collecting`
+* `last_synced_at`
+* `last_collected_message_id`
+* `last_collected_at`
+* `last_error_message`
+* `created_at`, `updated_at`
+
+### Message 권장 컬럼
+
+* `id`
+* `channel_id`
+* `telegram_message_id`
+* `sender_id`
+* `message_text`
+* `raw_payload_json`
+* `message_date`
+* `edited_at`
+* `collected_at`
+* `views`
+* `forwards`
+* `reply_to_message_id`
+* `grouped_id`
+* `is_deleted`
+
+---
+
+## C. 실행 전 검증 항목
+
+README에서 이미 `diagnose_phase1.py`, `authenticate.py`, `run_web.py`, `run_collector.py` 흐름이 정리되어 있으므로, 착수 전에 아래 4개는 실제 성공해야 합니다. 
+
+1. `diagnose_phase1.py` 정상 통과
+2. 텔레그램 세션 생성 완료
+3. API 서버 `/api/health`, `/api/ready` 정상 응답
+4. 워커 단독 실행 시 로그인 및 기본 루프 진입 확인
+
+---
+
+# 2. Phase 2 상세 기능명세 v1
+
+## 2-1. 기능 목표
+
+Phase 2의 목적은 “분석”이 아니라 **안정적인 실시간 수집 파이프라인 확보**입니다.
+즉, 핵심은 아래 3개입니다.
+
+1. 내 텔레그램 참여 채널을 DB와 동기화
+2. 사용자가 켠 채널의 신규 메시지를 실시간 수집
+3. 메시지를 중복 없이 안정적으로 DB 저장
+
+이 방향은 README의 Phase 2 정의와 정확히 일치합니다. 
+
+---
+
+## 2-2. 모듈별 책임
+
+### `src/infra/telegram/client.py`
+
+역할:
+
+* Telethon 클라이언트 연결/해제
+* 세션 로그인 확인
+* 참여 채널 목록 조회
+* 실시간 이벤트 핸들러 등록
+* 과거 메시지 조회(backfill)
+
+권장 메서드:
+
+* `connect()`
+* `disconnect()`
+* `is_authorized()`
+* `get_joined_dialogs()`
+* `iter_channel_messages(channel, limit, offset_id)`
+* `register_new_message_handler(callback)`
+* `register_edited_message_handler(callback)`
+
+---
+
+### `src/workers/startup_tasks.py`
+
+역할:
+
+* 워커 시작 시 초기화 태스크 수행
+* DB 기준 수집 대상 채널 조회
+* 필요한 경우 최근 누락 메시지 복원
+* 마지막 수집 위치 점검
+
+권장 함수:
+
+* `sync_channels_on_startup()`
+* `recover_recent_messages()`
+* `load_active_channel_ids()`
+
+---
+
+### `src/workers/collector_worker.py`
+
+역할:
+
+* 실시간 이벤트 수신
+* 이벤트를 DB 저장용 구조로 변환
+* 중복 방지/upsert 처리
+* 채널별 상태 갱신
+* 오류 로깅 및 reconnect 대응
+
+권장 함수:
+
+* `start_worker()`
+* `handle_new_message(event)`
+* `handle_edited_message(event)`
+* `persist_message(payload)`
+* `update_channel_checkpoint(channel_id, message_id)`
+
+---
+
+### `src/web/routes/telegram.py`
+
+README에 정의된 API 엔드포인트를 기준으로 구현합니다. 
+
+필수 엔드포인트:
+
+* `GET /api/telegram/channels`
+* `POST /api/telegram/channels/sync`
+* `POST /api/telegram/channels/{id}/toggle`
+
+추가 추천:
+
+* `GET /api/telegram/channels/{id}`
+* `GET /api/telegram/channels/{id}/messages?limit=50`
+* `POST /api/telegram/channels/{id}/backfill`
+
+---
+
+# 3. API 동작 기준
+
+## 3-1. `GET /api/telegram/channels`
+
+응답 예시 항목:
+
+* 채널 ID
+* 제목
+* username
+* type
+* is_active
+* is_collecting
+* last_collected_at
+* last_error_message
+
+목적:
+
+* 대시보드에서 현재 관리 가능한 채널 상태 확인
+
+---
+
+## 3-2. `POST /api/telegram/channels/sync`
+
+동작:
+
+1. Telethon으로 현재 계정 참여 채널 조회
+2. DB 채널 테이블과 비교
+3. 신규 채널 insert
+4. 기존 채널 정보 update
+5. 더 이상 참여하지 않는 채널은 `sync_status`만 비활성 처리
+
+반환값 예시:
+
+* `new_channels_count`
+* `updated_channels_count`
+* `inactive_channels_count`
+
+---
+
+## 3-3. `POST /api/telegram/channels/{id}/toggle`
+
+동작:
+
+* `is_active` 또는 `is_collecting` 상태 전환
+* ON 전환 시 필요하면 최근 메시지 백필
+* OFF 전환 시 실시간 수집 대상에서 제외
+
+주의:
+
+* API에서 토글만 바꾸고, 실제 워커가 그 상태를 반영하도록 설계해야 함
+
+---
+
+# 4. Phase 2에서 가장 중요한 비기능 요구사항
+
+## 안정성
+
+* 워커 재시작 후 이어받기 가능
+* 동일 메시지 중복 저장 없음
+* Telegram reconnect 발생 시 자동 복구
+* 예외 발생 시 전체 워커 중단 방지
+
+## 성능
+
+* 메시지 1건당 즉시 insert보다 소규모 batch/upsert 고려
+* raw payload 저장은 하되, 조회용 컬럼은 별도 분리
+* 채널 수가 늘어나도 핸들러 구조가 복잡해지지 않게 설계
+
+## 운영성
+
+* 로그만 봐도 어느 채널에서 실패했는지 알 수 있어야 함
+* 마지막 수집 시점과 마지막 메시지 ID가 확인 가능해야 함
+* API와 워커 상태를 분리해서 확인 가능해야 함
+
+README상 로그 도구가 Loguru이고, API/워커 분리 구조이므로 이 운영성 요구는 매우 중요합니다. 
+
+---
+
+# 5. 완료 기준
+
+Phase 2 완료는 아래 기준으로 판정하는 것이 좋습니다.
+
+1. `/api/telegram/channels/sync` 호출 시 참여 채널이 DB에 반영된다.
+2. `/api/telegram/channels/{id}/toggle`로 수집 ON/OFF가 가능하다.
+3. 수집 ON 채널에 새 메시지가 올라오면 DB에 저장된다.
+4. 동일 메시지를 여러 번 받아도 1건만 유지된다.
+5. 편집 메시지는 기존 레코드에 반영된다.
+6. 워커 재시작 후 마지막 수집 지점부터 이어서 수집된다.
+7. 특정 채널 수집 오류가 전체 워커 중단으로 번지지 않는다.
+
+---
+
+# 6. 제가 추가로 강하게 추천하는 것
+
+Phase 2 시작 전에 아래 2개를 먼저 만드는 것이 좋습니다.
+
+## 1) `message persistence 규격`
+
+이걸 먼저 정해야 이후 코드가 흔들리지 않습니다.
+
+* 어떤 필드를 저장할지
+* raw payload를 어디까지 남길지
+* edited / deleted를 어떻게 처리할지
+* 유니크 키를 무엇으로 잡을지
+
+## 2) `수집 상태 머신`
+
+채널 상태를 단순 ON/OFF 대신 아래처럼 두는 게 좋습니다.
+
+* `discovered`
+* `synced`
+* `active`
+* `collecting`
+* `paused`
+* `error`
+
+이렇게 해야 나중에 대시보드와 장애 대응이 훨씬 쉬워집니다.
+
+---
+
+# 7. 결론
+
+지금 시점에서 Phase 2로 넘어가기 전 가장 좋은 준비는
+**“채널/메시지 스키마 확정 + 중복 방지 정책 확정 + 워커 재시작 복원 정책 확정”** 입니다.
+
+README가 이미
+
+* Phase 2의 목표
+* API/워커 분리 구조
+* `src/workers`, `src/infra/telegram` 중심 확장 방향
+* 채널 조회/동기화/토글 API
+  를 잘 잡아두었기 때문에, 이제 필요한 것은 큰 방향 수정이 아니라 **운영 가능한 수준으로 명세를 촘촘히 만드는 것**입니다. 
+

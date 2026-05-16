@@ -1,0 +1,161 @@
+`translators.py`는 **간결하고 방향도 맞습니다.**
+특히 `posted_at`과 `collected_at`를 분리하고, `sender_id / reply_to / views / forwards / grouped_id / edited_at`를 안전하게 꺼내는 흐름은 좋습니다. STEP 1의 목적이 “Telethon 객체를 내부 payload로 표준화”하는 것이었으니, 그 역할은 제대로 하고 있습니다. 
+
+다만 이 파일은 **운영 전에 꼭 손봐야 할 3개**가 있습니다.
+
+## 1) `raw_payload_json`이 실제로는 JSON 문자열이 아닙니다
+
+현재 코드는:
+
+* `message.to_dict()`가 있으면 `raw_dict = message.to_dict()`
+* 없으면 `str(message)`
+  로 넣고, 그 값을 그대로 `raw_payload_json=raw_dict`에 전달합니다. 그런데 변수명과 필드명이 `raw_payload_json`이면, 보통 기대값은 **JSON 문자열**입니다. 지금처럼 dict를 그대로 넣으면 타입 불일치가 날 수 있고, 저장소에서 문자열을 기대하면 문제가 됩니다. `json`을 import해두고도 실제 직렬화는 하지 않고 있습니다. 
+
+### 권장
+
+이 부분은 아래처럼 고치는 게 좋습니다.
+
+```python
+raw_obj = message.to_dict() if hasattr(message, "to_dict") else {"repr": str(message)}
+raw_payload_json = json.dumps(raw_obj, ensure_ascii=False, default=str)
+```
+
+이렇게 해야
+
+* 필드명과 실제 값이 일치하고
+* datetime이나 예외 타입이 있어도 `default=str`로 방어할 수 있습니다.
+
+---
+
+## 2) `message.text`는 안전하지만, 조금 더 보수적으로 가져오는 편이 좋습니다
+
+현재는 `message_text_raw=message.text`입니다. 보통 Telethon에서 잘 동작하지만, 메시지 종류에 따라 `text`가 `None`일 수 있고, 일부 경우에는 `message.message`가 더 직접적인 원문일 때도 있습니다. 특히 캡션/미디어 메시지, 서비스 메시지, 본문 없는 메시지를 생각하면 방어적으로 가는 편이 좋습니다. 
+
+### 권장
+
+이 정도로 잡으면 더 안전합니다.
+
+```python
+message_text_raw = getattr(message, "text", None)
+if message_text_raw is None:
+    message_text_raw = getattr(message, "message", None)
+```
+
+이렇게 해두면 본문 없는 메시지에도 대응이 자연스럽습니다.
+
+---
+
+## 3) `channel_db_id`라는 이름이 혼동을 부를 수 있습니다
+
+함수 인자는 `channel_db_id`인데, payload 필드에는 `telegram_channel_id=channel_db_id`로 들어갑니다. 이건 **지금 실제 저장 기준이 내부 DB 채널 PK인지, 텔레그램 원본 channel id인지**를 헷갈리게 만듭니다. 
+
+이건 코드가 틀렸다는 뜻은 아니고, **이름이 위험하다**는 뜻입니다.
+
+### 왜 중요하나
+
+`repository.py` 쪽 유니크 키가 `(telegram_channel_id, tg_message_id)` 기준이라면,
+
+* 정말로 텔레그램 채널 원본 id를 넣는 건지
+* 내부 DB의 `TelegramChannel.id`를 넣는 건지
+  가 아주 중요합니다.
+
+### 권장
+
+둘 중 하나로 명확히 하세요.
+
+* 내부 PK라면: `channel_id`
+* 텔레그램 원본 id라면: `telegram_channel_id`
+
+지금 `channel_db_id`는 둘 다처럼 들려서 나중에 버그를 만들기 좋습니다.
+
+---
+
+# 그 다음으로 좋은 점 / 보완점
+
+## 4) `posted_at` / `collected_at` 분리는 아주 좋습니다
+
+이건 잘하셨습니다.
+원본 작성 시각과 수집 시각을 분리한 것은 나중에 백필/실시간 차이를 볼 때 유용합니다. `message.date`가 없을 때 현재 UTC로 대체하는 것도 방어적으로 괜찮습니다. 
+
+## 5) `edited_at`은 현재 방식이면 충분합니다
+
+`getattr(message, 'edit_date', None)`는 무난합니다. Telethon 쪽에서 보통 timezone-aware 값을 주기 때문에 translator 단계에서는 그대로 넘기고, 정규화는 repository에서 하는 쪽이 자연스럽습니다. 
+
+## 6) `reply_to` 추출은 잘했습니다
+
+`message.reply_to.reply_to_msg_id`를 안전하게 꺼내는 패턴은 좋습니다. 이건 실무에서 자주 빠뜨리는 부분인데 잘 반영돼 있습니다. 
+
+---
+
+# 바로 적용하면 좋은 수정안
+
+아래 정도로 바꾸면 이 파일은 훨씬 단단해집니다.
+
+```python
+from datetime import datetime, timezone
+import json
+
+from src.infra.telegram.schemas import TelegramMessagePayload
+
+
+def telethon_to_payload(channel_id: int, message) -> TelegramMessagePayload:
+    posted_at = message.date if getattr(message, "date", None) else datetime.now(timezone.utc)
+    collected_at = datetime.now(timezone.utc)
+
+    sender_id = getattr(message, "sender_id", None)
+    reply_to_message_id = (
+        message.reply_to.reply_to_msg_id
+        if getattr(message, "reply_to", None)
+        else None
+    )
+    views = getattr(message, "views", None)
+    forwards = getattr(message, "forwards", None)
+    grouped_id = getattr(message, "grouped_id", None)
+    edited_at = getattr(message, "edit_date", None)
+
+    message_text_raw = getattr(message, "text", None)
+    if message_text_raw is None:
+        message_text_raw = getattr(message, "message", None)
+
+    raw_obj = message.to_dict() if hasattr(message, "to_dict") else {"repr": str(message)}
+    raw_payload_json = json.dumps(raw_obj, ensure_ascii=False, default=str)
+
+    return TelegramMessagePayload(
+        telegram_channel_id=channel_id,
+        tg_message_id=message.id,
+        sender_id=sender_id,
+        message_text_raw=message_text_raw,
+        reply_to_message_id=reply_to_message_id,
+        views=views,
+        forwards=forwards,
+        grouped_id=grouped_id,
+        edited_at=edited_at,
+        is_deleted=False,
+        posted_at=posted_at,
+        collected_at=collected_at,
+        raw_payload_json=raw_payload_json,
+    )
+```
+
+---
+
+# 최종 판단
+
+이 파일 평가는 이렇게 보시면 됩니다.
+
+* **좋은 점**
+
+  * DTO 변환 책임이 명확함
+  * 메타데이터 추출 범위가 좋음
+  * posted/collected 시각 분리 좋음
+
+* **필수 수정**
+
+  * `raw_payload_json` 실제 JSON 문자열화
+  * `channel_db_id` 명칭 명확화
+
+* **권장 수정**
+
+  * `message.text` fallback 보강
+
+현재 상태로도 STEP 1 용도로는 충분히 괜찮지만, **`raw_payload_json`은 꼭 바로 고치시는 게 좋습니다.**

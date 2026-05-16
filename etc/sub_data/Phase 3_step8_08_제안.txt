@@ -1,0 +1,188 @@
+좋습니다. `analysis_job_repository.py`까지 포함해서 보면, 이제 **체크 완료 / 누락 / 수정 필요**가 꽤 선명해졌습니다.
+
+결론부터 말하면, 이 repository는 **기본 골격은 맞지만 현재 서비스/워커와 붙이면 3개의 치명적인 인터페이스 문제가 남아 있습니다.**
+가장 큰 문제는 아래 3개입니다.
+
+* `mark_retry()`가 `RETRY_PENDING`으로 바꾸는데 `claim_next_job()`은 `PENDING`만 가져와서 **재시도 job이 다시 실행되지 않을 가능성**이 큽니다. 
+* 서비스는 `await self.job_repo.enqueue_job(...)`를 쓰는데, repository의 `enqueue_job()`은 `async def`가 아니라 일반 `def`라서 **그대로면 await 시점에 깨질 수 있습니다.**  
+* `PreprocessWorker`의 다음 job payload 전달은 여전히 안전하지 않아 `InferenceWorker`가 기대하는 `preprocess_result_id`가 비어 있을 수 있습니다.  
+
+---
+
+## 1) `analysis_job_repository.py` 실제 판정
+
+| 항목                      | 판정    | 근거                                                                                                                                                             | 조치                           |
+| ----------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| `enqueue_job()` 존재      | 체크 완료 | 생성에 필요한 `job_type`, `target_type`, `target_id`, `telegram_message_id`, `message_version_id`, `priority`, `idempotency_key`, `payload_json`, `max_attempts`를 받음 | 유지                           |
+| `get_existing_job()` 존재 | 체크 완료 | 중복 조회용 메서드가 있고 `telegram_message_id`, `message_version_id`, `job_type` 기준으로 조회함                                                                                | 유지                           |
+| `claim_next_job()` 존재   | 체크 완료 | 작업 선점 메서드가 있고 `worker_name`, `lease_seconds`, `lease_expires_at`, `heartbeat_at`까지 세팅함                                                                         | 유지, 단 아래 상태값 수정 필요           |
+| `mark_succeeded()` 존재   | 체크 완료 | 완료 처리 로직 존재                                                                                                                                                    | 상태값 명칭만 전체와 일치 여부 점검         |
+| `mark_dead()` 존재        | 체크 완료 | 최종 실패 처리 존재                                                                                                                                                    | 유지                           |
+| `mark_retry()` 존재       | 수정 필요 | `RETRY_PENDING`으로 바꾸는데 `claim_next_job()`은 `PENDING`만 조회                                                                                                       | 둘 중 하나 통일 필요                 |
+| `touch_heartbeat()` 존재  | 체크 완료 | heartbeat/lease 연장 로직 존재                                                                                                                                       | 유지                           |
+| `find_stuck_jobs()` 존재  | 체크 완료 | `RUNNING` + heartbeat/lease 만료 기준 조회 구현                                                                                                                        | 유지                           |
+| `idempotency_key` 실사용   | 수정 필요 | `enqueue_job()`이 필드를 받지만 실제 중복 차단 로직은 없음                                                                                                                       | repository 또는 DB unique로 보강  |
+| 서비스와 async 시그니처 정합성     | 수정 필요 | repository `enqueue_job()`은 sync, 서비스는 일부 경로에서 `await` 사용                                                                                                      | 둘 중 하나로 통일                   |
+
+---
+
+## 2) 가장 중요한 실제 문제 5개
+
+### ① retry 상태가 다시 소비되지 않음
+
+이건 가장 큰 구조 문제입니다.
+
+* `claim_next_job()`은 `JobStatus.PENDING.value`만 가져옵니다. 
+* 그런데 `mark_retry()`는 status를 `JobStatus.RETRY_PENDING.value`로 바꿉니다. 
+* 서비스의 `mark_failed()`는 retry 가능하면 `mark_retry()`를 호출합니다. 
+
+즉, 실패 후 재시도 대기 상태로 들어간 job이 **다시 claim 대상이 안 될 수 있습니다.**
+이 부분은 사실상 **수정 필요가 아니라 우선 수정 대상 1순위**입니다.
+
+### ② `enqueue_job()` sync / service await 불일치
+
+repository:
+
+* `def enqueue_job(...) -> AnalysisJob` 입니다. 
+
+service:
+
+* `create_job_if_not_exists()`에서 `await self.job_repo.enqueue_job(...)`
+* `complete_job()`에서도 `await self.job_repo.enqueue_job(...)` 를 사용합니다. 
+
+이 상태면 **`object AnalysisJob can't be used in 'await' expression`** 류 오류가 날 가능성이 큽니다.
+정리 방식은 둘 중 하나입니다.
+
+* repository를 `async def enqueue_job(...)`로 바꾸기
+* 아니면 service에서 `await`를 제거하기
+
+현재 구조상은 repository를 async로 맞추는 쪽보다, **service에서 `await`를 빼는 게 더 단순**합니다.
+
+### ③ `JobTargetType` / `default_max_attempts` / `fail_job()` 문제는 아직 남아 있음
+
+repository가 생겨도 서비스 쪽 누락은 그대로입니다.
+
+* `create_job_if_not_exists()`는 `JobTargetType.MESSAGE.value`와 `self.default_max_attempts`를 쓰는데, 현재 서비스 코드에는 둘 다 정리돼 있지 않습니다. 
+* `PreprocessWorker`와 `InferenceWorker`는 둘 다 `self.job_service.fail_job(...)`를 호출하는데, 현재 서비스에는 그 메서드가 없습니다.  
+
+즉, repository만 추가해서는 아직 런타임 오류가 남습니다.
+
+### ④ preprocess → inference payload 전달은 아직 위험
+
+`PreprocessWorker`는 이렇게 씁니다.
+
+* `res_id = None` 초기화
+* `result_save_handler()` 내부에서 `res_id`를 세팅
+* 그런데 `complete_job(..., next_payload={"preprocess_result_id": res_id})`로 넘깁니다. 
+
+이 dict는 호출 시점에 만들어지므로, 실제 다음 job에 들어가는 값이 `None`일 수 있습니다.
+반면 `InferenceWorker`는 `job.payload.get("preprocess_result_id")`를 전제로 바로 `NormalizedTelegramMessage`를 조회합니다. 
+
+즉, 이 부분은 여전히 **수정 필요**입니다.
+
+### ⑤ scheduler는 여전히 반환값/세션팩토리 문제가 남아 있음
+
+현재 `SchedulerWorker`는
+
+* `run_once()`에서 `recovered > 0` 비교
+* `_recover_stuck_jobs()`는 반환값 없음
+* 주입받은 `self.session_factory` 대신 `AsyncSessionLocal()` 직접 사용 
+
+즉, repository가 좋아져도 scheduler는 여전히 **실행 중 깨질 가능성**이 있습니다.
+
+---
+
+## 3) 지금 상태 기준 최종 판정
+
+### 체크 완료
+
+* `AnalysisJobRepository` 기본 메서드 세트는 거의 갖춰짐
+* `enqueue_job / get_existing_job / claim_next_job / mark_succeeded / mark_dead / mark_retry / touch_heartbeat / find_stuck_jobs`가 모두 존재
+* stuck job 판별 기준도 heartbeat/lease를 함께 보도록 보강돼 있음 
+
+### 누락
+
+* repository 관점에서는 큰 기능 누락은 거의 없음
+* 다만 전체 파이프라인 관점에서는 여전히 `fail_job()` 서비스 메서드가 누락 상태
+* `JobTargetType` import와 `default_max_attempts` 설정도 서비스 쪽 누락 상태 
+
+### 수정 필요
+
+* retry 상태값 체계
+* service/repository async 시그니처 통일
+* preprocess payload 전달 방식
+* scheduler 반환값/DI
+* idempotency_key 실사용 여부    
+
+---
+
+## 4) 지금 가장 먼저 고칠 순서
+
+가장 좋은 순서는 이겁니다.
+
+### 1순위: retry 상태값 통일
+
+가장 간단한 수정은 `mark_retry()`를 이렇게 바꾸는 것입니다.
+
+```python
+def mark_retry(
+    self,
+    session: AsyncSession,
+    job: AnalysisJob,
+    error_code: str,
+    error_message: str,
+    next_available_at: datetime,
+) -> None:
+    job.status = JobStatus.PENDING.value
+    job.attempt_count += 1
+    job.available_at = next_available_at
+    job.error_code = error_code
+    job.error_message = error_message
+    job.worker_name = None
+    job.claimed_at = None
+    job.lease_expires_at = None
+```
+
+지금 구조에서는 이게 가장 자연스럽습니다.
+`claim_next_job()`이 이미 `PENDING + available_at <= now`를 사용하고 있기 때문입니다. 
+
+### 2순위: service의 `await self.job_repo.enqueue_job(...)` 제거 또는 repository async화
+
+현재는 **service에서 await 제거**가 가장 작고 안전합니다.  
+
+### 3순위: `AnalysisJobService` 보정
+
+반드시 같이 넣어야 합니다.
+
+* `JobTargetType` import
+* `default_max_attempts`
+* `fail_job()` 메서드 추가 
+
+### 4순위: `PreprocessWorker` payload_holder 방식 수정
+
+이건 inference 배선을 실제로 살리는 수정입니다.  
+
+### 5순위: `SchedulerWorker` 반환값 수정
+
+이건 독립적으로 바로 고칠 수 있습니다. 
+
+---
+
+## 5) 지금 기준으로 테스트를 바로 돌리면 어디서 먼저 깨질까
+
+우선순위대로 보면:
+
+1. `create_job_if_not_exists()`의 `JobTargetType` / `default_max_attempts` 문제 
+2. `await self.job_repo.enqueue_job(...)` 타입 불일치  
+3. preprocess 후속 payload가 `None`으로 들어가서 inference 입력 없음  
+4. 실패 시 `fail_job()` 미존재   
+5. scheduler `None > 0` 비교 문제 
+
+---
+
+## 6) 한 줄 결론
+
+`analysis_job_repository.py`는 **골격은 체크 완료**, 하지만 **retry 상태값 / async 시그니처 / payload 전달** 3개 때문에 현재 전체 파이프라인 기준으로는 **수정 필요**입니다. 
+
+다음 답변에서는 제가 이 판정 그대로 반영해서
+**`analysis_job_service.py + preprocess_worker.py + scheduler_worker.py` 최소 수정 패치본 3개**를 한 번에 정리해드리겠습니다.

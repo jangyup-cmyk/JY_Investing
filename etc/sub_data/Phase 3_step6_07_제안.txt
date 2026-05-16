@@ -1,0 +1,810 @@
+좋습니다.
+그럼 바로 **다음 단계 구현 초안**으로 이어가겠습니다.
+
+이번에는 아래 5가지를 붙여서 정리하겠습니다.
+
+1. `inference_service.py`
+2. `inference_worker.py`
+3. `run_worker.py` smoke test
+4. `scheduler_worker.py` 테스트 3개
+5. 적용 순서와 체크포인트
+
+이 단계까지 들어가면, 이제 정말로 **NORMALIZE → SINGLE_MESSAGE_SUMMARY → stuck recovery**의 핵심 루프가 코드 수준에서 거의 닫히게 됩니다.
+
+---
+
+# 1. `src/services/inference_service.py`
+
+이 서비스는 `SINGLE_MESSAGE_SUMMARY` job을 실제로 수행합니다.
+
+핵심 원칙은 딱 하나입니다.
+
+**InferenceWorker는 raw message를 직접 읽지 않고, 반드시 preprocess 결과를 입력으로 사용한다.**
+
+아래 초안은 그 원칙을 그대로 반영한 형태입니다.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class SummaryModelOutput:
+    summary_text: str
+    keywords: list[str] | None = None
+    entities: list[dict[str, Any]] | None = None
+    sentiment_label: str | None = None
+    confidence_score: float | None = None
+    raw_response: dict[str, Any] | None = None
+
+
+class InferenceService:
+    MODEL_NAME = "single-message-summary-model"
+    PROMPT_VERSION = "summary-v1"
+    TASK_TYPE = "SINGLE_MESSAGE_SUMMARY"
+
+    def __init__(
+        self,
+        preprocess_result_repository,
+        inference_result_repository,
+        model_client,
+    ):
+        self.preprocess_result_repository = preprocess_result_repository
+        self.inference_result_repository = inference_result_repository
+        self.model_client = model_client
+
+    def run_single_message_summary_job(self, session, *, job) -> int:
+        payload = job.payload_json or {}
+        preprocess_result_id = payload.get("preprocess_result_id")
+        if not preprocess_result_id:
+            raise ValueError("preprocess_result_id missing in job payload")
+
+        preprocess_result = self.preprocess_result_repository.get_by_id(
+            session,
+            preprocess_result_id,
+        )
+        if preprocess_result is None:
+            raise ValueError(
+                f"preprocess_result not found: preprocess_result_id={preprocess_result_id}"
+            )
+
+        prompt = self._build_prompt(preprocess_result.normalized_text)
+        model_output = self.model_client.summarize(prompt)
+
+        parsed = self._parse_model_output(model_output)
+
+        inference_result = self.inference_result_repository.create_result(
+            session,
+            message_id=job.message_id,
+            message_version_id=job.message_version_id,
+            preprocess_result_id=preprocess_result.id,
+            inference_job_id=job.id,
+            task_type=self.TASK_TYPE,
+            model_name=self.MODEL_NAME,
+            prompt_version=self.PROMPT_VERSION,
+            summary_text=parsed.summary_text,
+            keywords_json=parsed.keywords,
+            entities_json=parsed.entities,
+            sentiment_label=parsed.sentiment_label,
+            confidence_score=parsed.confidence_score,
+            raw_response_json=parsed.raw_response,
+        )
+        return inference_result.id
+
+    def _build_prompt(self, normalized_text: str) -> str:
+        return (
+            "다음 텔레그램 메시지를 분석하라.\n"
+            "1) 한 줄 요약\n"
+            "2) 핵심 키워드 목록\n"
+            "3) 주요 엔티티가 있으면 추출\n"
+            "4) 메시지 톤(positive/neutral/negative)이 있으면 분류\n\n"
+            f"[입력 메시지]\n{normalized_text}"
+        )
+
+    def _parse_model_output(self, model_output) -> SummaryModelOutput:
+        """
+        model_client가 dict를 반환한다고 가정한 파서.
+        운영 중 필요하면 pydantic 검증으로 강화하는 것이 좋습니다.
+        """
+        if not isinstance(model_output, dict):
+            raise ValueError("model output must be dict")
+
+        summary_text = model_output.get("summary_text")
+        if not summary_text or not isinstance(summary_text, str):
+            raise ValueError("summary_text missing in model output")
+
+        return SummaryModelOutput(
+            summary_text=summary_text.strip(),
+            keywords=model_output.get("keywords"),
+            entities=model_output.get("entities"),
+            sentiment_label=model_output.get("sentiment_label"),
+            confidence_score=model_output.get("confidence_score"),
+            raw_response=model_output,
+        )
+```
+
+---
+
+# 2. `src/workers/inference_worker.py`
+
+이 worker는 `SINGLE_MESSAGE_SUMMARY` job 전용 소비자입니다.
+
+구조는 `PreprocessWorker`와 거의 동일하되, 서비스만 `InferenceService`로 바뀝니다.
+
+```python
+from __future__ import annotations
+
+import logging
+import socket
+import time
+
+from src.domain.constants import JobType
+
+logger = logging.getLogger(__name__)
+
+
+class InferenceWorker:
+    def __init__(
+        self,
+        session_factory,
+        job_service,
+        inference_service,
+        poll_interval: float = 1.0,
+    ):
+        self.session_factory = session_factory
+        self.job_service = job_service
+        self.inference_service = inference_service
+        self.poll_interval = poll_interval
+        self.worker_id = f"inference:{socket.gethostname()}"
+
+    def run_forever(self) -> None:
+        while True:
+            processed = self.run_once()
+            if not processed:
+                time.sleep(self.poll_interval)
+
+    def run_once(self) -> bool:
+        with self.session_factory() as session:
+            job = self.job_service.claim_next_job(
+                session,
+                job_type=JobType.SINGLE_MESSAGE_SUMMARY.value,
+                worker_id=self.worker_id,
+            )
+
+            if job is None:
+                session.commit()
+                return False
+
+            try:
+                inference_result_id = self.inference_service.run_single_message_summary_job(
+                    session,
+                    job=job,
+                )
+                self.job_service.mark_job_succeeded(session, job=job)
+                session.commit()
+
+                logger.info(
+                    "inference job succeeded job_id=%s message_id=%s inference_result_id=%s",
+                    job.id,
+                    job.message_id,
+                    inference_result_id,
+                )
+                return True
+
+            except Exception as exc:
+                self.job_service.mark_job_failed(
+                    session,
+                    job=job,
+                    error_code="INFERENCE_ERROR",
+                    error_message=str(exc),
+                    retryable=True,
+                )
+                session.commit()
+
+                logger.exception(
+                    "inference job failed job_id=%s message_id=%s",
+                    job.id,
+                    job.message_id,
+                )
+                return True
+```
+
+### 이 worker의 핵심 포인트
+
+* `NORMALIZE` job을 절대 건드리지 않음
+* `job.payload_json["preprocess_result_id"]`를 신뢰 기준으로 삼음
+* 실패해도 `commit()`해서 stuck 상태를 남기지 않음
+
+---
+
+# 3. 최소 repository 초안도 같이 있어야 합니다
+
+`InferenceService`가 바로 붙으려면 `preprocess_result_repository.py`, `inference_result_repository.py`에 최소 메서드가 있어야 합니다.
+
+---
+
+## 3-1. `src/repositories/preprocess_result_repository.py`
+
+```python
+from __future__ import annotations
+
+from sqlalchemy.orm import Session
+
+from src.db.models.preprocess_result import MessagePreprocessResult
+
+
+class PreprocessResultRepository:
+    def get_by_id(self, session: Session, preprocess_result_id: int):
+        return session.get(MessagePreprocessResult, preprocess_result_id)
+
+    def create_result(
+        self,
+        session: Session,
+        *,
+        message_id: int,
+        message_version_id: int,
+        normalize_job_id: int,
+        normalized_text: str,
+        cleaned_text: str | None,
+        language_code: str | None,
+        token_count: int | None,
+        line_count: int | None,
+        char_count: int | None,
+        has_url: bool,
+        has_ticker_hint: bool,
+        preprocess_version: str,
+    ):
+        result = MessagePreprocessResult(
+            message_id=message_id,
+            message_version_id=message_version_id,
+            normalize_job_id=normalize_job_id,
+            normalized_text=normalized_text,
+            cleaned_text=cleaned_text,
+            language_code=language_code,
+            token_count=token_count,
+            line_count=line_count,
+            char_count=char_count,
+            has_url=has_url,
+            has_ticker_hint=has_ticker_hint,
+            preprocess_version=preprocess_version,
+        )
+        session.add(result)
+        session.flush()
+        return result
+```
+
+---
+
+## 3-2. `src/repositories/inference_result_repository.py`
+
+```python
+from __future__ import annotations
+
+from sqlalchemy.orm import Session
+
+from src.db.models.inference_result import MessageInferenceResult
+
+
+class InferenceResultRepository:
+    def get_by_id(self, session: Session, inference_result_id: int):
+        return session.get(MessageInferenceResult, inference_result_id)
+
+    def create_result(
+        self,
+        session: Session,
+        *,
+        message_id: int,
+        message_version_id: int,
+        preprocess_result_id: int,
+        inference_job_id: int,
+        task_type: str,
+        model_name: str,
+        prompt_version: str,
+        summary_text: str | None,
+        keywords_json,
+        entities_json,
+        sentiment_label: str | None,
+        confidence_score,
+        raw_response_json,
+    ):
+        result = MessageInferenceResult(
+            message_id=message_id,
+            message_version_id=message_version_id,
+            preprocess_result_id=preprocess_result_id,
+            inference_job_id=inference_job_id,
+            task_type=task_type,
+            model_name=model_name,
+            prompt_version=prompt_version,
+            summary_text=summary_text,
+            keywords_json=keywords_json,
+            entities_json=entities_json,
+            sentiment_label=sentiment_label,
+            confidence_score=confidence_score,
+            raw_response_json=raw_response_json,
+        )
+        session.add(result)
+        session.flush()
+        return result
+```
+
+---
+
+# 4. model client 인터페이스도 얇게 고정하는 것이 좋습니다
+
+운영 초기에 이 계층이 없으면 나중에 OpenAI, 로컬 모델, mock 모델 분리가 힘들어집니다.
+
+예:
+
+```python
+from __future__ import annotations
+
+
+class SummaryModelClient:
+    def summarize(self, prompt: str) -> dict:
+        raise NotImplementedError
+```
+
+테스트에서는 이걸 fake로 대체하면 됩니다.
+
+---
+
+# 5. `run_worker.py` smoke test 초안
+
+사용자께서 앞서 원하신 흐름과 맞물려, `run_worker.py` smoke test는 매우 현실적인 가치가 있습니다.
+
+여기서는 실제 worker 내부 동작까지 다 보는 게 아니라, **라우팅이 정상인지**만 확인하는 수준이면 충분합니다.
+
+가정:
+
+* `src.run_worker.main()` 존재
+* 내부에서 `build_container()` 호출
+* container가 `preprocess_worker`, `inference_worker`, `scheduler_worker` 팩토리를 제공
+
+---
+
+## `tests/test_run_worker.py`
+
+```python
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+import src.run_worker as run_worker_module
+
+
+class DummyWorker:
+    def __init__(self):
+        self.run_once_called = False
+        self.run_forever_called = False
+
+    def run_once(self):
+        self.run_once_called = True
+
+    def run_forever(self):
+        self.run_forever_called = True
+
+
+class DummyContainer:
+    def __init__(self):
+        self._preprocess_worker = DummyWorker()
+        self._inference_worker = DummyWorker()
+        self._scheduler_worker = DummyWorker()
+
+    def preprocess_worker(self):
+        return self._preprocess_worker
+
+    def inference_worker(self):
+        return self._inference_worker
+
+    def scheduler_worker(self):
+        return self._scheduler_worker
+
+
+def test_run_worker_routes_preprocess_once(monkeypatch):
+    container = DummyContainer()
+
+    monkeypatch.setattr(run_worker_module, "build_container", lambda: container)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_worker.py", "--worker", "preprocess", "--once"],
+    )
+
+    run_worker_module.main()
+
+    assert container._preprocess_worker.run_once_called is True
+    assert container._preprocess_worker.run_forever_called is False
+
+
+def test_run_worker_routes_scheduler_once(monkeypatch):
+    container = DummyContainer()
+
+    monkeypatch.setattr(run_worker_module, "build_container", lambda: container)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_worker.py", "--worker", "scheduler", "--once"],
+    )
+
+    run_worker_module.main()
+
+    assert container._scheduler_worker.run_once_called is True
+    assert container._scheduler_worker.run_forever_called is False
+
+
+def test_run_worker_invalid_choice_exits(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_worker.py", "--worker", "invalid-type", "--once"],
+    )
+
+    with pytest.raises(SystemExit):
+        run_worker_module.main()
+```
+
+### 이 테스트의 의미
+
+* argparse 라우팅 확인
+* build_container 주입 구조 확인
+* 운영용 실행 엔트리포인트가 최소한 깨지지 않는지 확인
+
+---
+
+# 6. `scheduler_worker.py` 테스트 3개 초안
+
+이제 복구 안정성 테스트입니다.
+이건 실제 운영 관점에서 매우 중요합니다.
+
+가장 쉬운 방법은 `SchedulerService` 단위 테스트 또는 `SchedulerWorker.run_once()` 테스트입니다.
+여기서는 **서비스 기준 테스트**가 더 안정적이고 간결합니다.
+
+---
+
+## `tests/services/test_scheduler_service.py`
+
+```python
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+
+class FakeJob:
+    def __init__(
+        self,
+        *,
+        job_id: int,
+        retry_count: int,
+        max_retries: int,
+    ):
+        self.id = job_id
+        self.retry_count = retry_count
+        self.max_retries = max_retries
+
+
+class FakeJobRepository:
+    def __init__(self, stuck_jobs):
+        self.stuck_jobs = stuck_jobs
+        self.retry_wait_calls = []
+        self.failed_calls = []
+
+    def find_stuck_jobs(self, session, *, timeout_before):
+        return self.stuck_jobs
+
+    def mark_retry_wait(
+        self,
+        session,
+        *,
+        job,
+        now,
+        next_available_at,
+        error_code,
+        error_message,
+    ):
+        self.retry_wait_calls.append(
+            {
+                "job_id": job.id,
+                "now": now,
+                "next_available_at": next_available_at,
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        )
+
+    def mark_failed(
+        self,
+        session,
+        *,
+        job,
+        now,
+        error_code,
+        error_message,
+    ):
+        self.failed_calls.append(
+            {
+                "job_id": job.id,
+                "now": now,
+                "error_code": error_code,
+                "error_message": error_message,
+            }
+        )
+```
+
+```python
+from src.services.scheduler_service import SchedulerService
+
+
+def test_recover_stuck_jobs_moves_retryable_job_to_retry_wait():
+    repo = FakeJobRepository(
+        stuck_jobs=[
+            FakeJob(job_id=1, retry_count=0, max_retries=3),
+        ]
+    )
+    service = SchedulerService(job_repository=repo)
+
+    stats = service.recover_stuck_jobs(session=None, timeout_minutes=10)
+
+    assert stats.recovered_count == 1
+    assert stats.failed_count == 0
+    assert len(repo.retry_wait_calls) == 1
+    assert repo.retry_wait_calls[0]["job_id"] == 1
+    assert repo.retry_wait_calls[0]["error_code"] == "STUCK_TIMEOUT"
+    assert len(repo.failed_calls) == 0
+
+
+def test_recover_stuck_jobs_does_not_touch_when_no_stuck_jobs():
+    repo = FakeJobRepository(stuck_jobs=[])
+    service = SchedulerService(job_repository=repo)
+
+    stats = service.recover_stuck_jobs(session=None, timeout_minutes=10)
+
+    assert stats.recovered_count == 0
+    assert stats.failed_count == 0
+    assert len(repo.retry_wait_calls) == 0
+    assert len(repo.failed_calls) == 0
+
+
+def test_recover_stuck_jobs_marks_failed_when_max_retries_exceeded():
+    repo = FakeJobRepository(
+        stuck_jobs=[
+            FakeJob(job_id=9, retry_count=2, max_retries=3),
+        ]
+    )
+    service = SchedulerService(job_repository=repo)
+
+    stats = service.recover_stuck_jobs(session=None, timeout_minutes=10)
+
+    assert stats.recovered_count == 0
+    assert stats.failed_count == 1
+    assert len(repo.retry_wait_calls) == 0
+    assert len(repo.failed_calls) == 1
+    assert repo.failed_calls[0]["job_id"] == 9
+    assert repo.failed_calls[0]["error_code"] == "STUCK_MAX_RETRIES_EXCEEDED"
+```
+
+---
+
+# 7. `inference_worker.py` 테스트도 최소 2개는 바로 붙는 것이 좋습니다
+
+---
+
+## `tests/workers/test_inference_worker.py`
+
+```python
+from __future__ import annotations
+
+
+class DummySession:
+    def commit(self):
+        self.committed = True
+
+    def __enter__(self):
+        self.committed = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class DummySessionFactory:
+    def __call__(self):
+        return DummySession()
+
+
+class DummyJob:
+    def __init__(self):
+        self.id = 101
+        self.message_id = 1001
+        self.message_version_id = 2001
+        self.payload_json = {"preprocess_result_id": 3001}
+        self.retry_count = 0
+        self.max_retries = 3
+
+
+class DummyJobService:
+    def __init__(self, job=None):
+        self.job = job
+        self.succeeded_jobs = []
+        self.failed_jobs = []
+
+    def claim_next_job(self, session, *, job_type, worker_id):
+        return self.job
+
+    def mark_job_succeeded(self, session, *, job):
+        self.succeeded_jobs.append(job.id)
+
+    def mark_job_failed(self, session, *, job, error_code, error_message, retryable):
+        self.failed_jobs.append(
+            {
+                "job_id": job.id,
+                "error_code": error_code,
+                "error_message": error_message,
+                "retryable": retryable,
+            }
+        )
+
+
+class DummyInferenceService:
+    def __init__(self, should_fail=False):
+        self.should_fail = should_fail
+        self.called_job_ids = []
+
+    def run_single_message_summary_job(self, session, *, job):
+        self.called_job_ids.append(job.id)
+        if self.should_fail:
+            raise RuntimeError("model timeout")
+        return 999
+```
+
+```python
+from src.workers.inference_worker import InferenceWorker
+
+
+def test_inference_worker_run_once_succeeds():
+    job = DummyJob()
+    worker = InferenceWorker(
+        session_factory=DummySessionFactory(),
+        job_service=DummyJobService(job=job),
+        inference_service=DummyInferenceService(should_fail=False),
+        poll_interval=0,
+    )
+
+    processed = worker.run_once()
+
+    assert processed is True
+    assert worker.inference_service.called_job_ids == [101]
+    assert worker.job_service.succeeded_jobs == [101]
+    assert worker.job_service.failed_jobs == []
+
+
+def test_inference_worker_run_once_marks_failed_on_exception():
+    job = DummyJob()
+    worker = InferenceWorker(
+        session_factory=DummySessionFactory(),
+        job_service=DummyJobService(job=job),
+        inference_service=DummyInferenceService(should_fail=True),
+        poll_interval=0,
+    )
+
+    processed = worker.run_once()
+
+    assert processed is True
+    assert worker.inference_service.called_job_ids == [101]
+    assert worker.job_service.succeeded_jobs == []
+    assert len(worker.job_service.failed_jobs) == 1
+    assert worker.job_service.failed_jobs[0]["job_id"] == 101
+    assert worker.job_service.failed_jobs[0]["error_code"] == "INFERENCE_ERROR"
+```
+
+---
+
+# 8. bootstrap 연결 시 최소 필요 사항
+
+`build_container()`는 복잡하게 시작할 필요 없습니다.
+아래 의존성만 맞으면 됩니다.
+
+### container가 반환할 것
+
+* `analysis_job_repository`
+* `analysis_job_service`
+* `preprocess_result_repository`
+* `inference_result_repository`
+* `model_client`
+* `preprocess_service`
+* `inference_service`
+* `scheduler_service`
+* `preprocess_worker`
+* `inference_worker`
+* `scheduler_worker`
+
+예시 구조는 이런 느낌이면 충분합니다.
+
+```python
+class Container:
+    def __init__(self, session_factory):
+        self.session_factory = session_factory
+
+        self.analysis_job_repository = AnalysisJobRepository()
+        self.preprocess_result_repository = PreprocessResultRepository()
+        self.inference_result_repository = InferenceResultRepository()
+
+        self.analysis_job_service = AnalysisJobService(self.analysis_job_repository)
+        self.model_client = SummaryModelClientImpl()
+
+        self.preprocess_service = PreprocessService(
+            message_version_repository=...,
+            preprocess_result_repository=self.preprocess_result_repository,
+            job_service=self.analysis_job_service,
+        )
+        self.inference_service = InferenceService(
+            preprocess_result_repository=self.preprocess_result_repository,
+            inference_result_repository=self.inference_result_repository,
+            model_client=self.model_client,
+        )
+        self.scheduler_service = SchedulerService(self.analysis_job_repository)
+
+    def preprocess_worker(self):
+        return PreprocessWorker(
+            session_factory=self.session_factory,
+            job_service=self.analysis_job_service,
+            preprocess_service=self.preprocess_service,
+        )
+
+    def inference_worker(self):
+        return InferenceWorker(
+            session_factory=self.session_factory,
+            job_service=self.analysis_job_service,
+            inference_service=self.inference_service,
+        )
+
+    def scheduler_worker(self):
+        return SchedulerWorker(
+            session_factory=self.session_factory,
+            scheduler_service=self.scheduler_service,
+        )
+```
+
+---
+
+# 9. 여기까지 적용되면 실제 파이프라인은 이렇게 닫힙니다
+
+1. `persist_message()`가 `NORMALIZE` job 생성
+2. `PreprocessWorker`가 `NORMALIZE` claim
+3. `PreprocessService`가 preprocess result 저장
+4. `SINGLE_MESSAGE_SUMMARY` job 생성
+5. `InferenceWorker`가 summary job claim
+6. `InferenceService`가 inference result 저장
+7. `SchedulerService`가 stuck job 복구
+
+즉, 이제 구조상 빠져 있는 큰 조각은 거의 없습니다.
+
+---
+
+# 10. 지금 가장 자연스러운 다음 작업
+
+이 시점에서 다음 우선순위는 아래 순서가 가장 좋습니다.
+
+### 1순위
+
+`persist_message()` 실제 코드 패치
+왜냐하면 파이프라인 입구가 완전히 연결되어야 전체가 의미가 생깁니다.
+
+### 2순위
+
+`analysis_job_repository.claim_next_job()`를 현재 DB/ORM에 맞게 실제 SQLAlchemy 코드로 보정
+특히 DB가 PostgreSQL/MySQL/SQLite 중 무엇인지에 따라 `FOR UPDATE SKIP LOCKED` 호환성을 확인해야 합니다.
+
+### 3순위
+
+`collector_worker.py`에서 기존 직접 분석 호출 제거
+이게 남아 있으면 구조가 다시 꼬입니다.
+
+### 4순위
+
+`PreprocessWorker`와 `InferenceWorker`를 현재 run 루프에 실제로 연결
+
+---
+
+다음 답변에서는 이어서
+**`persist_message()` 실제 패치 초안 + `collector_worker.py` 수정안 + message/version/job 생성 테스트**까지 바로 정리하겠습니다.
