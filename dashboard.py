@@ -274,8 +274,14 @@ def get_watchlist_report():
     miss_codes = [c for c in recommended if c not in name_map and c]
     if miss_codes and config.USERS:
         try:
+            from kis_api import _token_cache as _tc
             _client = KISAPIClient(config.USERS[0])
-            if _client.get_access_token():
+            account_no = config.USERS[0].get("account_no", "")
+            # 이미 캐시된 토큰이 있을 때만 API 조회 (추가 발급 불필요)
+            token_ok = account_no in _tc or account_no[:8] + "01" in _tc
+            if not token_ok:
+                token_ok = _client.get_access_token()
+            if token_ok:
                 fetched: dict = {}
                 for mc in miss_codes:
                     n = _client.get_stock_name(mc)
