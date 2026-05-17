@@ -309,6 +309,24 @@ class KISAPIClient:
             logger.error(f"지수 조회 오류 ({index_code}): {e}")
             return {}
 
+    def get_stock_name(self, stock_code: str) -> str:
+        """주식 현재가 시세 조회로 종목명(hts_kor_isnm) 반환.
+        조회 실패 시 빈 문자열 반환.
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
+        params = {
+            "fid_cond_mrkt_div_code": "J",
+            "fid_input_iscd": stock_code,
+        }
+        headers = self._get_headers("FHKST01010100")
+        try:
+            res = requests.get(url, params=params, headers=headers, timeout=3)
+            if res.status_code == 200:
+                return res.json().get("output", {}).get("hts_kor_isnm", "")
+        except Exception as e:
+            logger.debug(f"종목명 조회 오류 ({stock_code}): {e}")
+        return ""
+
     def get_vi_status(self, stock_code: str) -> dict:
         """VI (변동성 완화장치) 발동 상태 조회"""
         url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-vi-status"

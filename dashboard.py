@@ -89,6 +89,41 @@ def get_config():
         "users": [{"name": u["name"], "account": u["account_no"]} for u in config.USERS]
     })
 
+_STOCK_NAMES_CACHE = _BASE_DIR / "etc" / "stock_names.json"
+
+
+def _load_stock_names_cache() -> dict:
+    """etc/stock_names.json 로드 (없으면 빈 dict)"""
+    try:
+        if _STOCK_NAMES_CACHE.exists():
+            import json as _j
+            return _j.loads(_STOCK_NAMES_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _update_stock_names_cache(new_entries: dict) -> None:
+    """새 종목명을 기존 캐시에 병합 저장 (빈 값·기존 항목 덮어쓰지 않음)"""
+    if not new_entries:
+        return
+    try:
+        import json as _j
+        cache = _load_stock_names_cache()
+        changed = False
+        for code, name in new_entries.items():
+            if name and code not in cache:
+                cache[code] = name
+                changed = True
+        if changed:
+            _STOCK_NAMES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            _STOCK_NAMES_CACHE.write_text(
+                _j.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+    except Exception as exc:
+        logger.debug(f"stock_names 캐시 저장 실패: {exc}")
+
+
 @app.route("/api/balance")
 def get_balance():
     """모든 사용자의 계좌 잔고 및 평가 수익 반환"""
@@ -108,6 +143,12 @@ def get_balance():
         if data and "output2" in data:
             summary = data["output2"][0] if data["output2"] else {}
             holdings = data.get("output1", [])
+
+            # 잔고 종목명을 stock_names.json 캐시에 누적 저장
+            _update_stock_names_cache(
+                {h.get("pdno", ""): h.get("prdt_name", "")
+                 for h in holdings if h.get("pdno") and h.get("prdt_name")}
+            )
 
             balances.append({
                 "name": user["name"],
@@ -206,32 +247,52 @@ def get_watchlist_report():
         except Exception:
             pass
 
-    # 종목명 조회 (stock_aliases.json → positions.json 순서)
-    aliases_path = base / "stock_aliases.json"
-    name_map: dict = {}
+    # 종목명 조회: stock_names.json 캐시 → stock_aliases.json → positions → KIS API
+    name_map: dict = _load_stock_names_cache()   # 1순위: 누적 캐시
+
+    aliases_path = base / "stock_aliases.json"   # 2순위: alias 사전
     if aliases_path.exists():
         try:
             raw = _json.loads(aliases_path.read_text(encoding="utf-8"))
             for code, names in raw.items():
-                name_map[code] = names[0] if names else code
+                if code not in name_map:
+                    name_map[code] = names[0] if names else code
         except Exception:
             pass
-    for pos in position_tracker.get_open_positions():
+
+    for pos in position_tracker.get_open_positions():  # 3순위: 보유 포지션
         code = pos.get("stock_code", "")
         if code and code not in name_map:
             name_map[code] = pos.get("stock_name", code)
 
-    # 추천 종목별 정보 조합
+    # 추천 종목별 정보 조합 + 4순위: KIS API 실시간 조회 (캐시 미스 종목만)
     code_scores: dict = report.get("code_scores", {})
     recommended: list = report.get("recommended_codes", [])
     max_score = max(code_scores.values(), default=1)
+
+    # 캐시에 없는 종목 KIS API 일괄 조회 후 캐시 갱신
+    miss_codes = [c for c in recommended if c not in name_map and c]
+    if miss_codes and config.USERS:
+        try:
+            _client = KISAPIClient(config.USERS[0])
+            if _client.get_access_token():
+                fetched: dict = {}
+                for mc in miss_codes:
+                    n = _client.get_stock_name(mc)
+                    if n:
+                        fetched[mc] = n
+                if fetched:
+                    name_map.update(fetched)
+                    _update_stock_names_cache(fetched)
+        except Exception as exc:
+            logger.debug(f"종목명 API 조회 실패: {exc}")
 
     stocks = []
     for code in recommended:
         score = code_scores.get(code, 0)
         stocks.append({
             "code": code,
-            "name": name_map.get(code, code),
+            "name": name_map.get(code, code),   # 최종 fallback: 코드 그대로
             "score": round(score, 1),
             "score_pct": round(score / max_score * 100, 1),
             "themes": themes.get(code, []),
