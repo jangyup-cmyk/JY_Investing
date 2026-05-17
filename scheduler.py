@@ -77,25 +77,18 @@ def _resolve_weighted_codes_from_channel_report() -> list[str]:
     return resolved
 
 
-def resolve_stock_codes(initial_codes: list | None = None) -> list:
-    """WATCH_LIST 또는 자연어 추출 기반 추천 종목 코드 결정."""
+def refresh_watchlist_report() -> list:
+    """
+    텍스트 기반 AI 종목 추출 실행 → auto_watchlist_report.json 저장.
+    USE_CHANNEL_WEIGHTED_WATCHLIST 설정과 무관하게 항상 실행되어
+    대시보드에 최신 분석 결과를 표시.
+    반환: 텍스트 추출 기반 추천 종목 코드 목록
+    """
     import config
-
-    resolved = list(initial_codes or [])
-    if resolved:
-        return resolved
-
-    if not config.AUTO_BUILD_WATCH_LIST:
-        return resolved
+    import theme_extractor
+    from datetime import datetime as _dt
 
     try:
-        if config.USE_CHANNEL_WEIGHTED_WATCHLIST:
-            weighted = _resolve_weighted_codes_from_channel_report()
-            if weighted:
-                return weighted
-
-        import theme_extractor
-
         # 텔레그램 텍스트를 채널 폴더 단위로 그룹 로드 (C: 채널 정규화용)
         text_groups = theme_extractor.load_texts_grouped_by_subdir(config.TEXT_SIGNAL_SOURCE_DIR)
 
@@ -105,6 +98,7 @@ def resolve_stock_codes(initial_codes: list | None = None) -> list:
             text_groups.update({f"naver_{k}": v for k, v in research_groups.items()})
 
         if not text_groups:
+            logger.info("[테마 추출] 분석할 텍스트 없음 — 리포트 생성 스킵")
             return []
 
         # update_theme_mapping_from_texts 는 flat list 필요
@@ -116,11 +110,10 @@ def resolve_stock_codes(initial_codes: list | None = None) -> list:
             text_groups, min_score=config.THEME_EXTRACTION_MIN_SCORE
         )
         resolved = aggregated.get("recommended_codes", [])
+        aggregated["generated_at"] = _dt.now().isoformat()
 
         # auto_watchlist_report.json 저장 (대시보드 /api/watchlist-report 에서 읽음)
         try:
-            from datetime import datetime as _dt
-            aggregated["generated_at"] = _dt.now().isoformat()
             report_path = Path(config.AUTO_WATCHLIST_REPORT_PATH)
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(
@@ -136,11 +129,39 @@ def resolve_stock_codes(initial_codes: list | None = None) -> list:
             f"중복제거 후 {dedup.get('unique_after', 0)}건 ({dedup.get('removed', 0)}건 제거), "
             f"themes.json 갱신 {updated}종목, 추천 종목 {len(resolved)}개"
         )
+        return resolved
+
     except Exception as exc:
-        logger.error(f"[테마 추출] 자동 watch list 생성 실패: {exc}")
+        logger.error(f"[테마 추출] watchlist 리포트 생성 실패: {exc}")
         return []
 
-    return resolved
+
+def resolve_stock_codes(initial_codes: list | None = None) -> list:
+    """
+    WATCH_LIST 또는 자연어 추출 기반 추천 종목 코드 결정.
+    항상 refresh_watchlist_report()를 호출해 대시보드 리포트를 갱신한 뒤,
+    USE_CHANNEL_WEIGHTED_WATCHLIST 가 True 면 채널 가중치 결과로 최종 코드 오버라이드.
+    """
+    import config
+
+    resolved = list(initial_codes or [])
+    if resolved:
+        return resolved
+
+    if not config.AUTO_BUILD_WATCH_LIST:
+        return resolved
+
+    # 항상 텍스트 추출 실행 → 대시보드 리포트 갱신
+    text_based = refresh_watchlist_report()
+
+    # 채널 가중치 모드: 추가로 채널 비교 리포트 기반 코드로 오버라이드
+    if config.USE_CHANNEL_WEIGHTED_WATCHLIST:
+        weighted = _resolve_weighted_codes_from_channel_report()
+        if weighted:
+            logger.info(f"[채널 가중치] 텍스트 추출 결과를 채널 가중치 결과로 오버라이드: {len(weighted)}개")
+            return weighted
+
+    return text_based
 
 
 def refresh_all_tokens():
@@ -490,9 +511,9 @@ def start_scheduler() -> None:
         # run_signal_pipeline 과 별도로 watchlist 리포트만 갱신
         # 시작 시 1회 즉시 실행하여 최신 리포트 생성
         if config.AUTO_BUILD_WATCH_LIST:
-            resolve_stock_codes()  # 시작 시 즉시 1회
+            refresh_watchlist_report()  # 시작 시 즉시 1회
             scheduler.add_job(
-                resolve_stock_codes,
+                refresh_watchlist_report,
                 trigger="interval",
                 hours=1,
                 id="watchlist_refresh",

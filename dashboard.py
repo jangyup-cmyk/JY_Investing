@@ -325,7 +325,7 @@ def refresh_watchlist_report():
     """AI 종목 추출 리포트 즉시 재생성 (대시보드 새로고침 버튼용)"""
     try:
         import scheduler as _sched
-        codes = _sched.resolve_stock_codes()
+        codes = _sched.refresh_watchlist_report()
         return jsonify({
             "success": True,
             "recommended_codes": codes,
