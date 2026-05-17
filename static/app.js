@@ -257,12 +257,13 @@ document.addEventListener('DOMContentLoaded', () => {
                    <div class="cell-sub" style="color:${rateColor}">${pnlAmt >= 0 ? '+' : ''}₩ ${pnlAmt.toLocaleString()}</div>`
                 : '-';
 
-            // 매수가 + 매수일자 (2줄)
-            const buyDate = pos.opened_at ? pos.opened_at.slice(0, 10) : '-';
+            // 매수가 + 매수일자 (2줄) — buy_date 우선, 없으면 opened_at 날짜
+            const buyDate = pos.buy_date || (pos.opened_at ? pos.opened_at.slice(0, 10) : '-');
             const buyStr = `<div class="cell-main">₩ ${Number(pos.buy_price).toLocaleString()}</div>
                             <div class="cell-sub">${buyDate}</div>`;
 
             const posKey = `${pos.account_no}_${pos.stock_code}`;
+            const label  = `${pos.stock_name} (${pos.stock_code})`;
             const acctCell = _selectedAccount ? '' : `<td style="font-size:0.82rem;color:var(--text-secondary);">${pos.account_no}</td>`;
 
             return `
@@ -276,7 +277,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     <td>${pos.qty.toLocaleString()} 주</td>
                     <td style="color:var(--loss-color)">₩ ${Number(pos.stop_loss).toLocaleString()}</td>
                     <td style="color:var(--profit-color)">₩ ${Number(pos.take_profit).toLocaleString()}</td>
-                    <td><button class="btn-edit" onclick="openEditModal('${posKey}', ${pos.stop_loss}, ${pos.take_profit})">✏️</button></td>
+                    <td><button class="btn-edit" onclick="openEditModal('${posKey}', ${pos.stop_loss}, ${pos.take_profit}, '${buyDate}', '${label}')">✏️</button></td>
                 </tr>`;
         }).join('');
     }
@@ -455,11 +456,13 @@ document.addEventListener('DOMContentLoaded', () => {
             .catch(err => console.error('Collection stats fetch error:', err));
     }
 
-    // Fix 4: 손절/익절 편집 모달
-    window.openEditModal = function(posKey, stopLoss, takeProfit) {
+    // 포지션 편집 모달 (손절/익절 + 매수일)
+    window.openEditModal = function(posKey, stopLoss, takeProfit, buyDate, label) {
         document.getElementById('edit-pos-key').value = posKey;
         document.getElementById('edit-stop-loss').value = stopLoss;
         document.getElementById('edit-take-profit').value = takeProfit;
+        document.getElementById('edit-buy-date').value = buyDate || '';
+        document.getElementById('edit-pos-label').textContent = label || posKey;
         document.getElementById('edit-modal').style.display = 'flex';
     };
 
@@ -468,14 +471,15 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     window.submitEditModal = function() {
-        const key = document.getElementById('edit-pos-key').value;
-        const sl  = parseFloat(document.getElementById('edit-stop-loss').value);
-        const tp  = parseFloat(document.getElementById('edit-take-profit').value);
+        const key     = document.getElementById('edit-pos-key').value;
+        const sl      = parseFloat(document.getElementById('edit-stop-loss').value);
+        const tp      = parseFloat(document.getElementById('edit-take-profit').value);
+        const buyDate = document.getElementById('edit-buy-date').value;
         if (!sl || !tp || sl <= 0 || tp <= 0) { alert('유효한 값을 입력하세요.'); return; }
         fetch(`/api/positions/${key}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ stop_loss: sl, take_profit: tp }),
+            body: JSON.stringify({ stop_loss: sl, take_profit: tp, buy_date: buyDate }),
         })
         .then(r => r.json())
         .then(r => {

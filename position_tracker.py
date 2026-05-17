@@ -59,9 +59,13 @@ def add_position(
     stop_loss: float,
     take_profit: float,
     stock_name: str = "",
+    buy_date: str = "",
 ) -> None:
-    """매수 체결 후 포지션 등록"""
+    """매수 체결 후 포지션 등록.
+    buy_date: 실제 매수일 (YYYY-MM-DD). 미전달 시 오늘 날짜로 자동 설정.
+    """
     key = f"{account_no}_{stock_code}"
+    today = datetime.now().strftime("%Y-%m-%d")
     entry = {
         "account_no": account_no,
         "stock_code": stock_code,
@@ -71,7 +75,8 @@ def add_position(
         "stop_loss": round(stop_loss, 0),
         "take_profit": round(take_profit, 0),
         "status": "open",
-        "opened_at": datetime.now().isoformat(),
+        "buy_date": buy_date.strip() or today,   # 실제 매수일 (수정 가능)
+        "opened_at": datetime.now().isoformat(),  # 시스템 등록 시각 (내부용)
     }
     with _lock:
         positions = _load()
@@ -116,8 +121,9 @@ def update_position_levels(
     stock_code: str,
     stop_loss: float,
     take_profit: float,
+    buy_date: str = "",
 ) -> bool:
-    """손절/익절가 수동 업데이트 (대시보드 편집 UI용)"""
+    """손절/익절가 + 매수일 수동 업데이트 (대시보드 편집 UI용)"""
     key = f"{account_no}_{stock_code}"
     with _lock:
         positions = _load()
@@ -126,7 +132,14 @@ def update_position_levels(
             return False
         positions[key]["stop_loss"] = round(stop_loss, 0)
         positions[key]["take_profit"] = round(take_profit, 0)
+        if buy_date and buy_date.strip():
+            positions[key]["buy_date"] = buy_date.strip()
+        # 기존 포지션에 buy_date 없으면 opened_at 날짜로 초기화
+        if "buy_date" not in positions[key]:
+            opened = positions[key].get("opened_at", "")
+            positions[key]["buy_date"] = opened[:10] if opened else ""
         ok = _save(positions)
     if ok:
-        logger.info(f"[손절/익절 수정] {key} → 손절={stop_loss:,.0f} 익절={take_profit:,.0f}")
+        logger.info(f"[포지션 수정] {key} → 손절={stop_loss:,.0f} 익절={take_profit:,.0f}"
+                    + (f" 매수일={buy_date}" if buy_date else ""))
     return ok

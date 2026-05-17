@@ -186,12 +186,18 @@
 
     </div>
 
-    <!-- 손절/익절 편집 모달 -->
+    <!-- 포지션 편집 모달 (손절/익절 + 매수일) -->
     <div id="edit-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
-        <div style="background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;padding:2rem;min-width:320px;">
-            <h3 style="margin-bottom:1.2rem;color:var(--text-primary)">손절/익절 수정</h3>
+        <div style="background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;padding:2rem;min-width:340px;">
+            <h3 style="margin-bottom:0.3rem;color:var(--text-primary)">포지션 수정</h3>
+            <div id="edit-pos-label" style="font-size:0.82rem;color:var(--text-secondary);margin-bottom:1.2rem;"></div>
             <input type="hidden" id="edit-pos-key">
-            <div style="margin-bottom:1rem;">
+            <div style="margin-bottom:0.9rem;">
+                <label style="color:var(--text-secondary);font-size:0.85rem;">매수일 (실제 거래일)</label>
+                <input id="edit-buy-date" type="date"
+                    style="width:100%;margin-top:0.3rem;padding:0.5rem 0.75rem;background:var(--input-bg,#1e2a3a);border:1px solid var(--border-color);border-radius:6px;color:var(--text-primary);font-size:1rem;">
+            </div>
+            <div style="margin-bottom:0.9rem;">
                 <label style="color:var(--text-secondary);font-size:0.85rem;">손절가 (₩)</label>
                 <input id="edit-stop-loss" type="number" step="1"
                     style="width:100%;margin-top:0.3rem;padding:0.5rem 0.75rem;background:var(--input-bg,#1e2a3a);border:1px solid var(--border-color);border-radius:6px;color:var(--loss-color);font-size:1rem;">

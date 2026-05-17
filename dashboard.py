@@ -196,6 +196,7 @@ def update_position(key: str):
         body = request.get_json(force=True) or {}
         stop_loss   = float(body.get("stop_loss", 0))
         take_profit = float(body.get("take_profit", 0))
+        buy_date   = str(body.get("buy_date", "")).strip()
         if stop_loss <= 0 or take_profit <= 0:
             return jsonify({"success": False, "error": "유효하지 않은 값 (0 이하)"})
         if stop_loss >= take_profit:
@@ -204,7 +205,7 @@ def update_position(key: str):
         parts = key.split("_", 1)
         if len(parts) != 2:
             return jsonify({"success": False, "error": "잘못된 키 형식"})
-        ok = position_tracker.update_position_levels(parts[0], parts[1], stop_loss, take_profit)
+        ok = position_tracker.update_position_levels(parts[0], parts[1], stop_loss, take_profit, buy_date)
         return jsonify({"success": ok, "error": None if ok else "저장 실패"})
     except (ValueError, TypeError) as e:
         return jsonify({"success": False, "error": f"입력 오류: {e}"})
