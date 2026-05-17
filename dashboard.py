@@ -291,16 +291,31 @@ def get_collection_stats():
                 }
 
     # 텔레그램 텍스트 폴더별 통계
-    # channel_alpha / channel_beta 는 시뮬레이션 테스트용 폴더 → 제외
-    TG_EXCLUDE = {"channel_alpha", "channel_beta"}
+    # channel_groups.json 에 등록된 폴더만 표시 (삭제된 구버전 폴더 제외)
     tg_root = base / "telegram_texts"
     tg_groups = {}
+
+    # 실제 모니터링 중인 폴더 목록 로드
+    channel_groups_path = base / "channel_groups.json"
+    active_tg_folders: set[str] = set()
+    if channel_groups_path.exists():
+        try:
+            cg_data = _json.loads(channel_groups_path.read_text(encoding="utf-8"))
+            if isinstance(cg_data, dict):
+                active_tg_folders = set(cg_data.keys())
+        except Exception:
+            pass  # 파일 읽기 실패 시 빈 set → 아래에서 fallback
+
     if tg_root.exists():
         for grp_dir in sorted(tg_root.iterdir()):
-            if grp_dir.is_dir() and grp_dir.name not in TG_EXCLUDE:
-                stat = _scan_dir(grp_dir)
-                if stat["count"] > 0:   # 파일이 있는 폴더만 표시
-                    tg_groups[grp_dir.name] = stat
+            if not grp_dir.is_dir():
+                continue
+            # active_tg_folders 가 비어있으면 (channel_groups.json 없음) 전체 표시
+            if active_tg_folders and grp_dir.name not in active_tg_folders:
+                continue  # 등록되지 않은 구버전/테스트 폴더 제외
+            stat = _scan_dir(grp_dir)
+            if stat["count"] > 0:
+                tg_groups[grp_dir.name] = stat
 
     # 텔레그램 리스너 추적 채널 수
     state_file = base / "telegram_listener_state.json"
