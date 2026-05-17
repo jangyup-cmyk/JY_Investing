@@ -220,8 +220,8 @@ def get_watchlist_report():
 
     base = _pl.Path("etc")
 
-    # 1. auto_watchlist_report.json
-    report_path = base / "telegram_texts" / "auto_watchlist_report.json"
+    # 1. auto_watchlist_report.json (config 경로 기준)
+    report_path = _pl.Path(config.AUTO_WATCHLIST_REPORT_PATH)
     report: dict = {}
     if report_path.exists():
         try:
@@ -318,6 +318,22 @@ def get_watchlist_report():
         "top_themes": [{"name": k, "count": v} for k, v in top_themes],
         "channel_weights": weights,
     })
+
+
+@app.route("/api/watchlist-report/refresh", methods=["POST"])
+def refresh_watchlist_report():
+    """AI 종목 추출 리포트 즉시 재생성 (대시보드 새로고침 버튼용)"""
+    try:
+        import scheduler as _sched
+        codes = _sched.resolve_stock_codes()
+        return jsonify({
+            "success": True,
+            "recommended_codes": codes,
+            "count": len(codes),
+        })
+    except Exception as exc:
+        logger.error(f"watchlist refresh 실패: {exc}", exc_info=True)
+        return jsonify({"success": False, "error": str(exc) if _FLASK_DEBUG else "재생성 실패"})
 
 
 @app.route("/api/collection-stats")

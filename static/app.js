@@ -235,16 +235,37 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // AI Watchlist Report
+    let _watchlistRefreshing = false;
+    window.refreshWatchlist = function() {
+        if (_watchlistRefreshing) return;
+        _watchlistRefreshing = true;
+        const btn = document.getElementById('watchlist-refresh-btn');
+        if (btn) { btn.textContent = '⏳'; btn.disabled = true; }
+        fetch('/api/watchlist-report/refresh', { method: 'POST' })
+            .then(res => res.json())
+            .then(res => {
+                if (res.success) updateWatchlistReport();
+                else alert('재생성 실패: ' + (res.error || '알 수 없는 오류'));
+            })
+            .catch(err => console.error('Watchlist refresh error:', err))
+            .finally(() => {
+                _watchlistRefreshing = false;
+                if (btn) { btn.textContent = '↻'; btn.disabled = false; }
+            });
+    };
+
     function updateWatchlistReport() {
         fetch('/api/watchlist-report')
             .then(res => res.json())
             .then(res => {
                 if (!res.success) return;
 
-                // 메타 정보
+                // 메타 정보 (생성 시각 + 신선도 경고)
                 const genAt = res.generated_at ? res.generated_at.replace('T', ' ').slice(0, 16) : '-';
+                const genMs = res.generated_at ? Date.now() - new Date(res.generated_at).getTime() : 0;
+                const stale = genMs > 2 * 60 * 60 * 1000; // 2시간 이상 오래된 경우
                 document.getElementById('watchlist-meta').textContent =
-                    `분석 텍스트 ${res.text_count.toLocaleString()}건 | 생성: ${genAt}`;
+                    `분석 텍스트 ${(res.text_count || 0).toLocaleString()}건 | 생성: ${genAt}${stale ? ' ⚠️' : ''}`;
 
                 // 수동 지정 여부
                 if (!res.auto_build && res.manual_watch_list.length > 0) {

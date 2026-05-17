@@ -120,6 +120,7 @@ CHANNEL_COMPARISON_REPORT_PATH: str = os.getenv(
 )
 CHANNEL_WEIGHTS_FILE: str = os.getenv("CHANNEL_WEIGHTS_FILE", "etc/channel_weights.json")
 CHANNEL_WEIGHTED_TOP_N: int = int(os.getenv("CHANNEL_WEIGHTED_TOP_N", "10"))
+AUTO_WATCHLIST_REPORT_PATH: str = os.getenv("AUTO_WATCHLIST_REPORT_PATH", "etc/auto_watchlist_report.json")
 
 # ============================================================================
 # 손절 / 익절 비율 설정 (.env로 오버라이드 가능)

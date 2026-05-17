@@ -72,7 +72,10 @@
         <section class="glass-card" style="margin-bottom:1.5rem;">
             <div class="section-header" style="padding:1rem 1.5rem 0.75rem;">
                 <h2>🧠 AI 종목 추출 현황</h2>
-                <span id="watchlist-meta" style="font-size:0.82rem;color:var(--text-secondary);">로딩중...</span>
+                <div style="display:flex;align-items:center;gap:0.75rem;">
+                    <span id="watchlist-meta" style="font-size:0.82rem;color:var(--text-secondary);">로딩중...</span>
+                    <button id="watchlist-refresh-btn" class="btn-icon" onclick="refreshWatchlist()" title="AI 종목 추출 즉시 재실행">↻</button>
+                </div>
             </div>
             <div style="padding:0 1.25rem 1rem;">
                 <div id="watchlist-manual" style="display:none;margin-bottom:0.75rem;padding:0.6rem 1rem;background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.3);border-radius:8px;font-size:0.85rem;">

@@ -119,7 +119,10 @@ def resolve_stock_codes(initial_codes: list | None = None) -> list:
 
         # auto_watchlist_report.json 저장 (대시보드 /api/watchlist-report 에서 읽음)
         try:
-            report_path = Path(getattr(config, "AUTO_WATCHLIST_REPORT_PATH", "auto_watchlist_report.json"))
+            from datetime import datetime as _dt
+            aggregated["generated_at"] = _dt.now().isoformat()
+            report_path = Path(config.AUTO_WATCHLIST_REPORT_PATH)
+            report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(
                 json.dumps(aggregated, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -483,10 +486,23 @@ def start_scheduler() -> None:
                 replace_existing=True,
             )
 
-        # ── Job 5: 텔레그램 폴더별 채널 모니터링 (선택 사항) ────────────
+        # ── Job 5: AI 종목 추출 리포트 주기 갱신 (1시간 간격, 24시간 운영) ──
+        # run_signal_pipeline 과 별도로 watchlist 리포트만 갱신
+        # 시작 시 1회 즉시 실행하여 최신 리포트 생성
+        if config.AUTO_BUILD_WATCH_LIST:
+            resolve_stock_codes()  # 시작 시 즉시 1회
+            scheduler.add_job(
+                resolve_stock_codes,
+                trigger="interval",
+                hours=1,
+                id="watchlist_refresh",
+                replace_existing=True,
+            )
+
+        # ── Job 6: 텔레그램 폴더별 채널 모니터링 (선택 사항) ────────────
         start_telegram_listener()
 
-        # ── Job 6: 네이버 리서치 자동 수집 ───────────────────────────
+        # ── Job 7: 네이버 리서치 자동 수집 ───────────────────────────
         start_naver_research_collector()
 
         logger.info("✅ 스케줄러 시작됨")
