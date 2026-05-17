@@ -111,28 +111,40 @@
             </div>
         </section>
 
-        <!-- ⑥ 잔고 카드 -->
-        <section class="metrics-grid" id="balance-container" style="margin-bottom:1.5rem;">
-            <div class="glass-card metric-card">
-                <h3>로딩 중...</h3>
-                <div class="value">₩ 0</div>
+        <!-- ⑥ 계좌 자산 카드 (클릭 → 해당 계좌 포지션 필터) -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header" style="padding:1rem 1.5rem 0.75rem;">
+                <h2>💰 계좌 자산</h2>
+                <button id="account-all-btn" class="account-all-btn" onclick="selectAccount(null)" style="display:none;">전체 보기</button>
+            </div>
+            <!-- 총합 요약 바 (계좌 2개 이상일 때 표시) -->
+            <div id="balance-summary" style="display:none;padding:0 1.5rem 0.75rem;border-bottom:1px solid var(--border-color);margin-bottom:0.75rem;">
+            </div>
+            <!-- 계좌별 카드 그리드 -->
+            <div class="account-cards-grid" id="balance-container">
+                <div class="glass-card metric-card" style="background:transparent;border:1px solid var(--border-color);">
+                    <h3>로딩 중...</h3><div class="value">₩ 0</div>
+                </div>
             </div>
         </section>
 
         <!-- ⑦ 보유 포지션 (전체 너비) -->
         <section class="glass-card" style="margin-bottom:1.5rem;">
             <div class="section-header">
-                <h2>📊 보유 포지션</h2>
+                <div style="display:flex;align-items:center;gap:0.75rem;">
+                    <h2>📊 보유 포지션</h2>
+                    <span id="positions-account-filter" class="account-filter-badge">전체 계좌</span>
+                </div>
             </div>
             <div class="table-responsive">
-                <table class="data-table">
-                    <thead>
+                <table class="data-table" id="positions-table">
+                    <thead id="positions-thead">
                         <tr>
-                            <th>계좌명</th>
+                            <th class="col-account">계좌</th>
                             <th>종목명 (코드)</th>
-                            <th>매수가</th>
+                            <th>매수가 / 매수일</th>
                             <th>현재가</th>
-                            <th>수익률</th>
+                            <th>수익률 / 수익금액</th>
                             <th>보유수량</th>
                             <th>손절가</th>
                             <th>익절가</th>

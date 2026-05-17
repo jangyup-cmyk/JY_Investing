@@ -11,9 +11,38 @@ document.addEventListener('DOMContentLoaded', () => {
     // 현재가 맵 (계좌잔고 응답에서 채움)
     let _priceMap = {};
 
+    // 계좌 선택 상태 (null = 전체)
+    let _selectedAccount = null;
+    let _accountCount = 0;
+
     // System Status + main.py 제어 버튼 상태
     let _mainRunning = false;
     let _toggleBusy  = false;
+
+    // 계좌 선택 / 해제 (카드 클릭)
+    window.selectAccount = function(accountNo) {
+        _selectedAccount = (accountNo === null || _selectedAccount === accountNo) ? null : accountNo;
+
+        // 카드 선택 표시
+        document.querySelectorAll('.metric-card[data-account]').forEach(card => {
+            card.classList.toggle('selected', card.dataset.account === _selectedAccount);
+        });
+
+        // 포지션 헤더 뱃지
+        const badge = document.getElementById('positions-account-filter');
+        if (badge) badge.textContent = _selectedAccount ? `${_selectedAccount} 계좌` : '전체 계좌';
+
+        // "전체 보기" 버튼 표시/숨김
+        const allBtn = document.getElementById('account-all-btn');
+        if (allBtn) allBtn.style.display = _selectedAccount ? 'inline-block' : 'none';
+
+        // 계좌열 표시/숨김 (단일 계좌 선택 시 계좌열 숨김)
+        document.querySelectorAll('.col-account').forEach(el => {
+            el.classList.toggle('hidden', !!_selectedAccount);
+        });
+
+        renderPositionsIfReady();
+    };
 
     function updateSystemStatus() {
         fetch('/api/system-status')
@@ -116,26 +145,54 @@ document.addEventListener('DOMContentLoaded', () => {
         })
         .catch(err => console.error('Config fetch error:', err));
 
-    // Balance (Fix 1: eval_profit_loss 직접 사용 + Fix 3: 현재가 맵 구축)
+    // Balance — 계좌별 카드 + 총합 요약 + 계좌 선택 필터
     function updateBalance() {
         fetch('/api/balance')
             .then(res => res.json())
             .then(res => {
                 if (!res.success) return;
                 _priceMap = {};
+                _accountCount = res.data.length;
+
+                // 현재가 맵 갱신
+                res.data.forEach(b => {
+                    (b.holdings || []).forEach(h => { if (h.code) _priceMap[h.code] = h; });
+                });
+
+                // ── 총합 요약 바 (계좌 2개 이상) ──────────────────────
+                const summaryEl = document.getElementById('balance-summary');
+                if (_accountCount >= 2) {
+                    const totalEvalAll = res.data.reduce((s, b) => s + (b.total_eval_amount || 0), 0);
+                    const totalBuyAll  = res.data.reduce((s, b) => s + (b.total_buy_amount  || 0), 0);
+                    const pnlAll       = res.data.reduce((s, b) => s + (b.eval_profit_loss  || 0), 0);
+                    const pnlRateAll   = totalBuyAll > 0 ? (pnlAll / totalBuyAll) * 100 : 0;
+                    const pnlCol       = pnlAll >= 0 ? 'var(--profit-color)' : 'var(--loss-color)';
+                    summaryEl.style.display = 'block';
+                    summaryEl.innerHTML = `
+                        <div class="balance-summary-row">
+                            <span><span class="bs-label">전체 평가금액</span><span class="bs-value">₩ ${totalEvalAll.toLocaleString()}</span></span>
+                            <span><span class="bs-label">전체 손익</span>
+                                <span class="bs-value" style="color:${pnlCol}">
+                                    ${pnlAll >= 0 ? '+' : ''}₩ ${pnlAll.toLocaleString()}
+                                    (${pnlRateAll >= 0 ? '+' : ''}${pnlRateAll.toFixed(2)}%)
+                                </span>
+                            </span>
+                            <span><span class="bs-label">계좌 수</span><span class="bs-value">${_accountCount}개</span></span>
+                        </div>`;
+                } else {
+                    summaryEl.style.display = 'none';
+                }
+
+                // ── 계좌별 카드 렌더링 ─────────────────────────────────
                 balanceContainer.innerHTML = '';
                 res.data.forEach(b => {
-                    // 현재가 맵 갱신
-                    (b.holdings || []).forEach(h => { if (h.code) _priceMap[h.code] = h; });
-
                     if (b.error) {
                         balanceContainer.innerHTML += `
-                            <div class="glass-card metric-card">
-                                <h3>${b.name} (${b.account})</h3>
-                                <div class="value" style="color: var(--loss-color)">API 오류</div>
-                                <div class="sub-value">${b.error}</div>
-                            </div>
-                        `;
+                            <div class="metric-card" data-account="${b.account}" onclick="selectAccount('${b.account}')">
+                                <h3>${b.name}</h3>
+                                <div class="value" style="color:var(--loss-color);font-size:1.2rem;">API 오류</div>
+                                <div class="cell-sub">${b.error}</div>
+                            </div>`;
                         return;
                     }
                     const totalEval = b.total_eval_amount || 0;
@@ -143,55 +200,84 @@ document.addEventListener('DOMContentLoaded', () => {
                     const pnl       = b.eval_profit_loss != null ? b.eval_profit_loss : (totalEval - totalBuy);
                     const pnlRate   = totalBuy > 0 ? (pnl / totalBuy) * 100 : 0;
                     const pnlColor  = pnl > 0 ? 'var(--profit-color)' : (pnl < 0 ? 'var(--loss-color)' : 'var(--text-primary)');
+                    const isSelected = _selectedAccount === b.account;
                     balanceContainer.innerHTML += `
-                        <div class="glass-card metric-card">
-                            <h3>${b.name} 계좌 자산</h3>
-                            <div class="value">₩ ${totalEval.toLocaleString()}</div>
-                            <div class="sub-value">주문가능 현금: ₩ ${(b.available_balance || 0).toLocaleString()} | 보유 종목 ${b.holdings_count || 0}개</div>
-                            <div class="sub-value" style="margin-top:10px; color: ${pnlColor}">
-                                평가 손익: ₩ ${pnl.toLocaleString()} (${pnlRate > 0 ? '+' : ''}${pnlRate.toFixed(2)}%)
+                        <div class="metric-card${isSelected ? ' selected' : ''}" data-account="${b.account}" onclick="selectAccount('${b.account}')">
+                            <h3 style="font-size:0.95rem;margin-bottom:0.25rem;">${b.name}</h3>
+                            <div style="font-size:0.78rem;color:var(--text-secondary);margin-bottom:0.6rem;">${b.account}</div>
+                            <div class="value" style="font-size:1.8rem;">₩ ${totalEval.toLocaleString()}</div>
+                            <div class="cell-sub" style="margin-top:0.4rem;">주문가능 ₩ ${(b.available_balance || 0).toLocaleString()} | ${b.holdings_count || 0}종목</div>
+                            <div style="margin-top:0.5rem;font-size:0.88rem;font-weight:600;color:${pnlColor};">
+                                ${pnl >= 0 ? '+' : ''}₩ ${pnl.toLocaleString()}
+                                <span style="font-size:0.8rem;">(${pnlRate >= 0 ? '+' : ''}${pnlRate.toFixed(2)}%)</span>
                             </div>
-                        </div>
-                    `;
+                        </div>`;
                 });
-                // 포지션 테이블도 현재가 갱신
+
+                // 포지션 테이블 현재가 갱신
                 renderPositionsIfReady();
             })
             .catch(err => console.error('Balance fetch error:', err));
     }
 
-    // Positions (Fix 3: 현재가·수익률 표시, Fix 4: 편집 버튼)
+    // Positions — 계좌 필터 + 매수일 + 수익금액 표시
     let _positionsData = [];
 
     function renderPositionsIfReady() {
         if (_positionsData.length === 0) return;
-        if (_positionsData[0] === '__empty__') {
-            positionsBody.innerHTML = `<tr><td colspan="9" class="text-center" style="color: var(--text-secondary)">현재 보유 중인 포지션이 없습니다.</td></tr>`;
+
+        // 계좌 선택 시 해당 계좌만 필터
+        const filtered = _positionsData[0] === '__empty__' ? [] :
+            (_selectedAccount
+                ? _positionsData.filter(p => p.account_no === _selectedAccount)
+                : _positionsData);
+
+        // colspan: 계좌열 숨김 여부에 따라 조정
+        const colSpan = _selectedAccount ? 8 : 9;
+
+        if (filtered.length === 0) {
+            positionsBody.innerHTML = `<tr><td colspan="${colSpan}" class="text-center" style="color:var(--text-secondary)">
+                ${_selectedAccount ? `${_selectedAccount} 계좌에 보유 포지션이 없습니다.` : '현재 보유 중인 포지션이 없습니다.'}
+            </td></tr>`;
             return;
         }
-        positionsBody.innerHTML = _positionsData.map(pos => {
+
+        positionsBody.innerHTML = filtered.map(pos => {
             const p = _priceMap[pos.stock_code] || {};
             const curr = p.current_price || 0;
             const rate = p.pnl_rate != null ? p.pnl_rate : 0;
+            const pnlAmt = p.pnl_amt != null ? p.pnl_amt : 0;
             const rateColor = rate > 0 ? 'var(--profit-color)' : (rate < 0 ? 'var(--loss-color)' : 'var(--text-secondary)');
+
             const currStr = curr > 0 ? `₩ ${curr.toLocaleString()}` : '-';
-            const rateStr = curr > 0 ? `<span style="color:${rateColor}">${rate > 0 ? '+' : ''}${rate.toFixed(2)}%</span>` : '-';
+
+            // 수익률 + 수익금액 (2줄)
+            const pnlStr = curr > 0
+                ? `<div class="cell-main" style="color:${rateColor}">${rate >= 0 ? '+' : ''}${rate.toFixed(2)}%</div>
+                   <div class="cell-sub" style="color:${rateColor}">${pnlAmt >= 0 ? '+' : ''}₩ ${pnlAmt.toLocaleString()}</div>`
+                : '-';
+
+            // 매수가 + 매수일자 (2줄)
+            const buyDate = pos.opened_at ? pos.opened_at.slice(0, 10) : '-';
+            const buyStr = `<div class="cell-main">₩ ${Number(pos.buy_price).toLocaleString()}</div>
+                            <div class="cell-sub">${buyDate}</div>`;
+
             const posKey = `${pos.account_no}_${pos.stock_code}`;
+            const acctCell = _selectedAccount ? '' : `<td style="font-size:0.82rem;color:var(--text-secondary);">${pos.account_no}</td>`;
+
             return `
                 <tr>
-                    <td>${pos.account_no}</td>
-                    <td style="font-weight:600">${pos.stock_name} <span style="color:var(--text-secondary);font-size:0.8rem">(${pos.stock_code})</span></td>
-                    <td>₩ ${Number(pos.buy_price).toLocaleString()}</td>
+                    ${acctCell}
+                    <td><span style="font-weight:600">${pos.stock_name}</span>
+                        <span style="color:var(--text-secondary);font-size:0.78rem;"> (${pos.stock_code})</span></td>
+                    <td>${buyStr}</td>
                     <td>${currStr}</td>
-                    <td>${rateStr}</td>
+                    <td>${pnlStr}</td>
                     <td>${pos.qty.toLocaleString()} 주</td>
-                    <td style="color: var(--loss-color)">₩ ${Number(pos.stop_loss).toLocaleString()}</td>
-                    <td style="color: var(--profit-color)">₩ ${Number(pos.take_profit).toLocaleString()}</td>
-                    <td>
-                        <button class="btn-edit" onclick="openEditModal('${posKey}', ${pos.stop_loss}, ${pos.take_profit})">✏️</button>
-                    </td>
-                </tr>
-            `;
+                    <td style="color:var(--loss-color)">₩ ${Number(pos.stop_loss).toLocaleString()}</td>
+                    <td style="color:var(--profit-color)">₩ ${Number(pos.take_profit).toLocaleString()}</td>
+                    <td><button class="btn-edit" onclick="openEditModal('${posKey}', ${pos.stop_loss}, ${pos.take_profit})">✏️</button></td>
+                </tr>`;
         }).join('');
     }
 

@@ -383,3 +383,90 @@ body {
     border-color: var(--accent-color, #3b82f6);
     color: var(--text-primary);
 }
+
+/* 계좌 카드 그리드 (확장 가능) */
+.account-cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 1rem;
+    padding: 0 1rem 1rem;
+}
+
+/* 계좌 카드 선택 상태 */
+.metric-card {
+    cursor: pointer;
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 1.25rem;
+    transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+}
+
+.metric-card:hover {
+    border-color: rgba(59, 130, 246, 0.5);
+}
+
+.metric-card.selected {
+    border-color: var(--accent-neon);
+    box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.25);
+}
+
+.metric-card.selected::after {
+    content: '✓ 선택됨';
+    display: block;
+    font-size: 0.72rem;
+    color: var(--accent-neon);
+    margin-top: 0.5rem;
+    font-weight: 600;
+}
+
+/* 전체 보기 버튼 */
+.account-all-btn {
+    padding: 0.3rem 0.9rem;
+    border-radius: 20px;
+    border: 1px solid var(--accent-neon);
+    background: transparent;
+    color: var(--accent-neon);
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.account-all-btn:hover {
+    background: rgba(14, 165, 233, 0.15);
+}
+
+/* 포지션 계좌 필터 뱃지 */
+.account-filter-badge {
+    font-size: 0.78rem;
+    padding: 0.2rem 0.7rem;
+    border-radius: 20px;
+    background: rgba(14, 165, 233, 0.12);
+    border: 1px solid rgba(14, 165, 233, 0.3);
+    color: var(--accent-neon);
+    font-weight: 600;
+}
+
+/* 포지션 테이블 계좌열 (선택 시 숨김) */
+.col-account { transition: opacity 0.2s; }
+.col-account.hidden { display: none; }
+
+/* 2줄 셀 (매수가/날짜, 수익률/금액) */
+.cell-main {
+    font-weight: 600;
+    font-size: 0.95rem;
+}
+.cell-sub {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-top: 0.15rem;
+}
+
+/* 총합 요약 바 */
+.balance-summary-row {
+    display: flex;
+    gap: 2rem;
+    flex-wrap: wrap;
+    font-size: 0.88rem;
+}
+.balance-summary-row .bs-label { color: var(--text-secondary); }
+.balance-summary-row .bs-value { font-weight: 700; color: var(--text-primary); margin-left: 0.4rem; }
