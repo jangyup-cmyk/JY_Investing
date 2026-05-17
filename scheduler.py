@@ -344,7 +344,8 @@ def monitor_positions():
             
             if res.get("rt_cd") == "0":
                 logger.info(f"[매도 성공] {user['name']} | {stock_code}")
-                # 포지션 제거
+                # 매도 이력 보존 (성과 분석용) → 그 다음 포지션 제거
+                position_tracker.archive_position(account_no, stock_code, sell_price=current_price, reason=reason)
                 position_tracker.remove_position(account_no, stock_code)
                 # 알림 전송
                 bot.send_personal_sell_signal(

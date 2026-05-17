@@ -628,5 +628,87 @@ def get_ai_costs():
         return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
 
 
+def _compute_performance_stats(closed: list) -> dict:
+    """closed_positions 리스트 → 누적 성과 지표 계산"""
+    if not closed:
+        return {
+            "trade_count": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "win_rate": 0.0,
+            "total_pnl_amt": 0.0,
+            "avg_pnl_rate": 0.0,
+            "best_pnl_rate": 0.0,
+            "worst_pnl_rate": 0.0,
+        }
+    pnl_rates = [float(p.get("pnl_rate", 0.0)) for p in closed]
+    pnl_amts  = [float(p.get("pnl_amt", 0.0))  for p in closed]
+    wins      = [r for r in pnl_rates if r > 0]
+    losses    = [r for r in pnl_rates if r <= 0]
+    trade_count = len(closed)
+    return {
+        "trade_count": trade_count,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": round(len(wins) / trade_count * 100, 2) if trade_count else 0.0,
+        "total_pnl_amt": round(sum(pnl_amts), 2),
+        "avg_pnl_rate": round(sum(pnl_rates) / trade_count, 4) if trade_count else 0.0,
+        "best_pnl_rate": round(max(pnl_rates), 4),
+        "worst_pnl_rate": round(min(pnl_rates), 4),
+    }
+
+
+@app.route("/api/performance")
+def get_performance():
+    """누적 거래 성과 요약 (closed_positions.json 기반, KIS API 호출 없음)"""
+    try:
+        closed = position_tracker.load_closed_positions()
+        account = request.args.get("account_no", "").strip()
+        if account:
+            closed = [p for p in closed if str(p.get("account_no", "")) == account]
+        return jsonify({"success": True, "data": _compute_performance_stats(closed)})
+    except Exception as e:
+        logger.error(f"성과 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+
+@app.route("/api/performance/by-stock")
+def get_performance_by_stock():
+    """종목별 누적 PnL 랭킹 (closed_positions.json 기반)"""
+    try:
+        closed = position_tracker.load_closed_positions()
+        account = request.args.get("account_no", "").strip()
+        if account:
+            closed = [p for p in closed if str(p.get("account_no", "")) == account]
+
+        agg: dict = {}
+        for p in closed:
+            code = str(p.get("stock_code", ""))
+            if not code:
+                continue
+            slot = agg.setdefault(code, {
+                "stock_code": code,
+                "stock_name": p.get("stock_name", code),
+                "trade_count": 0,
+                "total_pnl_amt": 0.0,
+                "pnl_rates": [],
+            })
+            slot["trade_count"] += 1
+            slot["total_pnl_amt"] += float(p.get("pnl_amt", 0.0))
+            slot["pnl_rates"].append(float(p.get("pnl_rate", 0.0)))
+
+        rows = []
+        for slot in agg.values():
+            rates = slot.pop("pnl_rates")
+            slot["avg_pnl_rate"] = round(sum(rates) / len(rates), 4) if rates else 0.0
+            slot["total_pnl_amt"] = round(slot["total_pnl_amt"], 2)
+            rows.append(slot)
+        rows.sort(key=lambda r: r["total_pnl_amt"], reverse=True)
+        return jsonify({"success": True, "data": rows})
+    except Exception as e:
+        logger.error(f"종목별 성과 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+
 if __name__ == "__main__":
     app.run(host=_FLASK_HOST, port=_FLASK_PORT, debug=_FLASK_DEBUG)

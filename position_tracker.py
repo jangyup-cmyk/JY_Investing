@@ -15,7 +15,9 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 POSITION_FILE = "positions.json"
+CLOSED_POSITIONS_FILE = "closed_positions.json"
 _lock = threading.Lock()
+_closed_lock = threading.Lock()
 
 
 # ─────────────────────────────────────────
@@ -87,6 +89,77 @@ def add_position(
         f"[포지션 등록] {account_no} | {stock_code} "
         f"매수가={buy_price:,.0f} 손절={stop_loss:,.0f} 익절={take_profit:,.0f}"
     )
+
+
+def archive_position(
+    account_no: str,
+    stock_code: str,
+    sell_price: float,
+    reason: str = "",
+) -> bool:
+    """매도 체결 정보를 closed_positions.json 에 append.
+
+    현재 열린 포지션을 조회해 PnL 을 계산하고, 새 record 로 추가한다.
+    실패 시 False (저장 실패 / 원본 포지션 미존재 등) — 부르는 쪽에서
+    remove_position 호출 여부와 무관하게 진행 가능하도록 예외는 던지지 않는다.
+    """
+    key = f"{account_no}_{stock_code}"
+    with _lock:
+        positions = _load()
+        original = positions.get(key)
+    if not original:
+        logger.warning(f"[포지션 아카이브] 원본 포지션 없음: {key}")
+        return False
+
+    buy_price = float(original.get("buy_price", 0) or 0)
+    qty = int(original.get("qty", 0) or 0)
+    pnl_amt = (sell_price - buy_price) * qty
+    pnl_rate = ((sell_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
+
+    record = {
+        **original,
+        "status": "closed",
+        "sell_price": round(float(sell_price), 2),
+        "sell_reason": reason,
+        "closed_at": datetime.now().isoformat(),
+        "pnl_amt": round(pnl_amt, 2),
+        "pnl_rate": round(pnl_rate, 4),
+    }
+
+    with _closed_lock:
+        try:
+            history: list = []
+            if os.path.exists(CLOSED_POSITIONS_FILE):
+                with open(CLOSED_POSITIONS_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, list):
+                        history = raw
+            history.append(record)
+            with open(CLOSED_POSITIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"closed_positions.json 저장 실패: {e}")
+            return False
+
+    logger.info(
+        f"[포지션 아카이브] {key} | 매도가={sell_price:,.0f} "
+        f"PnL={pnl_amt:+,.0f} ({pnl_rate:+.2f}%) 사유={reason}"
+    )
+    return True
+
+
+def load_closed_positions() -> list:
+    """closed_positions.json 전체 record 리스트 반환 (없으면 빈 리스트)"""
+    with _closed_lock:
+        if not os.path.exists(CLOSED_POSITIONS_FILE):
+            return []
+        try:
+            with open(CLOSED_POSITIONS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                return raw if isinstance(raw, list) else []
+        except (OSError, json.JSONDecodeError) as e:
+            logger.error(f"closed_positions.json 로드 실패: {e}")
+            return []
 
 
 def remove_position(account_no: str, stock_code: str) -> None:
