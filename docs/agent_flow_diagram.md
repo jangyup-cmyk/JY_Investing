@@ -11,16 +11,19 @@ graph TD
     A[텔레그램 메시지 수집] --> B[Sentiment Analyst]
     B --> C[테마 분석 및 후보 선별]
     C --> D[Technical Analyst]
-    D --> E[13대 필터 검증]
-    E --> F[Researcher Team]
-    F --> G[Bull/Bear 토론 및 리스크 평가]
-    G --> H[Risk Management]
-    H --> I[시장 지수, VI, 시간대 등 안전성 확인]
-    I --> J[Trader Agent]
+    D --> E{13대 필터 통과?}
+    E -- 탈락 --> Z1[final_approval=False 종료]
+    E -- 통과 --> F[Researcher Team]
+    F --> G{bull_score >= 0.60?}
+    G -- 반려 --> Z2[final_approval=False 종료]
+    G -- 승인 --> H[Risk Management]
+    H --> I{risk_pass & time_ok?}
+    I -- 거부 --> Z3[final_approval=False 종료]
+    I -- 통과 --> J[Trader Agent]
     J --> K[50% 시장가 + 50% 지정가 주문 실행]
     K --> L[10분 후 미체결 취소]
     L --> M[Portfolio Manager]
-    M --> N[최종 승인/거부 및 정책 적용]
+    M --> N[MAX_POSITIONS/MIN_CASH_RATE 검증 및 최종 승인]
     N --> O[Telegram 알림 전송]
 
     style A fill:#e1f5fe
@@ -30,6 +33,9 @@ graph TD
     style H fill:#29b6f6
     style J fill:#03a9f4
     style M fill:#0277bd
+    style Z1 fill:#ffcdd2
+    style Z2 fill:#ffcdd2
+    style Z3 fill:#ffcdd2
 ```
 
 ### 다이어그램 설명
@@ -160,47 +166,47 @@ class TraderAgent(BaseAgent):
 
 ```python
 from agents.base_agent import BaseAgent
+import config, position_tracker
 
 class PortfolioManager(BaseAgent):
-    def __init__(self):
-        super().__init__("Portfolio Manager")
-
     def process(self, input_data: dict) -> dict:
-        # 최종 승인 (현재는 Trader 결과 기반)
-        trade_ok = input_data.get("trade_result") is not None
-        return {"final_approval": trade_ok}
+        trade_result = input_data.get("trade_result")
+        if not trade_result:
+            return {"final_approval": False, "portfolio_reason": "주문 미체결"}
+
+        account_no = input_data.get("user", {}).get("account_no", "")
+        budget = input_data.get("user", {}).get("budget", 1)
+        positions = position_tracker.get_open_positions()
+        position_count = sum(1 for p in positions if p["account_no"] == account_no)
+        invested = sum(p["buy_price"] * p["qty"] for p in positions if p["account_no"] == account_no)
+        cash_rate = max(0.0, 1 - invested / budget)
+
+        if position_count > config.MAX_POSITIONS:
+            logger.warning(f"[Portfolio] MAX_POSITIONS 초과: {position_count}/{config.MAX_POSITIONS}")
+        if cash_rate < config.MIN_CASH_RATE:
+            logger.warning(f"[Portfolio] 현금 비율 부족: {cash_rate:.1%} < {config.MIN_CASH_RATE:.1%}")
+
+        return {"final_approval": True, "position_count": position_count, "cash_rate": round(cash_rate, 4)}
 ```
 
-### 통합 실행 예시 (`agents/agent_orchestrator.py`)
+### 통합 실행 — 게이트 로직 (`agents/agent_orchestrator.py`)
+
+`run_flow()`는 각 에이전트 결과를 누적하며, 탈락 조건 충족 시 즉시 `break`합니다.
 
 ```python
-from agents.sentiment_analyst import SentimentAnalyst
-from agents.technical_analyst import TechnicalAnalyst
-from agents.researcher_team import ResearcherTeam
-from agents.risk_management import RiskManagement
-from agents.trader_agent import TraderAgent
-from agents.portfolio_manager import PortfolioManager
+for name in ("sentiment", "technical", "researcher", "risk", "trader", "portfolio"):
+    result = self.agents[name].process(accumulated)
+    accumulated.update(result)
 
-class AgentOrchestrator:
-    def __init__(self):
-        self.agents = {
-            "sentiment": SentimentAnalyst(),
-            "technical": TechnicalAnalyst(),
-            "researcher": ResearcherTeam(),
-            "risk": RiskManagement(),
-            "trader": TraderAgent(),
-            "portfolio": PortfolioManager(),
-        }
-
-    def run_flow(self, input_data: dict) -> dict:
-        # 흐름 실행
-        sentiment_result = self.agents["sentiment"].process(input_data)
-        technical_result = self.agents["technical"].process({**input_data, **sentiment_result})
-        researcher_result = self.agents["researcher"].process(technical_result)
-        risk_result = self.agents["risk"].process(researcher_result)
-        trader_result = self.agents["trader"].process({**input_data, **risk_result})
-        portfolio_result = self.agents["portfolio"].process(trader_result)
-        return portfolio_result
+    if name == "technical" and not accumulated.get("pass", True):
+        accumulated["final_approval"] = False
+        break
+    if name == "researcher" and not accumulated.get("final_decision", False):
+        accumulated["final_approval"] = False
+        break
+    if name == "risk" and not accumulated.get("risk_pass", True):
+        accumulated["final_approval"] = False
+        break
 ```
 
 이 구조를 `agents/` 폴더에 구현하면, 각 에이전트가 독립적으로 작동하며 확장 가능합니다. 필요 시 실제 LLM 통합으로 업그레이드할 수 있습니다.

@@ -10,6 +10,12 @@ KIS API 실계좌 연결 검증 스크립트 (읽기 전용 — 주문 없음)
     .\\venv\\Scripts\\python.exe check_kis_api.py
 """
 
+import sys
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 import config
 from kis_api import KISAPIClient
 

@@ -16,14 +16,19 @@
 copy .env.example .env
 ```
 
-`.env`에서 최소한 아래 값을 설정합니다:
+`.env.local`에서 최소한 아래 값을 설정합니다:
 
 ```bash
-KIS_APP_KEY_JY=your_app_key
-KIS_APP_SECRET_JY=your_app_secret
-KIS_ACCOUNT_NO_JY=your_account_no
-TELEGRAM_BOT_TOKEN_JY=your_bot_token
-TELEGRAM_CHANNEL_ID_JY=@your_channel
+KIS_APP_KEY_JY1=your_app_key
+KIS_APP_SECRET_JY1=your_app_secret
+KIS_ACCOUNT_NO_JY_Investing1=your_account_no
+TELEGRAM_BOT_TOKEN_JY_Investing1=your_bot_token
+```
+
+전체 환경변수 검증은 `check_config.py`로 수행합니다:
+
+```powershell
+.\venv\Scripts\python.exe check_config.py
 ```
 
 ### 2. Python 환경 확인

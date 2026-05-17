@@ -38,16 +38,29 @@
 - `scheduler.py`와 `analyzer.py`가 이 역할의 핵심 로직을 담당합니다.
 - 위험 신호가 감지되면 신규 주문을 차단하거나 알림을 전송합니다.
 
-### 6. Portfolio Manager (확장)
+### 6. Portfolio Manager
 
-- 현재는 단일 계좌/단일 포지션 중심이지만, 향후 다계좌 또는 포트폴리오 수준 의사결정을 담당할 수 있습니다.
-- 매수 허용 기준, 계좌별 예산 분배, 전략별 자금 배분 정책을 관리합니다.
+- `agents/portfolio_manager.py`가 담당합니다.
+- TraderAgent의 주문 체결 결과를 검증하고 최종 승인 여부를 결정합니다.
+- `config.MAX_POSITIONS`(계좌당 최대 동시 보유 종목 수) 초과 여부를 경고합니다.
+- `config.MIN_CASH_RATE`(최소 현금 비율) 미달 시 경고를 발생시킵니다.
+- 주문 미체결(`trade_result=None`)이면 `final_approval=False`를 반환합니다.
+
+## 파이프라인 게이트 로직
+
+각 단계는 조기 종료 게이트를 갖습니다. 탈락 시 이후 에이전트는 **실행되지 않습니다**.
+
+| 단계 | 탈락 조건 | 이후 건너뜀 |
+|------|-----------|------------|
+| Technical | `pass=False` | Researcher, Risk, Trader, Portfolio |
+| Researcher | `final_decision=False` | Risk, Trader, Portfolio |
+| Risk | `risk_pass=False` | Trader, Portfolio |
 
 ## 적용 방안
 
 1. `theme_db.py`와 텔레그램 테마 분석 로직을 결합하여 초기 후보군을 선별합니다.
 2. `analyzer.py`를 통해 기술적 검증을 수행합니다.
-3. 연구자 역할은 현재 `analyzer.py` 기준을 복수 관점으로 나누는 형태로 확장할 수 있습니다.
+3. 연구자 역할은 Bull/Bear 복수 관점으로 평가하며, `bull_score < 0.60`이면 반려합니다.
 4. 주문 단계는 `trader.py`에서 자동 실행하고, 취소 및 알림 로직을 분리합니다.
 5. 리스크 관리 규칙은 `config.py`의 필터 설정과 `scheduler.py`의 자동 스케줄링으로 강화합니다.
 

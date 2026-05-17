@@ -1,6 +1,6 @@
 # JY 투자클럽 아키텍처
 
-> 문서 버전: 2026-05-12
+> 문서 버전: 2026-05-17
 
 이 문서는 `HKUDS_README.md`의 Agent-Native Trading 플랫폼 아키텍처에서 참고한 내용을 우리 프로젝트에 맞춰 정리한 것입니다.
 
@@ -12,7 +12,7 @@
 
 2. **서비스 분리**
    - 사용자 인터페이스(대시보드)와 백그라운드 작업(매매/데이터 수집)을 분리합니다.
-   - `dashboard.py`는 Flask 웹 서버로 상태 조회/수동 실행 UI를 제공하는 스켈레톤입니다.
+   - `dashboard.py`는 Flask 웹 서버로 계좌잔고·포지션·시스템 상태·AI 개발 비용을 실시간 표시합니다. 템플릿/정적 폴더는 `__file__` 기준 절대 경로로 고정되어 실행 디렉터리와 무관하게 동작합니다.
    - `scheduler.py`는 백그라운드 스케줄러를 담당합니다.
    - `telegram_listener.py`는 Telethon 기반 Telegram 메시지 수집을 담당합니다.
    - `naver_research_scraper.py`는 네이버 리서치 원문 수집을 담당합니다.
@@ -47,7 +47,8 @@
 | `naver_research_scraper.py` | 네이버 리서치 수집 | Researcher 입력            |
 | `stock_data.py`   | 데이터 수집           | 데이터 레이어              |
 | `scheduler.py`    | 스케줄러 관리         | 백그라운드 워커            |
-| `dashboard.py`    | 웹 UI 스켈레톤        | 사용자 인터페이스 분리     |
+| `dashboard.py`    | 웹 모니터링 대시보드   | 사용자 인터페이스 분리     |
+| `sync_positions.py` | 실계좌 → positions.json 동기화 | 포지션 초기화 유틸리티 |
 | `theme_db.py`     | 테마 매핑 DB          | Sentiment Analyst          |
 | `theme_extractor.py` | 텍스트 기반 종목/테마 추출 | Sentiment Analyst      |
 

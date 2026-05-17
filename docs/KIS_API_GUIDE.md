@@ -21,49 +21,46 @@
 
 **절대 App Key/Secret을 코드에 하드코딩하지 마세요!**
 
-`.env.example` 파일을 참고하여 `.env` 파일을 생성합니다:
+`.env.example` 파일을 참고하여 `.env.local` 파일을 생성합니다:
 
 ```bash
 # Windows
-copy .env.example .env
-
-# macOS/Linux
-cp .env.example .env
+copy .env.example .env.local
 ```
 
-### 2.2 .env 파일 설정
+### 2.2 .env.local 파일 설정
 
-생성된 `.env` 파일에 실제 값을 입력합니다:
+생성된 `.env.local` 파일에 실제 값을 입력합니다:
 
 ```bash
-# KIS API 설정 (한국투자증권)
-# https://dev.koreainvestment.com/contents/apiSpecification에서 발급
-KIS_APP_KEY_JY=pk1234abcd5678efgh  # 실제 App Key 입력
-KIS_APP_SECRET_JY=ps1234abcd5678efgh  # 실제 App Secret 입력
-KIS_ACCOUNT_NO_JY=your_account_no_jy
+# KIS API 설정 (계좌 1)
+KIS_APP_KEY_JY1=pk1234abcd5678efgh
+KIS_APP_SECRET_JY1=ps1234abcd5678efgh
+KIS_ACCOUNT_NO_JY_Investing1=your_account_no_1
+BUDGET_JY1=1000000
 
-KIS_APP_KEY_YS=pk9999xxxx1111yyyy
-KIS_APP_SECRET_YS=ps9999xxxx1111yyyy
-KIS_ACCOUNT_NO_YS=your_account_no_ys
+# KIS API 설정 (계좌 2)
+KIS_APP_KEY_JY2=pk9999xxxx1111yyyy
+KIS_APP_SECRET_JY2=ps9999xxxx1111yyyy
+KIS_ACCOUNT_NO_JY_Investing2=your_account_no_2
+BUDGET_JY2=1000000
 
-# Telegram Bot 토큰
-# https://t.me/BotFather에서 생성
-TELEGRAM_BOT_TOKEN_JY=your_telegram_bot_token_jy
-TELEGRAM_BOT_TOKEN_YS=your_telegram_bot_token_ys
-
-# Telegram 채널 ID
-# 채널에 봇 추가 후 메시지 전송으로 ID 확인
-TELEGRAM_CHANNEL_ID_JY=@jy_private_ch_A
-TELEGRAM_CHANNEL_ID_YS=@ys_private_ch_B
+# Telegram Bot 토큰 (계좌별 개인 알림용)
+TELEGRAM_BOT_TOKEN_JY_Investing1=your_bot_token_1
+TELEGRAM_BOT_TOKEN_JY_Investing2=your_bot_token_2
 
 # Telegram 관리자 설정 (긴급 알림용)
-TELEGRAM_ADMIN_BOT_TOKEN=your_telegram_admin_bot_token
+TELEGRAM_ADMIN_BOT_TOKEN=your_admin_bot_token
 TELEGRAM_ADMIN_CHAT_ID=your_admin_chat_id
 
 # 트레이딩 기본 설정
-BUDGET_JY=1000000
-BUDGET_YS=1000000
 SLIPPAGE_RATE=0.003
+STOP_LOSS_RATE=0.05
+TAKE_PROFIT_RATE=0.10
+
+# 포트폴리오 리스크 한도
+MAX_POSITIONS=5       # 계좌당 최대 동시 보유 종목 수
+MIN_CASH_RATE=0.20    # 예산 대비 최소 현금 비율 (20% 미만 시 경고)
 ```
 
 ### 2.3 .gitignore 확인
@@ -94,13 +91,13 @@ git status  # .env가 listed 아님 확인
 import os
 from dotenv import load_dotenv
 
-# .env 파일 로드
-load_dotenv()
+load_dotenv(override=False)
+load_dotenv(".env.local", override=False)
 
-# 환경 변수에서 읽기
-app_key = os.getenv("KIS_APP_KEY_JY")
-app_secret = os.getenv("KIS_APP_SECRET_JY")
-account_no = os.getenv("KIS_ACCOUNT_NO_JY")
+# 환경 변수에서 읽기 (계좌 1 예시)
+app_key = os.getenv("KIS_APP_KEY_JY1")
+app_secret = os.getenv("KIS_APP_SECRET_JY1")
+account_no = os.getenv("KIS_ACCOUNT_NO_JY_Investing1")
 ```
 
 ### 3.2 자동 검증
@@ -111,11 +108,16 @@ account_no = os.getenv("KIS_ACCOUNT_NO_JY")
 python main.py
 ```
 
-만약 `.env`가 없거나 값이 없으면:
+만약 `.env.local`이 없거나 값이 없으면:
 
 ```
-❌ 환경 변수 'KIS_APP_KEY_JY'가 설정되지 않았습니다.
-.env 파일을 확인하거나 생성하세요.
+[FAIL] KIS_APP_KEY_JY1   -> 미설정  (계좌1 API Key)
+```
+
+`check_config.py`로 전체 환경변수를 한 번에 검증할 수 있습니다:
+
+```powershell
+.\venv\Scripts\python.exe check_config.py
 ```
 
 ---
@@ -182,6 +184,6 @@ else:  # 실패
 
 ## 다음 단계
 
-- `analyzer.py`와 `trader.py`를 결합하여 실제 자동매매 로직 구현
-- 데이터 수집과 필터 검증 자동화
-- 테마 분석 엔진과 통합
+- 실계좌 보유 종목은 `sync_positions.py`로 `positions.json`에 동기화
+- 전체 시스템은 `main.py`로 실행, 대시보드는 `dashboard.py`로 별도 실행
+- 전체 파이프라인은 `README.md` 및 `docs/README_USER.md` 참고

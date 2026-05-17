@@ -1,91 +1,75 @@
 #!/usr/bin/env python
-"""
-환경 설정 검증 스크립트
-
-이 스크립트는 .env 파일이 올바르게 설정되었는지 확인합니다.
-"""
+# -*- coding: utf-8 -*-
+"""환경 설정 검증 스크립트 — .env.local이 올바르게 설정되었는지 확인합니다."""
 
 import os
 import sys
+
+# stdout을 UTF-8로 강제 설정 (Windows cp949 환경 대응)
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
 from dotenv import load_dotenv
 
-# .env 파일 로드
 load_dotenv()
+load_dotenv(".env.local", override=False)
 
 print("\n" + "=" * 70)
-print("🔍 JY 투자클럽 환경 설정 검증")
+print("[CHECK] JY 투자클럽 환경 설정 검증")
 print("=" * 70 + "\n")
 
-# 검증할 환경 변수 목록
 required_vars = {
-    "KIS_APP_KEY_JY": "전장엽님 API Key",
-    "KIS_APP_SECRET_JY": "전장엽님 API Secret",
-    "KIS_ACCOUNT_NO_JY": "전장엽님 계좌번호",
-    "TELEGRAM_BOT_TOKEN_JY": "전장엽님 봇 토큰",
-    "TELEGRAM_CHANNEL_ID_JY": "전장엽님 채널 ID",
-    "KIS_APP_KEY_YS": "김양선님 API Key",
-    "KIS_APP_SECRET_YS": "김양선님 API Secret",
-    "KIS_ACCOUNT_NO_YS": "김양선님 계좌번호",
-    "TELEGRAM_BOT_TOKEN_YS": "김양선님 봇 토큰",
-    "TELEGRAM_CHANNEL_ID_YS": "김양선님 채널 ID",
-    "TELEGRAM_ADMIN_BOT_TOKEN": "관리자 봇 토큰",
-    "TELEGRAM_ADMIN_CHAT_ID": "관리자 Chat ID",
+    # 계좌 1
+    "KIS_ACCOUNT_NO_JY_Investing1":     "계좌1 계좌번호",
+    "KIS_APP_KEY_JY1":                  "계좌1 API Key",
+    "KIS_APP_SECRET_JY1":               "계좌1 API Secret",
+    "TELEGRAM_BOT_TOKEN_JY_Investing1": "계좌1 봇 토큰",
+    # 계좌 2
+    "KIS_ACCOUNT_NO_JY_Investing2":     "계좌2 계좌번호",
+    "KIS_APP_KEY_JY2":                  "계좌2 API Key",
+    "KIS_APP_SECRET_JY2":               "계좌2 API Secret",
+    "TELEGRAM_BOT_TOKEN_JY_Investing2": "계좌2 봇 토큰",
+    # 공통
+    "TELEGRAM_ADMIN_BOT_TOKEN":         "관리자 봇 토큰",
+    "TELEGRAM_ADMIN_CHAT_ID":           "관리자 Chat ID",
 }
 
-passed = 0
-failed = 0
-warnings = 0
+passed = failed = warnings = 0
 
-print("1️⃣ 필수 환경 변수 검증\n")
+print("[1] 필수 환경 변수 검증\n")
 
 for var, description in required_vars.items():
     value = os.getenv(var)
-    
+
     if value is None:
-        print(f"❌ {var:<30} → 미설정")
-        print(f"   설명: {description}")
+        print(f"  [FAIL] {var:<42} -> 미설정  ({description})")
         failed += 1
-    elif value.startswith("your_") or value == "YOUR_BOT_TOKEN":
-        print(f"⚠️  {var:<30} → 기본값 (설정 필요)")
-        print(f"   현재값: {value}")
+    elif value.startswith("your_") or value in ("YOUR_BOT_TOKEN", ""):
+        print(f"  [WARN] {var:<42} -> 기본값 미변경  ({description})")
         warnings += 1
     else:
-        # 토큰은 일부만 표시 (보안)
-        if "TOKEN" in var or "SECRET" in var or "KEY" in var:
-            display_value = value[:10] + "..." + value[-5:] if len(value) > 20 else "***"
+        if any(k in var for k in ("TOKEN", "SECRET", "KEY")):
+            display = value[:8] + "..." + value[-4:] if len(value) > 14 else "***"
         else:
-            display_value = value
-        print(f"✅ {var:<30} → {display_value}")
+            display = value
+        print(f"  [ OK ] {var:<42} -> {display}")
         passed += 1
-    print()
 
-print("\n" + "=" * 70)
-print("📊 검증 결과")
-print("=" * 70)
-print(f"✅ 정상: {passed}")
-print(f"⚠️  경고: {warnings}")
-print(f"❌ 오류: {failed}")
-print()
+print(f"\n{'='*70}")
+print(f"[결과] 정상 {passed} / 경고 {warnings} / 오류 {failed}")
+print(f"{'='*70}\n")
 
 if failed > 0:
-    print("🚨 설정이 필요합니다!")
-    print("\n해결 방법:")
-    print("1. .env 파일 생성: copy .env.example .env  (또는 cp .env.example .env)")
-    print("2. .env 파일 편집: 실제 API 키와 토큰 입력")
-    print("3. 다시 실행: python check_config.py")
+    print("[ERROR] 설정이 필요합니다!")
+    print("   1. .env.example -> .env.local 복사 후 실제 값 입력")
+    print("   2. 다시 실행: python check_config.py")
     sys.exit(1)
-
 elif warnings > 0:
-    print("⚠️  경고: 기본값 설정이 남아있습니다.")
-    print("\n해결 방법:")
-    print("1. .env 파일 편집")
-    print("2. 'your_'로 시작하는 값들을 실제 값으로 변경")
-    print("3. 파일 저장 후 다시 실행: python check_config.py")
+    print("[WARN] 기본값이 남아 있습니다. .env.local을 편집하세요.")
     sys.exit(1)
-
 else:
-    print("✅ 모든 환경 변수가 올바르게 설정되었습니다!")
-    print("\n다음 단계:")
-    print("1. 데이터 수집 테스트: python test_stock_data.py")
-    print("2. 전체 시스템 실행: python main.py")
+    print("[OK] 모든 환경 변수 정상 — 다음 단계:")
+    print("   python check_kis_api.py    # KIS API 실계좌 연결 확인")
+    print("   python main.py             # 시스템 시작")
     sys.exit(0)

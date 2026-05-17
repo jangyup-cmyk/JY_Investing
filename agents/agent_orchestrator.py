@@ -49,4 +49,22 @@ class AgentOrchestrator:
                 accumulated["final_approval"] = False
                 break
 
+            # 리서치 팀 반려 시 주문 중단 (bull_approved=False → 매수 금지)
+            if name == "researcher" and not accumulated.get("final_decision", False):
+                logger.info(
+                    f"[Orchestrator] 리서치 팀 반려 (bull_score={accumulated.get('bull_score', 0):.2f}) "
+                    f"— 주문 에이전트 실행 생략"
+                )
+                accumulated["final_approval"] = False
+                break
+
+            # 위험 관리 거부 시 주문 중단
+            if name == "risk" and not accumulated.get("risk_pass", True):
+                logger.info(
+                    f"[Orchestrator] 위험 관리 거부 (time_ok={accumulated.get('time_ok')}) "
+                    f"— 주문 에이전트 실행 생략"
+                )
+                accumulated["final_approval"] = False
+                break
+
         return accumulated

@@ -233,9 +233,15 @@ def run_signal_pipeline(stock_codes: list = None, simulate_only: bool = False):
 
                 result = orchestrator.run_flow(input_data)
                 processed += 1
+                # 민감 정보(자격증명, 토큰)를 제외한 요약만 로깅
+                safe_summary = {
+                    k: v for k, v in result.items()
+                    if k not in ("user", "token", "app_key", "app_secret", "bot_token")
+                    and not isinstance(v, dict)  # user 딕셔너리 내 중첩 노출 방지
+                }
                 logger.info(
                     f"[파이프라인] {user['name']} | {code} → "
-                    f"승인={result.get('final_approval')} | {result}"
+                    f"승인={result.get('final_approval')} | {safe_summary}"
                 )
 
             except Exception as e:

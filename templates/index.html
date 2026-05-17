@@ -6,10 +6,11 @@
     <title>JY 투자클럽 대시보드</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+<!-- JY_MARKER_12345 -->
 </head>
 <body>
     <div class="background-glow"></div>
-    
+
     <div class="container">
         <header class="header">
             <div class="brand">
@@ -26,19 +27,49 @@
         <!-- 설정 정보 요약 -->
         <section class="config-section glass-card">
             <div class="config-grid" id="config-container">
-                <!-- JS 로 로드 -->
                 <div class="config-item"><span class="label">모니터링 종목:</span> <span class="value">로딩중...</span></div>
                 <div class="config-item"><span class="label">손절 설정:</span> <span class="value">로딩중...</span></div>
                 <div class="config-item"><span class="label">익절 설정:</span> <span class="value">로딩중...</span></div>
+            </div>
+            <div class="config-grid" id="system-status-container" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color);">
+                <div class="config-item"><span class="label">스케줄러:</span> <span class="value" id="scheduler-status">로딩중...</span></div>
+                <div class="config-item"><span class="label">텔레그램 모니터:</span> <span class="value" id="tg-status">로딩중...</span></div>
+                <div class="config-item"><span class="label">네이버 리서치:</span> <span class="value" id="naver-status">로딩중...</span></div>
+                <div class="config-item"><span class="label">서버 시간:</span> <span class="value" id="server-time">-</span></div>
             </div>
         </section>
 
         <!-- 메인 메트릭 (잔고) -->
         <section class="metrics-grid" id="balance-container">
-            <!-- JS로 로드됨 -->
             <div class="glass-card metric-card">
                 <h3>로딩 중...</h3>
                 <div class="value">₩ 0</div>
+            </div>
+        </section>
+
+        <!-- AI 개발 비용 -->
+        <section class="glass-card" style="margin-bottom: 1.5rem;">
+            <div class="section-header" style="padding: 1rem 1.5rem 0.5rem;">
+                <h2>🤖 AI 개발 비용 (Claude Code)</h2>
+                <span id="ai-cost-total" style="font-size:1.1rem; font-weight:700; color: var(--profit-color);">로딩중...</span>
+            </div>
+            <div class="table-responsive" style="padding: 0 1rem 1rem;">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>모델</th>
+                            <th>메시지 수</th>
+                            <th>Input</th>
+                            <th>Output</th>
+                            <th>캐시 읽기</th>
+                            <th>총 토큰</th>
+                            <th>비용 (USD)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="ai-cost-body">
+                        <tr><td colspan="7" class="text-center">로딩 중...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </section>
 
@@ -62,7 +93,6 @@
                             </tr>
                         </thead>
                         <tbody id="positions-body">
-                            <!-- JS 로드 -->
                             <tr><td colspan="7" class="text-center">로딩 중...</td></tr>
                         </tbody>
                     </table>
@@ -76,7 +106,6 @@
                     <button id="refresh-logs-btn" class="btn-icon">↻</button>
                 </div>
                 <div class="log-container" id="log-container">
-                    <!-- JS 로드 -->
                     <div class="log-entry">로딩 중...</div>
                 </div>
             </section>

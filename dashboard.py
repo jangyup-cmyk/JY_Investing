@@ -1,6 +1,7 @@
 import glob
 import logging
 import os
+import pathlib
 from datetime import datetime
 
 from flask import Flask, jsonify, render_template
@@ -9,7 +10,10 @@ import config
 import position_tracker
 from kis_api import KISAPIClient
 
-app = Flask(__name__)
+_BASE_DIR = pathlib.Path(__file__).resolve().parent
+app = Flask(__name__,
+            template_folder=str(_BASE_DIR / "templates"),
+            static_folder=str(_BASE_DIR / "static"))
 logger = logging.getLogger(__name__)
 
 _FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
@@ -129,6 +133,113 @@ def get_logs():
         logger.error(f"로그 조회 오류: {e}", exc_info=True)
         detail = str(e) if _FLASK_DEBUG else "서버 내부 오류"
         return jsonify({"success": False, "error": detail})
+
+def _is_scheduler_running() -> bool:
+    """로그 파일 최신 엔트리가 2분 이내면 스케줄러가 가동 중으로 판단"""
+    try:
+        log_files = glob.glob(os.path.join("logs", "trading_*.log"))
+        if not log_files:
+            return False
+        latest = max(log_files, key=os.path.getmtime)
+        age = datetime.now().timestamp() - os.path.getmtime(latest)
+        return age < 120
+    except Exception:
+        return False
+
+
+@app.route("/api/system-status")
+def get_system_status():
+    """스케줄러 가동 상태 및 설정 요약 반환"""
+    try:
+        return jsonify({
+            "success": True,
+            "scheduler_running": _is_scheduler_running(),
+            "jobs": [],
+            "telegram_monitor": os.getenv("TELEGRAM_MONITOR_ENABLED", "false").lower() == "true",
+            "naver_research": os.getenv("NAVER_RESEARCH_ENABLED", "true").lower() == "true",
+            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    except Exception as e:
+        logger.error(f"시스템 상태 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+
+@app.route("/api/ai-costs")
+def get_ai_costs():
+    """Claude Code 개발 비용 요약 (JSONL 파싱)"""
+    try:
+        import glob as _glob
+        import json as _json
+        import pathlib
+
+        claude_projects = pathlib.Path.home() / ".claude" / "projects"
+        jsonl_files = []
+        if claude_projects.exists():
+            for proj_dir in claude_projects.iterdir():
+                if proj_dir.is_dir() and "JY" in proj_dir.name:
+                    jsonl_files.extend(proj_dir.glob("*.jsonl"))
+
+        PRICING = {
+            "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0,  "cache_read": 0.30, "cache_write": 3.75},
+            "claude-haiku-4-5":  {"input": 0.8,  "output": 4.0,   "cache_read": 0.08, "cache_write": 1.0},
+            "claude-opus-4-7":   {"input": 15.0, "output": 75.0,  "cache_read": 1.50, "cache_write": 18.75},
+        }
+
+        model_stats = {}
+        for jsonl in jsonl_files:
+            try:
+                with open(jsonl, encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            obj = _json.loads(line)
+                            usage = obj.get("usage") or obj.get("message", {}).get("usage") or {}
+                            model = obj.get("model") or obj.get("message", {}).get("model") or ""
+                            if not model or not usage or model == "<synthetic>":
+                                continue
+                            s = model_stats.setdefault(model, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "messages": 0})
+                            s["input"]       += usage.get("input_tokens", 0)
+                            s["output"]      += usage.get("output_tokens", 0)
+                            s["cache_read"]  += usage.get("cache_read_input_tokens", 0)
+                            s["cache_write"] += usage.get("cache_creation_input_tokens", 0)
+                            s["messages"]    += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        rows = []
+        total_cost = 0.0
+        total_tokens = 0
+        for model, s in model_stats.items():
+            p = PRICING.get(model, {"input": 3.0, "output": 15.0, "cache_read": 0.30, "cache_write": 3.75})
+            cost = (
+                s["input"]       / 1_000_000 * p["input"] +
+                s["output"]      / 1_000_000 * p["output"] +
+                s["cache_read"]  / 1_000_000 * p["cache_read"] +
+                s["cache_write"] / 1_000_000 * p["cache_write"]
+            )
+            tok = s["input"] + s["output"] + s["cache_read"] + s["cache_write"]
+            total_cost   += cost
+            total_tokens += tok
+            rows.append({
+                "model": model, "messages": s["messages"],
+                "input": s["input"], "output": s["output"],
+                "cache_read": s["cache_read"], "cache_write": s["cache_write"],
+                "total_tokens": tok, "cost_usd": round(cost, 4),
+            })
+
+        rows.sort(key=lambda r: r["cost_usd"], reverse=True)
+        return jsonify({
+            "success": True,
+            "rows": rows,
+            "total_cost_usd": round(total_cost, 4),
+            "total_tokens": total_tokens,
+            "scanned_files": len(jsonl_files),
+        })
+    except Exception as e:
+        logger.error(f"AI 비용 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
 
 if __name__ == "__main__":
     app.run(host=_FLASK_HOST, port=_FLASK_PORT, debug=_FLASK_DEBUG)
