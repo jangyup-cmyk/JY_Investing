@@ -46,9 +46,9 @@ def check_user(user: dict):
     output2 = data.get("output2", [{}])
     summary = output2[0] if output2 else {}
     tot_eval   = int(summary.get("tot_evlu_amt", 0))
-    tot_buy    = int(summary.get("tot_puchsamt", 0))
+    tot_buy    = int(summary.get("pchs_amt_smtl_amt", 0))
     available  = int(summary.get("prvs_rcdl_excc_amt", 0))
-    pnl        = tot_eval - tot_buy
+    pnl        = int(summary.get("evlu_pfls_smtl_amt", 0))
     pnl_rate   = (pnl / tot_buy * 100) if tot_buy else 0.0
 
     print(f"  OK 잔고 조회 성공")

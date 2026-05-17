@@ -2,9 +2,11 @@ import glob
 import logging
 import os
 import pathlib
+import subprocess
+import sys
 from datetime import datetime
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 import config
 import position_tracker
@@ -19,6 +21,57 @@ logger = logging.getLogger(__name__)
 _FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
 _FLASK_HOST  = os.getenv("FLASK_HOST", "127.0.0.1")
 _FLASK_PORT  = int(os.getenv("FLASK_PORT", "5000"))
+
+# ── main.py 프로세스 관리 ──────────────────────────────────────
+_main_proc: "subprocess.Popen | None" = None
+_MAIN_PID_FILE = _BASE_DIR / "main.pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    """PID 가 살아있는지 확인 (Windows 호환)"""
+    try:
+        if os.name == "nt":
+            import ctypes
+            SYNCHRONIZE = 0x00100000
+            handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if handle == 0:
+                return False
+            result = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return result != 0   # 0 = WAIT_OBJECT_0 (종료됨)
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, PermissionError):
+        return False
+
+
+def _main_is_running() -> bool:
+    """main.py 프로세스 실행 여부 확인"""
+    global _main_proc
+    if _main_proc is not None and _main_proc.poll() is None:
+        return True
+    if _MAIN_PID_FILE.exists():
+        try:
+            pid = int(_MAIN_PID_FILE.read_text(encoding="utf-8").strip())
+            if _pid_alive(pid):
+                return True
+        except (ValueError, OSError):
+            pass
+        try:
+            _MAIN_PID_FILE.unlink()
+        except OSError:
+            pass
+    return False
+
+
+def _kill_pid(pid: int) -> None:
+    """PID 강제 종료 (Windows/Unix 공통)"""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                       capture_output=True)
+    else:
+        os.kill(pid, 15)  # SIGTERM
 
 @app.route("/")
 def index():
@@ -60,9 +113,19 @@ def get_balance():
                 "name": user["name"],
                 "account": user["account_no"],
                 "total_eval_amount": int(summary.get("tot_evlu_amt", 0)),
-                "total_buy_amount": int(summary.get("tot_puchsamt", 0)),
+                "total_buy_amount": int(summary.get("pchs_amt_smtl_amt", 0)),
+                "eval_profit_loss": int(summary.get("evlu_pfls_smtl_amt", 0)),
                 "available_balance": int(summary.get("prvs_rcdl_excc_amt", 0)),
                 "holdings_count": len(holdings),
+                "holdings": [
+                    {
+                        "code": h.get("pdno", ""),
+                        "current_price": int(h.get("prpr", 0)),
+                        "pnl_rate": float(h.get("evlu_pfls_rt", 0)),
+                        "pnl_amt": int(h.get("evlu_pfls_amt", 0)),
+                    }
+                    for h in holdings
+                ],
             })
         else:
             balances.append({
@@ -78,14 +141,183 @@ def get_positions():
     """현재 보유 중인 포지션 목록 반환"""
     try:
         positions = position_tracker.get_open_positions()
-        # 수익률 등을 서버에서 실시간 조회해서 줄 수도 있으나,
-        # API 부하가 심할 수 있으므로 저장된 매수가 기준으로 클라이언트에 전달.
-        # 최신가는 별도 API나 스케줄러 로그에서 갱신됨을 가정.
         return jsonify({"success": True, "data": positions})
     except Exception as e:
         logger.error(f"포지션 조회 오류: {e}", exc_info=True)
         detail = str(e) if _FLASK_DEBUG else "서버 내부 오류"
         return jsonify({"success": False, "error": detail})
+
+
+@app.route("/api/positions/<path:key>", methods=["PATCH"])
+def update_position(key: str):
+    """손절/익절가 수동 수정 (대시보드 편집 UI)"""
+    try:
+        body = request.get_json(force=True) or {}
+        stop_loss   = float(body.get("stop_loss", 0))
+        take_profit = float(body.get("take_profit", 0))
+        if stop_loss <= 0 or take_profit <= 0:
+            return jsonify({"success": False, "error": "유효하지 않은 값 (0 이하)"})
+        if stop_loss >= take_profit:
+            return jsonify({"success": False, "error": "손절가는 익절가보다 작아야 합니다"})
+        # key 형식: "계좌번호_종목코드"
+        parts = key.split("_", 1)
+        if len(parts) != 2:
+            return jsonify({"success": False, "error": "잘못된 키 형식"})
+        ok = position_tracker.update_position_levels(parts[0], parts[1], stop_loss, take_profit)
+        return jsonify({"success": ok, "error": None if ok else "저장 실패"})
+    except (ValueError, TypeError) as e:
+        return jsonify({"success": False, "error": f"입력 오류: {e}"})
+    except Exception as e:
+        logger.error(f"포지션 수정 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+@app.route("/api/watchlist-report")
+def get_watchlist_report():
+    """AI 자동 추출 현황 반환 (추천 종목·테마·채널 가중치)"""
+    import json as _json
+    import pathlib as _pl
+
+    base = _pl.Path("etc")
+
+    # 1. auto_watchlist_report.json
+    report_path = base / "telegram_texts" / "auto_watchlist_report.json"
+    report: dict = {}
+    if report_path.exists():
+        try:
+            report = _json.loads(report_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 2. themes.json (종목 → 테마 매핑)
+    themes_path = _pl.Path("themes.json")
+    themes: dict = {}
+    if themes_path.exists():
+        try:
+            themes = _json.loads(themes_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 3. channel_weights.json
+    weights_path = base / "channel_weights.json"
+    weights: dict = {}
+    if weights_path.exists():
+        try:
+            weights = _json.loads(weights_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 종목명 조회 (stock_aliases.json → positions.json 순서)
+    aliases_path = base / "stock_aliases.json"
+    name_map: dict = {}
+    if aliases_path.exists():
+        try:
+            raw = _json.loads(aliases_path.read_text(encoding="utf-8"))
+            for code, names in raw.items():
+                name_map[code] = names[0] if names else code
+        except Exception:
+            pass
+    for pos in position_tracker.get_open_positions():
+        code = pos.get("stock_code", "")
+        if code and code not in name_map:
+            name_map[code] = pos.get("stock_name", code)
+
+    # 추천 종목별 정보 조합
+    code_scores: dict = report.get("code_scores", {})
+    recommended: list = report.get("recommended_codes", [])
+    max_score = max(code_scores.values(), default=1)
+
+    stocks = []
+    for code in recommended:
+        score = code_scores.get(code, 0)
+        stocks.append({
+            "code": code,
+            "name": name_map.get(code, code),
+            "score": round(score, 1),
+            "score_pct": round(score / max_score * 100, 1),
+            "themes": themes.get(code, []),
+        })
+
+    # 테마 빈도 상위 10개
+    theme_freq = report.get("theme_frequency", {})
+    top_themes = sorted(theme_freq.items(), key=lambda x: x[1], reverse=True)[:12]
+
+    return jsonify({
+        "success": True,
+        "generated_at": report.get("generated_at", ""),
+        "text_count": report.get("text_count", 0),
+        "auto_build": config.AUTO_BUILD_WATCH_LIST,
+        "manual_watch_list": config.WATCH_LIST,
+        "stocks": stocks,
+        "top_themes": [{"name": k, "count": v} for k, v in top_themes],
+        "channel_weights": weights,
+    })
+
+
+@app.route("/api/collection-stats")
+def get_collection_stats():
+    """정보수집 현황 통계 반환 (네이버 리서치 + 텔레그램 텍스트)"""
+    import json as _json
+    import pathlib as _pl
+
+    base = _pl.Path("etc")
+
+    def _scan_dir(path: _pl.Path):
+        """디렉터리 내 파일 수와 최신 수정 시각 반환"""
+        if not path.exists():
+            return {"count": 0, "latest": None}
+        files = [f for f in path.rglob("*") if f.is_file()]
+        if not files:
+            return {"count": 0, "latest": None}
+        latest = max(files, key=lambda f: f.stat().st_mtime)
+        return {
+            "count": len(files),
+            "latest": datetime.fromtimestamp(latest.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+        }
+
+    # 네이버 리서치 카테고리별 통계
+    naver_root = base / "naver_research"
+    naver_categories = {}
+    NAVER_LABEL = {
+        "market_info": "시황", "economy": "경제", "industry": "산업",
+        "company": "기업", "invest": "투자", "debenture": "채권",
+    }
+    if naver_root.exists():
+        for cat_dir in sorted(naver_root.iterdir()):
+            if cat_dir.is_dir():
+                stat = _scan_dir(cat_dir)
+                naver_categories[cat_dir.name] = {
+                    "label": NAVER_LABEL.get(cat_dir.name, cat_dir.name),
+                    **stat,
+                }
+
+    # 텔레그램 텍스트 폴더별 통계
+    # channel_alpha / channel_beta 는 시뮬레이션 테스트용 폴더 → 제외
+    TG_EXCLUDE = {"channel_alpha", "channel_beta"}
+    tg_root = base / "telegram_texts"
+    tg_groups = {}
+    if tg_root.exists():
+        for grp_dir in sorted(tg_root.iterdir()):
+            if grp_dir.is_dir() and grp_dir.name not in TG_EXCLUDE:
+                stat = _scan_dir(grp_dir)
+                if stat["count"] > 0:   # 파일이 있는 폴더만 표시
+                    tg_groups[grp_dir.name] = stat
+
+    # 텔레그램 리스너 추적 채널 수
+    state_file = base / "telegram_listener_state.json"
+    tracked_channels = 0
+    if state_file.exists():
+        try:
+            tracked_channels = len(_json.loads(state_file.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    return jsonify({
+        "success": True,
+        "naver": naver_categories,
+        "telegram": tg_groups,
+        "tracked_channels": tracked_channels,
+    })
+
 
 @app.route("/api/logs")
 def get_logs():
@@ -135,7 +367,9 @@ def get_logs():
         return jsonify({"success": False, "error": detail})
 
 def _is_scheduler_running() -> bool:
-    """로그 파일 최신 엔트리가 2분 이내면 스케줄러가 가동 중으로 판단"""
+    """main.py 프로세스 또는 로그 최신성으로 스케줄러 가동 판단"""
+    if _main_is_running():
+        return True
     try:
         log_files = glob.glob(os.path.join("logs", "trading_*.log"))
         if not log_files:
@@ -147,12 +381,66 @@ def _is_scheduler_running() -> bool:
         return False
 
 
+@app.route("/api/system/start", methods=["POST"])
+def system_start():
+    """main.py 시작"""
+    global _main_proc
+    if _main_is_running():
+        return jsonify({"success": False, "error": "이미 실행 중입니다"})
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        _main_proc = subprocess.Popen(
+            [sys.executable, str(_BASE_DIR / "main.py")],
+            cwd=str(_BASE_DIR),
+            **kwargs,
+        )
+        _MAIN_PID_FILE.write_text(str(_main_proc.pid), encoding="utf-8")
+        logger.info(f"[Dashboard] main.py 시작 (PID={_main_proc.pid})")
+        return jsonify({"success": True, "pid": _main_proc.pid})
+    except Exception as e:
+        logger.error(f"[Dashboard] main.py 시작 실패: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/system/stop", methods=["POST"])
+def system_stop():
+    """main.py 중지"""
+    global _main_proc
+    if not _main_is_running():
+        return jsonify({"success": False, "error": "실행 중인 프로세스가 없습니다"})
+    try:
+        pid = None
+        if _main_proc is not None and _main_proc.poll() is None:
+            pid = _main_proc.pid
+            _main_proc.terminate()
+            try:
+                _main_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _main_proc.kill()
+            _main_proc = None
+        elif _MAIN_PID_FILE.exists():
+            pid = int(_MAIN_PID_FILE.read_text(encoding="utf-8").strip())
+            _kill_pid(pid)
+        try:
+            _MAIN_PID_FILE.unlink()
+        except OSError:
+            pass
+        logger.info(f"[Dashboard] main.py 중지 (PID={pid})")
+        return jsonify({"success": True, "pid": pid})
+    except Exception as e:
+        logger.error(f"[Dashboard] main.py 중지 실패: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+
 @app.route("/api/system-status")
 def get_system_status():
     """스케줄러 가동 상태 및 설정 요약 반환"""
     try:
         return jsonify({
             "success": True,
+            "main_running": _main_is_running(),
             "scheduler_running": _is_scheduler_running(),
             "jobs": [],
             "telegram_monitor": os.getenv("TELEGRAM_MONITOR_ENABLED", "false").lower() == "true",

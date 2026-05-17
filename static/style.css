@@ -191,12 +191,68 @@ body {
     display: grid;
     grid-template-columns: 2fr 1fr;
     gap: 1.5rem;
+    align-items: start;
 }
 
 @media (max-width: 1024px) {
     .main-content {
         grid-template-columns: 1fr;
     }
+}
+
+/* 로그 전체 너비 모드 */
+.log-wide {
+    max-height: 280px;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    align-content: start;
+    gap: 0;
+}
+
+.log-wide .log-entry {
+    border-bottom: 1px solid var(--border-color);
+}
+
+/* 소섹션 레이블 */
+.stat-label {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.6rem;
+}
+
+/* 정보수집 통계 그리드 */
+.collection-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.5rem;
+}
+
+.collection-item {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.82rem;
+}
+
+.collection-item .ci-label {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    margin-bottom: 0.2rem;
+}
+
+.collection-item .ci-count {
+    font-weight: 700;
+    font-size: 1rem;
+    color: var(--text-primary);
+}
+
+.collection-item .ci-time {
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    margin-top: 0.15rem;
 }
 
 .section-header {
@@ -310,4 +366,20 @@ body {
 .btn-icon:hover {
     color: var(--text-primary);
     transform: rotate(180deg);
+}
+
+.btn-edit {
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    padding: 0.2rem 0.5rem;
+    cursor: pointer;
+    transition: border-color 0.2s, color 0.2s;
+}
+
+.btn-edit:hover {
+    border-color: var(--accent-color, #3b82f6);
+    color: var(--text-primary);
 }

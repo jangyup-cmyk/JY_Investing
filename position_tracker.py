@@ -109,3 +109,24 @@ def load_all() -> dict:
     """전체 포지션 딕셔너리 반환 (대시보드 등 읽기 전용 용도)"""
     with _lock:
         return _load()
+
+
+def update_position_levels(
+    account_no: str,
+    stock_code: str,
+    stop_loss: float,
+    take_profit: float,
+) -> bool:
+    """손절/익절가 수동 업데이트 (대시보드 편집 UI용)"""
+    key = f"{account_no}_{stock_code}"
+    with _lock:
+        positions = _load()
+        if key not in positions:
+            logger.warning(f"[손절/익절 수정] 존재하지 않는 키: {key}")
+            return False
+        positions[key]["stop_loss"] = round(stop_loss, 0)
+        positions[key]["take_profit"] = round(take_profit, 0)
+        ok = _save(positions)
+    if ok:
+        logger.info(f"[손절/익절 수정] {key} → 손절={stop_loss:,.0f} 익절={take_profit:,.0f}")
+    return ok

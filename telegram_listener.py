@@ -326,15 +326,17 @@ class TelegramListener:
             return
         
         logger.info(f"🔍 그룹 '{group_name}' ({len(channel_refs)}개 채널) 모니터링 시작 (간격: {poll_interval}초)")
-        
+
         last_message_ids = load_listener_state(self.state_file)
-        
+        _failed_channels: set = set()  # 반복 오류 채널 추적 (로그 오염 방지)
+
         try:
             while True:
                 for channel_ref in channel_refs:
                     try:
                         # 채널 엔티티 조회
                         entity = await self.client.get_entity(channel_ref)
+                        _failed_channels.discard(channel_ref)  # 복구 시 제거
                         channel_id = entity.id
                         channel_name = getattr(entity, 'title', str(channel_ref))
                         
@@ -366,8 +368,12 @@ class TelegramListener:
                                 logger.warning(f"테마 추출 실패: {e}")
                         
                     except Exception as e:
-                        logger.warning(f"채널 '{channel_ref}' 처리 중 오류: {e}")
-                
+                        if channel_ref not in _failed_channels:
+                            logger.warning(f"채널 '{channel_ref}' 접근 불가 (이후 생략): {e}")
+                            _failed_channels.add(channel_ref)
+                        else:
+                            logger.debug(f"채널 '{channel_ref}' 오류 반복 중 (무시)")
+
                 logger.debug(f"⏳ {poll_interval}초 후 다시 폴링...")
                 await asyncio.sleep(poll_interval)
         

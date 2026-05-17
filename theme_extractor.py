@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import json
 import re
@@ -155,34 +156,112 @@ def extract_signal_from_text(text: str) -> dict:
     }
 
 
+def _text_hash(text: str) -> str:
+    """정규화된 텍스트의 SHA256 해시 반환 (중복 판별용)"""
+    return hashlib.sha256(normalize_text(text).encode()).hexdigest()
+
+
+def deduplicate_texts(texts: list[str]) -> tuple[list[str], int]:
+    """
+    A방식: SHA256 해시 기반 전역 중복 제거.
+    반환: (중복 제거된 텍스트 목록, 제거된 건수)
+    """
+    seen: set[str] = set()
+    unique: list[str] = []
+    for text in texts:
+        h = _text_hash(text)
+        if h not in seen:
+            seen.add(h)
+            unique.append(text)
+    return unique, len(texts) - len(unique)
+
+
 def extract_from_texts(texts: list[str], min_score: float = 1.0) -> dict:
     """
-    텍스트 여러 건에서 집계 신호 생성.
-    반환:
-    {
-      "recommended_codes": [...],
-      "theme_frequency": {...},
-      "code_scores": {...}
-    }
+    텍스트 여러 건에서 집계 신호 생성 (레거시 호환용).
+    내부적으로 extract_from_grouped_texts 를 단일 그룹으로 호출.
     """
-    score_counter: Counter[str] = Counter()
-    theme_counter: Counter[str] = Counter()
+    return extract_from_grouped_texts({"_all": texts}, min_score=min_score)
 
-    for text in texts:
-        signal = extract_signal_from_text(text)
-        for code, score in signal["code_scores"].items():
-            score_counter[code] += score
-        for theme in signal["themes"]:
-            theme_counter[theme] += 1
+
+def extract_from_grouped_texts(
+    text_groups: dict[str, list[str]],
+    min_score: float = 1.0,
+) -> dict:
+    """
+    A + C 방식 통합 추출:
+      A. SHA256 해시로 전역 중복 텍스트 제거
+      C. 종목별 언급 채널 수에 sqrt 정규화 적용 (과대평가 방지)
+
+    Args:
+        text_groups: {"그룹명": [텍스트, ...], ...}
+        min_score:   추천 최소 점수
+
+    Returns:
+        recommended_codes, theme_frequency, code_scores, dedup_stats
+    """
+    # ── A: 전역 해시 중복 제거 ────────────────────────────────
+    global_seen: set[str] = set()
+    total_before = 0
+
+    # 그룹별 중복 제거 후 신호 집계
+    # channel_code_scores[group][code] = 해당 그룹 내 해당 종목 총점
+    channel_code_scores: dict[str, Counter] = {}
+    channel_themes: Counter = Counter()
+
+    for group_name, texts in text_groups.items():
+        group_counter: Counter = Counter()
+        total_before += len(texts)
+        for text in texts:
+            h = _text_hash(text)
+            if h in global_seen:
+                continue                     # A: 전역 중복 스킵
+            global_seen.add(h)
+            signal = extract_signal_from_text(text)
+            for code, score in signal["code_scores"].items():
+                group_counter[code] += score
+            for theme in signal["themes"]:
+                channel_themes[theme] += 1
+        if group_counter:
+            channel_code_scores[group_name] = group_counter
+
+    total_removed = total_before - len(global_seen)
+
+    # ── C: 채널 정규화 (sqrt 감쇠) ───────────────────────────
+    # 종목별 몇 개 그룹에서 언급됐는지 집계
+    code_group_count: dict[str, int] = {}
+    for group_scores in channel_code_scores.values():
+        for code in group_scores:
+            code_group_count[code] = code_group_count.get(code, 0) + 1
+
+    final_scores: Counter = Counter()
+    for group_scores in channel_code_scores.values():
+        for code, raw_score in group_scores.items():
+            n = code_group_count.get(code, 1)
+            # sqrt 정규화: n개 그룹 언급 시 점수를 sqrt(n)으로 나눔
+            # 단, 다채널 언급은 약한 보너스(+10%)로 반영
+            normalized = raw_score / (n ** 0.5) * (1 + 0.1 * (n - 1))
+            final_scores[code] += normalized
 
     recommended_codes = [
-        code for code, score in score_counter.most_common() if score >= min_score
+        code for code, score in final_scores.most_common() if score >= min_score
     ]
+
+    logger.info(
+        f"[테마추출] 입력 {total_before}건 → 중복제거 후 {len(global_seen)}건 "
+        f"({total_removed}건 제거), 추천 {len(recommended_codes)}종목"
+    )
 
     return {
         "recommended_codes": recommended_codes,
-        "theme_frequency": dict(theme_counter.most_common()),
-        "code_scores": dict(score_counter.most_common()),
+        "theme_frequency": dict(channel_themes.most_common()),
+        "code_scores": {k: round(v, 2) for k, v in final_scores.most_common()},
+        "dedup_stats": {
+            "total_before": total_before,
+            "unique_after": len(global_seen),
+            "removed": total_removed,
+            "groups": len(text_groups),
+        },
     }
 
 

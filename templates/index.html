@@ -6,32 +6,39 @@
     <title>JY 투자클럽 대시보드</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
-<!-- JY_MARKER_12345 -->
 </head>
 <body>
     <div class="background-glow"></div>
 
     <div class="container">
+
+        <!-- ① 헤더 -->
         <header class="header">
             <div class="brand">
                 <h1>JY INVEST<span class="dot">.</span></h1>
                 <p class="subtitle">AI Automated Trading System</p>
             </div>
-            <div class="status-indicator">
-                <div class="pulse-ring"></div>
-                <div class="pulse-dot"></div>
-                <span>시스템 정상 가동 중</span>
+            <div style="display:flex;align-items:center;gap:1rem;">
+                <button id="main-toggle-btn" onclick="toggleMainSystem()"
+                    style="padding:0.5rem 1.4rem;border-radius:8px;border:none;font-weight:700;font-size:0.9rem;cursor:pointer;transition:all 0.2s;min-width:120px;">
+                    로딩중...
+                </button>
+                <div class="status-indicator">
+                    <div class="pulse-ring"></div>
+                    <div class="pulse-dot"></div>
+                    <span id="main-status-text">확인중...</span>
+                </div>
             </div>
         </header>
 
-        <!-- 설정 정보 요약 -->
+        <!-- ② 설정 + 시스템 상태 -->
         <section class="config-section glass-card">
             <div class="config-grid" id="config-container">
                 <div class="config-item"><span class="label">모니터링 종목:</span> <span class="value">로딩중...</span></div>
                 <div class="config-item"><span class="label">손절 설정:</span> <span class="value">로딩중...</span></div>
                 <div class="config-item"><span class="label">익절 설정:</span> <span class="value">로딩중...</span></div>
             </div>
-            <div class="config-grid" id="system-status-container" style="margin-top: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--border-color);">
+            <div class="config-grid" id="system-status-container" style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border-color);">
                 <div class="config-item"><span class="label">스케줄러:</span> <span class="value" id="scheduler-status">로딩중...</span></div>
                 <div class="config-item"><span class="label">텔레그램 모니터:</span> <span class="value" id="tg-status">로딩중...</span></div>
                 <div class="config-item"><span class="label">네이버 리서치:</span> <span class="value" id="naver-status">로딩중...</span></div>
@@ -39,21 +46,110 @@
             </div>
         </section>
 
-        <!-- 메인 메트릭 (잔고) -->
-        <section class="metrics-grid" id="balance-container">
+        <!-- ③ 정보수집 현황 (전체 너비) -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header" style="padding:1rem 1.5rem 0.75rem;">
+                <h2>📡 정보수집 현황</h2>
+                <span id="collection-channels" style="font-size:0.82rem;color:var(--text-secondary);">로딩중...</span>
+            </div>
+            <div style="padding:0 1.25rem 1rem;display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;">
+                <div>
+                    <div class="stat-label">📰 네이버 리서치</div>
+                    <div id="naver-stats-grid" class="collection-grid">
+                        <div class="collection-item">로딩중...</div>
+                    </div>
+                </div>
+                <div>
+                    <div class="stat-label">💬 텔레그램 수집</div>
+                    <div id="telegram-stats-grid" class="collection-grid">
+                        <div class="collection-item">로딩중...</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ④ AI 종목 추출 현황 (전체 너비) -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header" style="padding:1rem 1.5rem 0.75rem;">
+                <h2>🧠 AI 종목 추출 현황</h2>
+                <span id="watchlist-meta" style="font-size:0.82rem;color:var(--text-secondary);">로딩중...</span>
+            </div>
+            <div style="padding:0 1.25rem 1rem;">
+                <div id="watchlist-manual" style="display:none;margin-bottom:0.75rem;padding:0.6rem 1rem;background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.3);border-radius:8px;font-size:0.85rem;">
+                    📌 수동 지정 모드 — WATCH_LIST: <span id="watchlist-manual-codes" style="font-weight:700;"></span>
+                </div>
+                <div style="display:grid;grid-template-columns:2fr 1fr;gap:1.5rem;">
+                    <div>
+                        <div class="stat-label">추천 종목 (점수 순)</div>
+                        <div id="watchlist-stocks" style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem;">
+                            <div style="color:var(--text-secondary);font-size:0.85rem;">로딩중...</div>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="stat-label">감지된 테마 키워드</div>
+                        <div id="watchlist-themes" style="display:flex;flex-wrap:wrap;gap:0.4rem;margin-bottom:1rem;">
+                            <div style="color:var(--text-secondary);font-size:0.85rem;">로딩중...</div>
+                        </div>
+                        <div class="stat-label">채널 가중치</div>
+                        <div id="watchlist-weights"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ⑤ 시스템 로그 (전체 너비) -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header">
+                <h2>⚡ 시스템 로그</h2>
+                <button id="refresh-logs-btn" class="btn-icon">↻</button>
+            </div>
+            <div class="log-container log-wide" id="log-container">
+                <div class="log-entry">로딩 중...</div>
+            </div>
+        </section>
+
+        <!-- ⑥ 잔고 카드 -->
+        <section class="metrics-grid" id="balance-container" style="margin-bottom:1.5rem;">
             <div class="glass-card metric-card">
                 <h3>로딩 중...</h3>
                 <div class="value">₩ 0</div>
             </div>
         </section>
 
-        <!-- AI 개발 비용 -->
-        <section class="glass-card" style="margin-bottom: 1.5rem;">
-            <div class="section-header" style="padding: 1rem 1.5rem 0.5rem;">
-                <h2>🤖 AI 개발 비용 (Claude Code)</h2>
-                <span id="ai-cost-total" style="font-size:1.1rem; font-weight:700; color: var(--profit-color);">로딩중...</span>
+        <!-- ⑦ 보유 포지션 (전체 너비) -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header">
+                <h2>📊 보유 포지션</h2>
             </div>
-            <div class="table-responsive" style="padding: 0 1rem 1rem;">
+            <div class="table-responsive">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>계좌명</th>
+                            <th>종목명 (코드)</th>
+                            <th>매수가</th>
+                            <th>현재가</th>
+                            <th>수익률</th>
+                            <th>보유수량</th>
+                            <th>손절가</th>
+                            <th>익절가</th>
+                            <th>편집</th>
+                        </tr>
+                    </thead>
+                    <tbody id="positions-body">
+                        <tr><td colspan="9" class="text-center">로딩 중...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- ⑧ AI 개발 비용 (맨 아래) -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header" style="padding:1rem 1.5rem 0.5rem;">
+                <h2>🤖 AI 개발 비용 (Claude Code)</h2>
+                <span id="ai-cost-total" style="font-size:1.1rem;font-weight:700;color:var(--profit-color);">로딩중...</span>
+            </div>
+            <div class="table-responsive" style="padding:0 1rem 1rem;">
                 <table class="data-table">
                     <thead>
                         <tr>
@@ -73,42 +169,27 @@
             </div>
         </section>
 
-        <div class="main-content">
-            <!-- 보유 포지션 테이블 -->
-            <section class="positions-section glass-card">
-                <div class="section-header">
-                    <h2>📊 보유 포지션</h2>
-                </div>
-                <div class="table-responsive">
-                    <table class="data-table">
-                        <thead>
-                            <tr>
-                                <th>계좌명</th>
-                                <th>종목명 (코드)</th>
-                                <th>매수가</th>
-                                <th>보유수량</th>
-                                <th>손절가</th>
-                                <th>익절가</th>
-                                <th>진입시간</th>
-                            </tr>
-                        </thead>
-                        <tbody id="positions-body">
-                            <tr><td colspan="7" class="text-center">로딩 중...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </section>
+    </div>
 
-            <!-- 실시간 시스템 로그 -->
-            <section class="logs-section glass-card">
-                <div class="section-header">
-                    <h2>⚡ 시스템 로그</h2>
-                    <button id="refresh-logs-btn" class="btn-icon">↻</button>
-                </div>
-                <div class="log-container" id="log-container">
-                    <div class="log-entry">로딩 중...</div>
-                </div>
-            </section>
+    <!-- 손절/익절 편집 모달 -->
+    <div id="edit-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+        <div style="background:var(--card-bg);border:1px solid var(--border-color);border-radius:12px;padding:2rem;min-width:320px;">
+            <h3 style="margin-bottom:1.2rem;color:var(--text-primary)">손절/익절 수정</h3>
+            <input type="hidden" id="edit-pos-key">
+            <div style="margin-bottom:1rem;">
+                <label style="color:var(--text-secondary);font-size:0.85rem;">손절가 (₩)</label>
+                <input id="edit-stop-loss" type="number" step="1"
+                    style="width:100%;margin-top:0.3rem;padding:0.5rem 0.75rem;background:var(--input-bg,#1e2a3a);border:1px solid var(--border-color);border-radius:6px;color:var(--loss-color);font-size:1rem;">
+            </div>
+            <div style="margin-bottom:1.5rem;">
+                <label style="color:var(--text-secondary);font-size:0.85rem;">익절가 (₩)</label>
+                <input id="edit-take-profit" type="number" step="1"
+                    style="width:100%;margin-top:0.3rem;padding:0.5rem 0.75rem;background:var(--input-bg,#1e2a3a);border:1px solid var(--border-color);border-radius:6px;color:var(--profit-color);font-size:1rem;">
+            </div>
+            <div style="display:flex;gap:0.75rem;justify-content:flex-end;">
+                <button onclick="closeEditModal()" style="padding:0.5rem 1.2rem;border-radius:6px;border:1px solid var(--border-color);background:transparent;color:var(--text-secondary);cursor:pointer;">취소</button>
+                <button onclick="submitEditModal()" style="padding:0.5rem 1.4rem;border-radius:6px;border:none;background:var(--accent-color,#3b82f6);color:#fff;font-weight:600;cursor:pointer;">저장</button>
+            </div>
         </div>
     </div>
 

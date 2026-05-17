@@ -95,27 +95,42 @@ def resolve_stock_codes(initial_codes: list | None = None) -> list:
                 return weighted
 
         import theme_extractor
-        
-        # 텔레그램 텍스트 로드
-        texts = theme_extractor.load_texts_from_directory(config.TEXT_SIGNAL_SOURCE_DIR)
-        
-        # 네이버 리서치 텍스트 로드 (카테고리별 서브디렉터리 포함)
+
+        # 텔레그램 텍스트를 채널 폴더 단위로 그룹 로드 (C: 채널 정규화용)
+        text_groups = theme_extractor.load_texts_grouped_by_subdir(config.TEXT_SIGNAL_SOURCE_DIR)
+
+        # 네이버 리서치 텍스트를 카테고리 그룹으로 로드 후 합산
         if config.NAVER_RESEARCH_ENABLED:
-            research_texts = theme_extractor.load_texts_grouped_by_subdir(config.NAVER_RESEARCH_SOURCE_DIR)
-            for cat_texts in research_texts.values():
-                texts.extend(cat_texts)
-        
-        if not texts:
+            research_groups = theme_extractor.load_texts_grouped_by_subdir(config.NAVER_RESEARCH_SOURCE_DIR)
+            text_groups.update({f"naver_{k}": v for k, v in research_groups.items()})
+
+        if not text_groups:
             return []
 
-        updated = theme_extractor.update_theme_mapping_from_texts(texts)
-        aggregated = theme_extractor.extract_from_texts(
-            texts, min_score=config.THEME_EXTRACTION_MIN_SCORE
+        # update_theme_mapping_from_texts 는 flat list 필요
+        all_texts = [t for grp in text_groups.values() for t in grp]
+        updated = theme_extractor.update_theme_mapping_from_texts(all_texts)
+
+        # A+C 통합 추출 (SHA256 중복 제거 + sqrt 채널 정규화)
+        aggregated = theme_extractor.extract_from_grouped_texts(
+            text_groups, min_score=config.THEME_EXTRACTION_MIN_SCORE
         )
         resolved = aggregated.get("recommended_codes", [])
 
+        # auto_watchlist_report.json 저장 (대시보드 /api/watchlist-report 에서 읽음)
+        try:
+            report_path = Path(getattr(config, "AUTO_WATCHLIST_REPORT_PATH", "auto_watchlist_report.json"))
+            report_path.write_text(
+                json.dumps(aggregated, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(f"[테마 추출] watchlist 리포트 저장 실패: {exc}")
+
+        dedup = aggregated.get("dedup_stats", {})
         logger.info(
-            f"[테마 추출] 파일 {len(texts)}건 분석, "
+            f"[테마 추출] 입력 {dedup.get('total_before', 0)}건 → "
+            f"중복제거 후 {dedup.get('unique_after', 0)}건 ({dedup.get('removed', 0)}건 제거), "
             f"themes.json 갱신 {updated}종목, 추천 종목 {len(resolved)}개"
         )
     except Exception as exc:
