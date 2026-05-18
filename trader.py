@@ -58,6 +58,23 @@ def execute_split_buy(user: dict, stock_code: str, current_price: float, bull_sc
 
     logger.info(f"지정가 주문 ({user['name']}): {stock_code} {qty_limit}주 @ {int(current_price)}원 - {'성공' if limit_success else '실패'}")
 
+    # 부분 실패(market XOR limit) 또는 양쪽 실패 시 관리자 알림
+    if not (market_success and limit_success):
+        try:
+            failed_legs = []
+            if not market_success:
+                failed_legs.append(f"시장가({qty_market}주) {res_market.get('msg_text','')}")
+            if not limit_success:
+                failed_legs.append(f"지정가({qty_limit}주 @{int(current_price)}) {res_limit.get('msg_text','')}")
+            severity = "critical" if not (market_success or limit_success) else "warning"
+            bot.send_admin_alert(
+                severity,
+                "분할 매수 부분/전체 실패",
+                f"{user['name']} | {stock_code}\n" + "\n".join(failed_legs),
+            )
+        except Exception as _exc:
+            logger.error(f"매수 부분실패 알림 전송 실패 (silent): {_exc}")
+
     # 10분 뒤 미체결 취소 스케줄 등록
     if limit_order_no:
         cancel_time = datetime.now() + timedelta(minutes=10)

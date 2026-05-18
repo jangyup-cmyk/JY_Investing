@@ -41,7 +41,12 @@ document.addEventListener('DOMContentLoaded', () => {
             el.classList.toggle('hidden', !!_selectedAccount);
         });
 
+        // 성과 패널 헤더 뱃지 동기화
+        const perfBadge = document.getElementById('performance-account-filter');
+        if (perfBadge) perfBadge.textContent = _selectedAccount ? `${_selectedAccount} 계좌` : '전체 계좌';
+
         renderPositionsIfReady();
+        updatePerformance();
     };
 
     function updateSystemStatus() {
@@ -456,6 +461,140 @@ document.addEventListener('DOMContentLoaded', () => {
             .catch(err => console.error('Collection stats fetch error:', err));
     }
 
+    // 거래 성과 (closed_positions.json 기반, KIS API 호출 없음)
+    function _fmtPnl(amt) {
+        const sign = amt >= 0 ? '+' : '';
+        return `${sign}₩ ${Math.round(amt).toLocaleString()}`;
+    }
+    function _fmtRate(rate) {
+        if (rate === null || rate === undefined) return '-';
+        const sign = rate >= 0 ? '+' : '';
+        return `${sign}${Number(rate).toFixed(2)}%`;
+    }
+    function _rateColor(rate) {
+        if (rate > 0) return 'var(--profit-color)';
+        if (rate < 0) return 'var(--loss-color)';
+        return 'var(--text-secondary)';
+    }
+
+    function updatePerformance() {
+        const qs = _selectedAccount ? `?account_no=${encodeURIComponent(_selectedAccount)}` : '';
+
+        // 1) 요약 KPI
+        fetch('/api/performance' + qs)
+            .then(res => res.json())
+            .then(res => {
+                if (!res.success) return;
+                const d = res.data || {};
+                const setText = (id, val, color) => {
+                    const el = document.getElementById(id);
+                    if (!el) return;
+                    el.textContent = val;
+                    if (color) el.style.color = color;
+                };
+                setText('perf-trade-count', `${(d.trade_count || 0).toLocaleString()}회`);
+                setText('perf-win-rate',
+                    d.trade_count ? `${d.win_rate.toFixed(1)}% (${d.win_count}/${d.trade_count})` : '-',
+                    d.trade_count && d.win_rate >= 50 ? 'var(--profit-color)' : 'var(--loss-color)');
+                setText('perf-total-pnl',
+                    d.trade_count ? _fmtPnl(d.total_pnl_amt) : '-',
+                    _rateColor(d.total_pnl_amt || 0));
+                setText('perf-avg-rate',
+                    d.trade_count ? _fmtRate(d.avg_pnl_rate) : '-',
+                    _rateColor(d.avg_pnl_rate || 0));
+                setText('perf-best-rate',
+                    d.trade_count ? _fmtRate(d.best_pnl_rate) : '-',
+                    'var(--profit-color)');
+                setText('perf-worst-rate',
+                    d.trade_count ? _fmtRate(d.worst_pnl_rate) : '-',
+                    'var(--loss-color)');
+
+                const meta = document.getElementById('performance-meta');
+                if (meta) {
+                    meta.textContent = d.trade_count
+                        ? `총 ${d.trade_count.toLocaleString()}건 누적 (closed_positions.json 기반)`
+                        : '매도 이력 없음 — closed_positions.json 비어있음';
+                }
+            })
+            .catch(err => console.error('Performance fetch error:', err));
+
+        // 2) 종목별 랭킹 (상위 5)
+        fetch('/api/performance/by-stock' + qs)
+            .then(res => res.json())
+            .then(res => {
+                if (!res.success) return;
+                const body = document.getElementById('performance-by-stock-body');
+                if (!body) return;
+                const rows = (res.data || []).slice(0, 5);
+                if (rows.length === 0) {
+                    body.innerHTML = `<tr><td colspan="5" class="text-center" style="color:var(--text-secondary)">매도 이력 없음</td></tr>`;
+                    return;
+                }
+                body.innerHTML = rows.map((r, i) => `
+                    <tr>
+                        <td style="color:var(--text-secondary)">#${i + 1}</td>
+                        <td><span style="font-weight:600">${r.stock_name || r.stock_code}</span>
+                            <span style="color:var(--text-secondary);font-size:0.78rem;"> (${r.stock_code})</span></td>
+                        <td>${r.trade_count.toLocaleString()}회</td>
+                        <td style="color:${_rateColor(r.avg_pnl_rate)};font-weight:600">${_fmtRate(r.avg_pnl_rate)}</td>
+                        <td style="color:${_rateColor(r.total_pnl_amt)};font-weight:600">${_fmtPnl(r.total_pnl_amt)}</td>
+                    </tr>
+                `).join('');
+            })
+            .catch(err => console.error('Performance by-stock fetch error:', err));
+    }
+
+    // 에이전트 거부 분석 (agent_rejections.json 기반, 관측성 패널)
+    window.updateRejections = function() {
+        const days = document.getElementById('rejections-window')?.value || '7';
+        fetch(`/api/rejections/summary?days=${days}&top=10`)
+            .then(res => res.json())
+            .then(res => {
+                if (!res.success) return;
+                const d = res.data || {};
+                const totalEl = document.getElementById('rejections-total');
+                if (totalEl) totalEl.textContent = `총 ${(d.total || 0).toLocaleString()}건 (최근 ${d.window_days}일)`;
+
+                // 단계별 가로 바
+                const stageEl = document.getElementById('rejections-by-stage');
+                const stages = d.by_stage || [];
+                if (stages.length === 0) {
+                    stageEl.innerHTML = '<div style="color:var(--text-secondary);font-size:0.85rem;">거부 기록 없음</div>';
+                } else {
+                    const maxCount = stages[0].count || 1;
+                    stageEl.innerHTML = stages.map(s => {
+                        const pct = (s.count / maxCount) * 100;
+                        return `
+                            <div style="margin-bottom:0.55rem;">
+                                <div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.2rem;">
+                                    <span style="font-weight:600;text-transform:uppercase;">${s.stage}</span>
+                                    <span style="color:var(--text-secondary);">${s.count.toLocaleString()}</span>
+                                </div>
+                                <div style="height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;">
+                                    <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#ef4444,#f59e0b);border-radius:3px;"></div>
+                                </div>
+                            </div>`;
+                    }).join('');
+                }
+
+                // 사유 Top N
+                const topEl = document.getElementById('rejections-top-body');
+                const top = d.top_reasons || [];
+                if (top.length === 0) {
+                    topEl.innerHTML = `<tr><td colspan="3" class="text-center" style="color:var(--text-secondary)">거부 기록 없음</td></tr>`;
+                } else {
+                    topEl.innerHTML = top.map((r, i) => `
+                        <tr>
+                            <td style="color:var(--text-secondary)">#${i + 1}</td>
+                            <td><span style="font-weight:600">${r.label}</span></td>
+                            <td>${r.count.toLocaleString()}</td>
+                        </tr>
+                    `).join('');
+                }
+            })
+            .catch(err => console.error('Rejections fetch error:', err));
+    };
+
     // 포지션 편집 모달 (손절/익절 + 매수일)
     window.openEditModal = function(posKey, stopLoss, takeProfit, buyDate, label) {
         document.getElementById('edit-pos-key').value = posKey;
@@ -497,6 +636,8 @@ document.addEventListener('DOMContentLoaded', () => {
     updateLogs();
     updateCollectionStats();
     updateWatchlistReport();
+    updatePerformance();
+    updateRejections();
 
     // Polling
     setInterval(updateSystemStatus, 30000);
@@ -504,6 +645,8 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(updateLogs, SLOW_POLL_MS);
     setInterval(updateCollectionStats, 60000);
     setInterval(updateWatchlistReport, 300000); // 5분마다 갱신
+    setInterval(updatePerformance, 30000); // 거래 성과 — 30초마다 갱신 (히스토리 기반이라 느린 polling)
+    setInterval(updateRejections, 60000);  // 거부 분석 — 1분마다 갱신
 
     refreshLogsBtn.addEventListener('click', () => {
         updateLogs();

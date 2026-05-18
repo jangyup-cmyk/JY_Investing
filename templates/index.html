@@ -158,7 +158,91 @@
             </div>
         </section>
 
-        <!-- ⑧ AI 개발 비용 (맨 아래) -->
+        <!-- ⑧ 거래 성과 (누적 closed_positions 기반) -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header" style="padding:1rem 1.5rem 0.75rem;">
+                <div style="display:flex;align-items:center;gap:0.75rem;">
+                    <h2>📈 거래 성과</h2>
+                    <span id="performance-account-filter" class="account-filter-badge">전체 계좌</span>
+                </div>
+                <span id="performance-meta" style="font-size:0.82rem;color:var(--text-secondary);">로딩중...</span>
+            </div>
+            <div style="padding:0 1.25rem 1rem;">
+                <!-- 요약 KPI 그리드 -->
+                <div id="performance-summary" class="performance-kpi-grid">
+                    <div class="kpi-cell"><div class="ci-label">누적 거래</div><div class="ci-count" id="perf-trade-count">-</div></div>
+                    <div class="kpi-cell"><div class="ci-label">승률</div><div class="ci-count" id="perf-win-rate">-</div></div>
+                    <div class="kpi-cell"><div class="ci-label">총 PnL</div><div class="ci-count" id="perf-total-pnl">-</div></div>
+                    <div class="kpi-cell"><div class="ci-label">평균 수익률</div><div class="ci-count" id="perf-avg-rate">-</div></div>
+                    <div class="kpi-cell"><div class="ci-label">최고 수익률</div><div class="ci-count" id="perf-best-rate">-</div></div>
+                    <div class="kpi-cell"><div class="ci-label">최저 수익률</div><div class="ci-count" id="perf-worst-rate">-</div></div>
+                </div>
+
+                <!-- 종목별 PnL 랭킹 -->
+                <div style="margin-top:1rem;">
+                    <div class="stat-label">종목별 PnL 랭킹 (상위 5)</div>
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>종목명 (코드)</th>
+                                    <th>거래수</th>
+                                    <th>평균 수익률</th>
+                                    <th>총 PnL</th>
+                                </tr>
+                            </thead>
+                            <tbody id="performance-by-stock-body">
+                                <tr><td colspan="5" class="text-center">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ⑨ 에이전트 거부 분석 -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header" style="padding:1rem 1.5rem 0.75rem;">
+                <h2>🚦 에이전트 거부 분석</h2>
+                <div style="display:flex;align-items:center;gap:0.6rem;">
+                    <select id="rejections-window" onchange="updateRejections()"
+                        style="padding:0.35rem 0.7rem;background:rgba(255,255,255,0.05);border:1px solid var(--border-color);border-radius:6px;color:var(--text-primary);font-size:0.82rem;">
+                        <option value="7">최근 7일</option>
+                        <option value="30">최근 30일</option>
+                        <option value="1">최근 24시간</option>
+                    </select>
+                    <span id="rejections-total" style="font-size:0.82rem;color:var(--text-secondary);">로딩중...</span>
+                </div>
+            </div>
+            <div style="padding:0 1.25rem 1rem;display:grid;grid-template-columns:1fr 1.4fr;gap:1.5rem;">
+                <div>
+                    <div class="stat-label">단계별 거부 카운트</div>
+                    <div id="rejections-by-stage">
+                        <div style="color:var(--text-secondary);font-size:0.85rem;">로딩 중...</div>
+                    </div>
+                </div>
+                <div>
+                    <div class="stat-label">자주 거부된 사유 (Top 10)</div>
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>단계: 사유</th>
+                                    <th>횟수</th>
+                                </tr>
+                            </thead>
+                            <tbody id="rejections-top-body">
+                                <tr><td colspan="3" class="text-center">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ⑩ AI 개발 비용 (맨 아래) -->
         <section class="glass-card" style="margin-bottom:1.5rem;">
             <div class="section-header" style="padding:1rem 1.5rem 0.5rem;">
                 <h2>🤖 AI 개발 비용 (Claude Code)</h2>

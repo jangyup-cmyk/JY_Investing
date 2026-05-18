@@ -628,5 +628,243 @@ def get_ai_costs():
         return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
 
 
+def _compute_performance_stats(closed: list) -> dict:
+    """closed_positions 리스트 → 누적 성과 지표 계산"""
+    if not closed:
+        return {
+            "trade_count": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "win_rate": 0.0,
+            "total_pnl_amt": 0.0,
+            "avg_pnl_rate": 0.0,
+            "best_pnl_rate": 0.0,
+            "worst_pnl_rate": 0.0,
+        }
+    pnl_rates = [float(p.get("pnl_rate", 0.0)) for p in closed]
+    pnl_amts  = [float(p.get("pnl_amt", 0.0))  for p in closed]
+    wins      = [r for r in pnl_rates if r > 0]
+    losses    = [r for r in pnl_rates if r <= 0]
+    trade_count = len(closed)
+    return {
+        "trade_count": trade_count,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": round(len(wins) / trade_count * 100, 2) if trade_count else 0.0,
+        "total_pnl_amt": round(sum(pnl_amts), 2),
+        "avg_pnl_rate": round(sum(pnl_rates) / trade_count, 4) if trade_count else 0.0,
+        "best_pnl_rate": round(max(pnl_rates), 4),
+        "worst_pnl_rate": round(min(pnl_rates), 4),
+    }
+
+
+@app.route("/api/performance")
+def get_performance():
+    """누적 거래 성과 요약 (closed_positions.json 기반, KIS API 호출 없음)"""
+    try:
+        closed = position_tracker.load_closed_positions()
+        account = request.args.get("account_no", "").strip()
+        if account:
+            closed = [p for p in closed if str(p.get("account_no", "")) == account]
+        return jsonify({"success": True, "data": _compute_performance_stats(closed)})
+    except Exception as e:
+        logger.error(f"성과 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+
+@app.route("/api/performance/by-stock")
+def get_performance_by_stock():
+    """종목별 누적 PnL 랭킹 (closed_positions.json 기반)"""
+    try:
+        closed = position_tracker.load_closed_positions()
+        account = request.args.get("account_no", "").strip()
+        if account:
+            closed = [p for p in closed if str(p.get("account_no", "")) == account]
+
+        agg: dict = {}
+        for p in closed:
+            code = str(p.get("stock_code", ""))
+            if not code:
+                continue
+            slot = agg.setdefault(code, {
+                "stock_code": code,
+                "stock_name": p.get("stock_name", code),
+                "trade_count": 0,
+                "total_pnl_amt": 0.0,
+                "pnl_rates": [],
+            })
+            slot["trade_count"] += 1
+            slot["total_pnl_amt"] += float(p.get("pnl_amt", 0.0))
+            slot["pnl_rates"].append(float(p.get("pnl_rate", 0.0)))
+
+        rows = []
+        for slot in agg.values():
+            rates = slot.pop("pnl_rates")
+            slot["avg_pnl_rate"] = round(sum(rates) / len(rates), 4) if rates else 0.0
+            slot["total_pnl_amt"] = round(slot["total_pnl_amt"], 2)
+            rows.append(slot)
+        rows.sort(key=lambda r: r["total_pnl_amt"], reverse=True)
+        return jsonify({"success": True, "data": rows})
+    except Exception as e:
+        logger.error(f"종목별 성과 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+
+def _mask_account(acct: str) -> str:
+    """계좌번호 마지막 2자리만 노출 (예: 73918950 → '***8950')"""
+    s = str(acct)
+    return ("*" * max(0, len(s) - 4)) + s[-4:] if len(s) > 4 else "****"
+
+
+def _check_positions_file_valid():
+    """positions.json 의 raw JSON 파싱 여부 + 열린 포지션 수.
+    _load() 와 달리 auto-recovery 는 트리거하지 않음.
+    """
+    pf = position_tracker.POSITION_FILE
+    if not os.path.exists(pf):
+        return True, 0
+    try:
+        import json as _json
+        with open(pf, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        if not isinstance(data, dict):
+            return False, 0
+        open_count = sum(
+            1 for v in data.values()
+            if isinstance(v, dict) and v.get("status") == "open"
+        )
+        return True, open_count
+    except (Exception,):
+        return False, 0
+
+
+def _check_last_log_age_sec():
+    """가장 최근 trading_*.log 파일의 수정 시각 기준 경과 초.
+    로그 파일 없으면 None 반환."""
+    try:
+        files = glob.glob(os.path.join("logs", "trading_*.log"))
+        if not files:
+            return None
+        latest = max(files, key=os.path.getmtime)
+        return int(datetime.now().timestamp() - os.path.getmtime(latest))
+    except Exception:
+        return None
+
+
+def _check_kis_tokens():
+    """kis_api._token_cache 메타만 조회 — 절대 KIS API 호출하지 않음.
+    반환: {masked_account: {"seconds_until_expiry": int, "expired": bool}}"""
+    import time as _time
+    try:
+        from kis_api import _token_cache
+    except Exception:
+        return {}
+    now = _time.time()
+    result = {}
+    for acct, info in dict(_token_cache).items():
+        exp = float(info.get("expire_time", 0) or 0)
+        result[_mask_account(acct)] = {
+            "seconds_until_expiry": int(exp - now) if exp else None,
+            "expired": (exp <= now) if exp else None,
+        }
+    return result
+
+
+def _check_thread_alive(thread_obj) -> "bool | None":
+    """스레드 객체가 살아있는지. 등록된 적 없으면 None (unknown)."""
+    if thread_obj is None:
+        return None
+    try:
+        return bool(thread_obj.is_alive())
+    except Exception:
+        return None
+
+
+def _compute_health_status(checks: dict) -> str:
+    """집계 status 산출.
+
+    unhealthy: positions.json 파싱 실패 (실거래 보호 중단)
+    degraded:  토큰 만료 / 스케줄러 미가동 / 5분 이상 로그 정체
+    healthy:   그 외 (None=unknown 은 healthy 로 간주)
+    """
+    if checks.get("positions_json_valid") is False:
+        return "unhealthy"
+
+    degraded_signals = []
+    tokens = checks.get("kis_tokens") or {}
+    if any(v.get("expired") is True for v in tokens.values()):
+        degraded_signals.append("kis_token_expired")
+    if checks.get("scheduler_running") is False:
+        degraded_signals.append("scheduler_stopped")
+    last_log = checks.get("last_log_age_sec")
+    if isinstance(last_log, int) and last_log > 300:
+        degraded_signals.append("logs_stale")
+
+    checks["degraded_reasons"] = degraded_signals
+    return "degraded" if degraded_signals else "healthy"
+
+
+@app.route("/api/rejections/summary")
+def get_rejections_summary():
+    """에이전트 거부 사유 요약 (관측성 — 매매 흐름과 무관)."""
+    try:
+        import agent_telemetry
+        try:
+            days = int(request.args.get("days", "7"))
+        except (TypeError, ValueError):
+            days = 7
+        days = max(1, min(days, 90))
+        try:
+            top = int(request.args.get("top", "10"))
+        except (TypeError, ValueError):
+            top = 10
+        top = max(1, min(top, 50))
+        return jsonify({
+            "success": True,
+            "data": agent_telemetry.summarize_rejections(days=days, top_reasons=top),
+        })
+    except Exception as e:
+        logger.error(f"거부 요약 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+
+@app.route("/api/health")
+def get_health():
+    """시스템 헬스체크 엔드포인트 (UptimeRobot 호환: 200=healthy, 503=degraded/unhealthy).
+
+    KIS API 호출 없음 — 캐시된 토큰 메타데이터만 확인.
+    계좌번호는 마스킹되어 노출되며, 토큰 값 자체는 절대 포함하지 않음.
+    """
+    try:
+        import scheduler as _sched
+        valid, open_count = _check_positions_file_valid()
+        checks = {
+            "scheduler_running": _is_scheduler_running(),
+            "kis_tokens": _check_kis_tokens(),
+            "positions_json_valid": valid,
+            "positions_open_count": open_count,
+            "closed_positions_count": len(position_tracker.load_closed_positions()),
+            "last_log_age_sec": _check_last_log_age_sec(),
+            "telegram_listener_alive": _check_thread_alive(getattr(_sched, "telegram_listener_thread", None)),
+            "naver_research_alive": _check_thread_alive(getattr(_sched, "naver_research_thread", None)),
+        }
+        status = _compute_health_status(checks)
+        http_status = 200 if status == "healthy" else 503
+        body = {
+            "status": status,
+            "checks": checks,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        return jsonify(body), http_status
+    except Exception as e:
+        logger.error(f"health 체크 오류: {e}", exc_info=True)
+        # health 라우트는 절대 200/503 외 응답하지 않도록 안전망
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e) if _FLASK_DEBUG else "internal error",
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }), 503
+
+
 if __name__ == "__main__":
     app.run(host=_FLASK_HOST, port=_FLASK_PORT, debug=_FLASK_DEBUG)

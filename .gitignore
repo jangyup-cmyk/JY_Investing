@@ -24,6 +24,9 @@ env/
 
 # ── 런타임 상태 파일 (재시작마다 재생성) ─────────────────────────────
 positions.json
+closed_positions.json
+agent_rejections.json
+etc/positions_backups/
 etc/telegram_listener_state.json
 etc/telegram_texts/
 etc/naver_research/

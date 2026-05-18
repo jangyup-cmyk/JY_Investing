@@ -344,7 +344,8 @@ def monitor_positions():
             
             if res.get("rt_cd") == "0":
                 logger.info(f"[매도 성공] {user['name']} | {stock_code}")
-                # 포지션 제거
+                # 매도 이력 보존 (성과 분석용) → 그 다음 포지션 제거
+                position_tracker.archive_position(account_no, stock_code, sell_price=current_price, reason=reason)
                 position_tracker.remove_position(account_no, stock_code)
                 # 알림 전송
                 bot.send_personal_sell_signal(
@@ -356,7 +357,19 @@ def monitor_positions():
                     pnl_rate=pnl_rate
                 )
             else:
-                logger.error(f"[매도 실패] {user['name']} | {stock_code} - {res.get('msg_text', '')}")
+                msg = res.get('msg_text', '') or res.get('msg1', '')
+                logger.error(f"[매도 실패] {user['name']} | {stock_code} - {msg}")
+                try:
+                    import telegram_bot
+                    telegram_bot.send_admin_alert(
+                        "critical",
+                        "매도 주문 실패",
+                        f"{user['name']} | {stock_code} | 사유={reason}\n"
+                        f"현재가={current_price:,.0f} 수량={qty}\n"
+                        f"rt_cd={res.get('rt_cd')} msg={msg}",
+                    )
+                except Exception as _exc:
+                    logger.error(f"매도 실패 알림 전송 실패 (silent): {_exc}")
 
 
 def start_telegram_listener():
