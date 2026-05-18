@@ -11,7 +11,9 @@ import position_tracker
 @pytest.fixture(autouse=True)
 def isolated_pos_file(tmp_path, monkeypatch):
     pf = tmp_path / "positions.json"
+    bdir = tmp_path / "backups"
     monkeypatch.setattr(position_tracker, "POSITION_FILE", str(pf))
+    monkeypatch.setattr(position_tracker, "BACKUP_DIR", str(bdir))
     return pf
 
 
@@ -109,3 +111,97 @@ def test_update_position_levels_success():
 def test_update_position_levels_missing_key_returns_false():
     ok = position_tracker.update_position_levels("99999999", "999999", 1000, 2000)
     assert ok is False
+
+
+# ─── 백업 회전 + 손상 자동복구 ───────────────────────────────────────────────
+
+import os as _os
+import json as _json
+
+
+def test_backup_created_on_each_save():
+    """add_position 후 두 번째 호출 시 첫 번째 상태가 백업되어야 한다."""
+    position_tracker.add_position("A1", "005930", 70000, 1, 65000, 80000)
+    # 첫 호출 시점에는 기존 파일이 없었으므로 백업 0개
+    assert position_tracker.list_backups() == []
+
+    position_tracker.add_position("A1", "000660", 100000, 1, 90000, 120000)
+    # 두 번째 _save 직전에 첫 번째 상태가 백업됨
+    backups = position_tracker.list_backups()
+    assert len(backups) == 1
+    assert backups[0]["valid"] is True
+    assert backups[0]["position_count"] == 1  # 첫 번째 add 만 들어있던 상태
+
+
+def test_backup_rotation_keeps_only_max_backups():
+    """MAX_BACKUPS=5 초과 시 가장 오래된 백업은 삭제되어야 한다."""
+    # 백업 파일명은 μs 까지 포함하므로 sleep 없이도 유니크
+    for i in range(8):
+        position_tracker.add_position("A1", f"{i:06d}", 10000 + i, 1, 9000, 12000)
+    backups = position_tracker.list_backups()
+    assert len(backups) == position_tracker.MAX_BACKUPS  # 5
+    # 모두 유효 JSON 이어야 함
+    assert all(b["valid"] for b in backups)
+
+
+def test_load_auto_recovers_from_corrupt_positions_file(isolated_pos_file):
+    """positions.json 이 손상되면 가장 최근 유효 백업으로 자동 복구된다."""
+    # 1) 유효한 상태 → 자동 백업 트리거 위해 두 번째 저장도 진행
+    position_tracker.add_position("A1", "005930", 70000, 1, 65000, 80000)
+    position_tracker.add_position("A1", "000660", 100000, 1, 90000, 120000)
+    assert len(position_tracker.list_backups()) >= 1
+
+    # 2) positions.json 손상시킴 (직접 쓰기)
+    isolated_pos_file.write_text("{ broken json", encoding="utf-8")
+
+    # 3) load_all() 호출 시 자동 복구
+    recovered = position_tracker.load_all()
+    assert isinstance(recovered, dict)
+    # 가장 최근 백업이 1번째 add 시점 (1건짜리) 였으므로 복구된 dict 도 1건이어야 함
+    assert len(recovered) == 1
+
+
+def test_load_returns_empty_when_no_backups_and_corrupt(isolated_pos_file):
+    """백업이 없는데 파일이 손상되면 빈 dict 반환 (기존 동작 호환)."""
+    isolated_pos_file.write_text("totally broken", encoding="utf-8")
+    assert position_tracker.load_all() == {}
+
+
+def test_list_backups_returns_sorted_newest_first():
+    """list_backups 는 index=0 이 최신, 메타 필드 모두 포함."""
+    position_tracker.add_position("A1", "001", 1000, 1, 900, 1100)
+    position_tracker.add_position("A1", "002", 1000, 1, 900, 1100)
+    position_tracker.add_position("A1", "003", 1000, 1, 900, 1100)
+
+    backups = position_tracker.list_backups()
+    assert len(backups) == 2  # 1번/2번 add 시점의 백업 두 개
+    # 필드 검증
+    for b in backups:
+        assert set(b.keys()) == {"index", "filename", "mtime", "size", "position_count", "valid"}
+        assert b["filename"].startswith("positions.")
+        assert b["filename"].endswith(".json")
+    # 최신 순 — index 0 이 가장 마지막 백업 (2건짜리)
+    assert backups[0]["position_count"] >= backups[1]["position_count"]
+
+
+def test_restore_backup_replaces_current_file(isolated_pos_file):
+    """restore_backup(idx) 호출 시 positions.json 이 백업 내용으로 덮어쓰여진다."""
+    position_tracker.add_position("A1", "005930", 70000, 1, 65000, 80000)
+    position_tracker.add_position("A1", "000660", 100000, 1, 90000, 120000)
+    position_tracker.add_position("A1", "035720", 50000, 1, 45000, 60000)
+    # 현재 3건 보유
+    assert len(position_tracker.load_all()) == 3
+
+    # 가장 오래된 백업(1번 add 직후 = 종목 1건짜리)으로 복원
+    backups = position_tracker.list_backups()
+    # backups[-1] 이 가장 오래된 = 1건짜리
+    oldest_count = backups[-1]["position_count"]
+    ok = position_tracker.restore_backup(len(backups) - 1)
+    assert ok is True
+    assert len(position_tracker.load_all()) == oldest_count
+
+
+def test_restore_backup_invalid_index_returns_false():
+    position_tracker.add_position("A1", "005930", 70000, 1, 65000, 80000)
+    assert position_tracker.restore_backup(99) is False
+    assert position_tracker.restore_backup(-1) is False

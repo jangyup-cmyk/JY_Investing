@@ -15,8 +15,10 @@ import dashboard
 def isolated_files(tmp_path, monkeypatch):
     pf = tmp_path / "positions.json"
     cf = tmp_path / "closed_positions.json"
+    bdir = tmp_path / "backups"
     monkeypatch.setattr(position_tracker, "POSITION_FILE", str(pf))
     monkeypatch.setattr(position_tracker, "CLOSED_POSITIONS_FILE", str(cf))
+    monkeypatch.setattr(position_tracker, "BACKUP_DIR", str(bdir))
     return pf, cf
 
 
