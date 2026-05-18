@@ -14,6 +14,8 @@ def isolated_pos_file(tmp_path, monkeypatch):
     bdir = tmp_path / "backups"
     monkeypatch.setattr(position_tracker, "POSITION_FILE", str(pf))
     monkeypatch.setattr(position_tracker, "BACKUP_DIR", str(bdir))
+    # 관리자 알림은 no-op으로 차단 (실제 Telegram 호출 방지)
+    monkeypatch.setattr(position_tracker, "_safe_admin_alert", lambda *a, **k: None)
     return pf
 
 

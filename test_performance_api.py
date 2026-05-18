@@ -19,6 +19,7 @@ def isolated_files(tmp_path, monkeypatch):
     monkeypatch.setattr(position_tracker, "POSITION_FILE", str(pf))
     monkeypatch.setattr(position_tracker, "CLOSED_POSITIONS_FILE", str(cf))
     monkeypatch.setattr(position_tracker, "BACKUP_DIR", str(bdir))
+    monkeypatch.setattr(position_tracker, "_safe_admin_alert", lambda *a, **k: None)
     return pf, cf
 
 

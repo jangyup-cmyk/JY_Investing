@@ -1,10 +1,67 @@
 import logging
+import threading
+import time
 
 import requests
 
 import config
 
 logger = logging.getLogger(__name__)
+
+
+# ─── 관리자 무음 실패 알림 (admin alert) ──────────────────────────────────────
+ADMIN_ALERT_DEDUP_SEC = 30
+_ADMIN_ALERT_LOCK = threading.Lock()
+_admin_dedup_cache: dict[str, float] = {}
+_SEVERITY_ICONS = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}
+
+
+def _now() -> float:
+    """단조 클럭 — 테스트에서 monkeypatch 가능"""
+    return time.monotonic()
+
+
+def send_admin_alert(severity: str, title: str, detail: str = "") -> dict:
+    """관리자(TELEGRAM_ADMIN_*)에게 무음 실패 알림.
+
+    severity: 'critical' | 'warning' | 'info' (그 외는 info 로 처리)
+    30초 dedup 윈도우 (같은 severity+title+detail 조합은 30초 내 1회만 전송).
+    전송 실패 / 예외 발생 시 절대 raise 하지 않고 silent — 매매 흐름 차단 방지.
+    """
+    if not isinstance(severity, str) or not isinstance(title, str):
+        return {"ok": False, "error": "invalid args"}
+    if severity not in _SEVERITY_ICONS:
+        severity = "info"
+
+    detail = detail or ""
+    key = f"{severity}|{title}|{detail[:80]}"
+    now = _now()
+
+    with _ADMIN_ALERT_LOCK:
+        last = _admin_dedup_cache.get(key, 0.0)
+        if now - last < ADMIN_ALERT_DEDUP_SEC:
+            return {"ok": False, "deduped": True}
+        _admin_dedup_cache[key] = now
+        # 오래된 dedup 항목 정리 (메모리 누수 방지)
+        cutoff = now - ADMIN_ALERT_DEDUP_SEC * 4
+        stale = [k for k, t in _admin_dedup_cache.items() if t < cutoff]
+        for k in stale:
+            _admin_dedup_cache.pop(k, None)
+
+    icon = _SEVERITY_ICONS[severity]
+    text = f"{icon} <b>[{severity.upper()}]</b> {title}"
+    if detail:
+        text += f"\n\n{detail}"
+
+    try:
+        return send_custom_message(
+            config.TELEGRAM_ADMIN_BOT_TOKEN,
+            config.TELEGRAM_ADMIN_ID,
+            text,
+        )
+    except Exception as exc:
+        logger.error(f"send_admin_alert 전송 실패 (silent): {exc}")
+        return {"ok": False, "error": str(exc)}
 
 
 def send_custom_message(bot_token: str, channel_id: str, text: str) -> dict:

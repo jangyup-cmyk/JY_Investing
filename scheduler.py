@@ -357,7 +357,19 @@ def monitor_positions():
                     pnl_rate=pnl_rate
                 )
             else:
-                logger.error(f"[매도 실패] {user['name']} | {stock_code} - {res.get('msg_text', '')}")
+                msg = res.get('msg_text', '') or res.get('msg1', '')
+                logger.error(f"[매도 실패] {user['name']} | {stock_code} - {msg}")
+                try:
+                    import telegram_bot
+                    telegram_bot.send_admin_alert(
+                        "critical",
+                        "매도 주문 실패",
+                        f"{user['name']} | {stock_code} | 사유={reason}\n"
+                        f"현재가={current_price:,.0f} 수량={qty}\n"
+                        f"rt_cd={res.get('rt_cd')} msg={msg}",
+                    )
+                except Exception as _exc:
+                    logger.error(f"매도 실패 알림 전송 실패 (silent): {_exc}")
 
 
 def start_telegram_listener():

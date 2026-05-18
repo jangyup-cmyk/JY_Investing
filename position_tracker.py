@@ -80,10 +80,25 @@ def _try_restore_from_backups() -> dict | None:
                 data = json.load(f)
             if isinstance(data, dict):
                 logger.warning(f"positions.json 백업 자동 복구 성공: {fname}")
+                _safe_admin_alert(
+                    "critical",
+                    "positions.json 자동 복구",
+                    f"손상된 positions.json 을 백업 '{fname}' 에서 복구했습니다 "
+                    f"({len(data)}건). 손상 원인을 점검하세요.",
+                )
                 return data
         except (json.JSONDecodeError, OSError):
             continue
     return None
+
+
+def _safe_admin_alert(severity: str, title: str, detail: str = "") -> None:
+    """관리자 알림 — 모든 예외 흡수 (매매 흐름 절대 차단 안 함)."""
+    try:
+        import telegram_bot  # lazy import: 순환 참조 회피
+        telegram_bot.send_admin_alert(severity, title, detail)
+    except Exception as exc:
+        logger.error(f"_safe_admin_alert 실패 (silent): {exc}")
 
 
 def _load() -> dict:
@@ -119,6 +134,11 @@ def _save(positions: dict) -> bool:
         return True
     except OSError as e:
         logger.error(f"positions.json 저장 실패: {e}")
+        _safe_admin_alert(
+            "critical",
+            "positions.json 저장 실패",
+            f"OSError: {e}\n다음 재시작 시 포지션 소실 위험. 즉시 점검 필요.",
+        )
         return False
 
 
@@ -212,6 +232,12 @@ def archive_position(
                 json.dump(history, f, ensure_ascii=False, indent=2)
         except (OSError, json.JSONDecodeError) as e:
             logger.error(f"closed_positions.json 저장 실패: {e}")
+            _safe_admin_alert(
+                "warning",
+                "closed_positions.json 저장 실패",
+                f"{key} 매도가={sell_price:,.0f} 사유={reason}\n"
+                f"오류: {e}\n매도는 체결되었으나 성과 이력에서 누락됩니다.",
+            )
             return False
 
     logger.info(
