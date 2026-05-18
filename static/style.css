@@ -470,3 +470,30 @@ body {
 }
 .balance-summary-row .bs-label { color: var(--text-secondary); }
 .balance-summary-row .bs-value { font-weight: 700; color: var(--text-primary); margin-left: 0.4rem; }
+
+/* 거래 성과 패널 — KPI 그리드 */
+.performance-kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 0.6rem;
+}
+.performance-kpi-grid .kpi-cell {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 0.7rem 0.8rem;
+    text-align: center;
+}
+.performance-kpi-grid .ci-label {
+    font-size: 0.74rem;
+    color: var(--text-secondary);
+    margin-bottom: 0.3rem;
+}
+.performance-kpi-grid .ci-count {
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+@media (max-width: 900px) {
+    .performance-kpi-grid { grid-template-columns: repeat(3, 1fr); }
+}
