@@ -804,6 +804,30 @@ def _compute_health_status(checks: dict) -> str:
     return "degraded" if degraded_signals else "healthy"
 
 
+@app.route("/api/rejections/summary")
+def get_rejections_summary():
+    """에이전트 거부 사유 요약 (관측성 — 매매 흐름과 무관)."""
+    try:
+        import agent_telemetry
+        try:
+            days = int(request.args.get("days", "7"))
+        except (TypeError, ValueError):
+            days = 7
+        days = max(1, min(days, 90))
+        try:
+            top = int(request.args.get("top", "10"))
+        except (TypeError, ValueError):
+            top = 10
+        top = max(1, min(top, 50))
+        return jsonify({
+            "success": True,
+            "data": agent_telemetry.summarize_rejections(days=days, top_reasons=top),
+        })
+    except Exception as e:
+        logger.error(f"거부 요약 조회 오류: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e) if _FLASK_DEBUG else "서버 내부 오류"})
+
+
 @app.route("/api/health")
 def get_health():
     """시스템 헬스체크 엔드포인트 (UptimeRobot 호환: 200=healthy, 503=degraded/unhealthy).

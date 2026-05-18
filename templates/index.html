@@ -201,7 +201,48 @@
             </div>
         </section>
 
-        <!-- ⑨ AI 개발 비용 (맨 아래) -->
+        <!-- ⑨ 에이전트 거부 분석 -->
+        <section class="glass-card" style="margin-bottom:1.5rem;">
+            <div class="section-header" style="padding:1rem 1.5rem 0.75rem;">
+                <h2>🚦 에이전트 거부 분석</h2>
+                <div style="display:flex;align-items:center;gap:0.6rem;">
+                    <select id="rejections-window" onchange="updateRejections()"
+                        style="padding:0.35rem 0.7rem;background:rgba(255,255,255,0.05);border:1px solid var(--border-color);border-radius:6px;color:var(--text-primary);font-size:0.82rem;">
+                        <option value="7">최근 7일</option>
+                        <option value="30">최근 30일</option>
+                        <option value="1">최근 24시간</option>
+                    </select>
+                    <span id="rejections-total" style="font-size:0.82rem;color:var(--text-secondary);">로딩중...</span>
+                </div>
+            </div>
+            <div style="padding:0 1.25rem 1rem;display:grid;grid-template-columns:1fr 1.4fr;gap:1.5rem;">
+                <div>
+                    <div class="stat-label">단계별 거부 카운트</div>
+                    <div id="rejections-by-stage">
+                        <div style="color:var(--text-secondary);font-size:0.85rem;">로딩 중...</div>
+                    </div>
+                </div>
+                <div>
+                    <div class="stat-label">자주 거부된 사유 (Top 10)</div>
+                    <div class="table-responsive">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>단계: 사유</th>
+                                    <th>횟수</th>
+                                </tr>
+                            </thead>
+                            <tbody id="rejections-top-body">
+                                <tr><td colspan="3" class="text-center">로딩 중...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ⑩ AI 개발 비용 (맨 아래) -->
         <section class="glass-card" style="margin-bottom:1.5rem;">
             <div class="section-header" style="padding:1rem 1.5rem 0.5rem;">
                 <h2>🤖 AI 개발 비용 (Claude Code)</h2>

@@ -544,6 +544,57 @@ document.addEventListener('DOMContentLoaded', () => {
             .catch(err => console.error('Performance by-stock fetch error:', err));
     }
 
+    // 에이전트 거부 분석 (agent_rejections.json 기반, 관측성 패널)
+    window.updateRejections = function() {
+        const days = document.getElementById('rejections-window')?.value || '7';
+        fetch(`/api/rejections/summary?days=${days}&top=10`)
+            .then(res => res.json())
+            .then(res => {
+                if (!res.success) return;
+                const d = res.data || {};
+                const totalEl = document.getElementById('rejections-total');
+                if (totalEl) totalEl.textContent = `총 ${(d.total || 0).toLocaleString()}건 (최근 ${d.window_days}일)`;
+
+                // 단계별 가로 바
+                const stageEl = document.getElementById('rejections-by-stage');
+                const stages = d.by_stage || [];
+                if (stages.length === 0) {
+                    stageEl.innerHTML = '<div style="color:var(--text-secondary);font-size:0.85rem;">거부 기록 없음</div>';
+                } else {
+                    const maxCount = stages[0].count || 1;
+                    stageEl.innerHTML = stages.map(s => {
+                        const pct = (s.count / maxCount) * 100;
+                        return `
+                            <div style="margin-bottom:0.55rem;">
+                                <div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-bottom:0.2rem;">
+                                    <span style="font-weight:600;text-transform:uppercase;">${s.stage}</span>
+                                    <span style="color:var(--text-secondary);">${s.count.toLocaleString()}</span>
+                                </div>
+                                <div style="height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;">
+                                    <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#ef4444,#f59e0b);border-radius:3px;"></div>
+                                </div>
+                            </div>`;
+                    }).join('');
+                }
+
+                // 사유 Top N
+                const topEl = document.getElementById('rejections-top-body');
+                const top = d.top_reasons || [];
+                if (top.length === 0) {
+                    topEl.innerHTML = `<tr><td colspan="3" class="text-center" style="color:var(--text-secondary)">거부 기록 없음</td></tr>`;
+                } else {
+                    topEl.innerHTML = top.map((r, i) => `
+                        <tr>
+                            <td style="color:var(--text-secondary)">#${i + 1}</td>
+                            <td><span style="font-weight:600">${r.label}</span></td>
+                            <td>${r.count.toLocaleString()}</td>
+                        </tr>
+                    `).join('');
+                }
+            })
+            .catch(err => console.error('Rejections fetch error:', err));
+    };
+
     // 포지션 편집 모달 (손절/익절 + 매수일)
     window.openEditModal = function(posKey, stopLoss, takeProfit, buyDate, label) {
         document.getElementById('edit-pos-key').value = posKey;
@@ -586,6 +637,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateCollectionStats();
     updateWatchlistReport();
     updatePerformance();
+    updateRejections();
 
     // Polling
     setInterval(updateSystemStatus, 30000);
@@ -594,6 +646,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(updateCollectionStats, 60000);
     setInterval(updateWatchlistReport, 300000); // 5분마다 갱신
     setInterval(updatePerformance, 30000); // 거래 성과 — 30초마다 갱신 (히스토리 기반이라 느린 polling)
+    setInterval(updateRejections, 60000);  // 거부 분석 — 1분마다 갱신
 
     refreshLogsBtn.addEventListener('click', () => {
         updateLogs();

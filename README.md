@@ -3,7 +3,7 @@
 [![tests](https://github.com/jangyup-cmyk/JY_Investing/actions/workflows/test.yml/badge.svg)](https://github.com/jangyup-cmyk/JY_Investing/actions/workflows/test.yml)
 
 > 문서 버전: 2026-05-18
-> 현재 테스트 상태: `94 passed, 9 deselected (integration/manual 제외)`
+> 현재 테스트 상태: `107 passed, 9 deselected (integration/manual 제외)`
 
 이 프로젝트는 한국투자증권(KIS) API 기반의 텔레그램 테마 연동 자동매매 시스템입니다. AI 테마 분석, 13개 기술 지표 필터, 다계좌 분할 매수, 개인별 텔레그램 알림을 핵심으로 합니다.
 
